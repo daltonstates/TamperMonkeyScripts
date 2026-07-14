@@ -1,12 +1,17 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.0
+// @version      4.7
 // @author       Dalton
 // @license      MIT
-// @description  Filters Goodreads giveaways by genre, provides a persistent settings panel with accordion UI, and adds a safe auto-open feature.
+// @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with element polling.
 // @match        https://www.goodreads.com/giveaway*
+// @match        https://www.goodreads.com/giveaway/show/*
+// @match        https://www.goodreads.com/giveaway/enter_choose_address/*
+// @match        https://www.goodreads.com/giveaway/enter_print_giveaway/*
 // @grant        GM_openInTab
+// @grant        window.close
+// @grant        window.focus
 // ==/UserScript==
 
 /*
@@ -67,8 +72,6 @@
    * ------------------------------------------------------------ */
 
   function analyzeGiveawayCard(card) {
-    // if (card.dataset.analyzed === "1") return;
-
     const tags = card.querySelectorAll(
       "div.GiveawayGenres li.GiveawayGenres__tag",
     );
@@ -118,7 +121,7 @@
   }
 
   /* ------------------------------------------------------------
-   *  AUTO-OPEN ENGINE
+   * AUTO-OPEN ENGINE
    * ------------------------------------------------------------ */
 
   const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
@@ -137,7 +140,7 @@
       .filter((href, i, arr) => arr.indexOf(href) === i);
 
     for (const link of links) {
-      GM_openInTab(link, { active: false });
+      GM_openInTab(link, { active: false, close: true });
       await sleep(500 + Math.random() * 700);
     }
 
@@ -341,18 +344,73 @@
   }
 
   /* ------------------------------------------------------------
-   *  MAIN LOOP
+   * AUTO-CLOSE / WORKFLOW HANDLERS
    * ------------------------------------------------------------ */
 
-  function tick() {
-    runFilter();
-    updateCounts();
+  function handleAutoClose() {
+    const url = window.location.href;
+    if (/goodreads\.com\/giveaway\/show\/\d+/.test(url)) {
+      window.close();
+    }
   }
 
-  injectStyles();
-  createOpenButton();
-  createSettingsPanel();
+  function handleChooseAddressFlow() {
+    const addressInterval = setInterval(() => {
+      const addressLink = document.querySelector("a.addressLink");
+      if (addressLink) {
+        clearInterval(addressInterval);
+        addressLink.focus();
+      }
+    }, 50);
+  }
 
-  tick();
-  setInterval(tick, 1000);
+  function handlePrintGiveawayFlow() {
+    const giveawayInterval = setInterval(() => {
+      const checkbox = document.querySelector("input#termsCheckBox");
+      const submitBtn = document.querySelector("input#giveawaySubmitButton");
+
+      if (checkbox && submitBtn) {
+        clearInterval(giveawayInterval);
+        checkbox.focus();
+
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) {
+            submitBtn.focus();
+          }
+        });
+
+        submitBtn.addEventListener("click", () => {
+          setTimeout(() => {
+            window.close();
+          }, 50);
+        });
+      }
+    }, 50);
+  }
+
+  /* ------------------------------------------------------------
+   * MAIN INITIALIZATION ROUTER
+   * ------------------------------------------------------------ */
+
+  const url = window.location.href;
+
+  if (url.includes("/giveaway/enter_choose_address/")) {
+    handleChooseAddressFlow();
+  } else if (url.includes("/giveaway/enter_print_giveaway/")) {
+    handlePrintGiveawayFlow();
+  } else if (url.includes("/giveaway/show/")) {
+    handleAutoClose();
+  } else if (url.includes("/giveaway")) {
+    injectStyles();
+    createOpenButton();
+    createSettingsPanel();
+
+    function tick() {
+      runFilter();
+      updateCounts();
+    }
+
+    tick();
+    setInterval(tick, 1000);
+  }
 })();
