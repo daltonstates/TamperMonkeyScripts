@@ -1,0 +1,51 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+CatalogFile=VirtualHidKeyboardDriver.cat
+DriverVer=08/08/2026,1.0.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+VirtualHidKeyboardDriver.sys = 1
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=VirtualHidKeyboard_Install,ROOT\VirtualHidKeyboard
+
+[VirtualHidKeyboard_Install.NT]
+CopyFiles=DriverCopyFiles
+
+[VirtualHidKeyboard_Install.NT.HW]
+AddReg=VhfLowerFilter
+
+[VhfLowerFilter]
+HKR,,"LowerFilters",0x00010000,"vhf"
+
+[DriverCopyFiles]
+VirtualHidKeyboardDriver.sys
+
+[VirtualHidKeyboard_Install.NT.Services]
+AddService=VirtualHidKeyboard,0x00000002,VirtualHidKeyboard_Service
+
+[VirtualHidKeyboard_Service]
+DisplayName=%DeviceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\VirtualHidKeyboardDriver.sys
+
+[Strings]
+ProviderName="Internal Security Assessment"
+ManufacturerName="Internal Security Assessment"
+DeviceName="Virtual HID Keyboard"
+DiskName="Virtual HID Keyboard installation media"
