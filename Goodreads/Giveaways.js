@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.9
+// @version      4.10
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with element polling.
@@ -149,8 +149,6 @@
   /* ------------------------------------------------------------
    * AUTO-OPEN ENGINE
    * ------------------------------------------------------------ */
-
-  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
   function isGiveawayEntryLink(href) {
     try {
@@ -303,8 +301,6 @@
           failed++;
           console.error("Could not open Goodreads giveaway", link, error);
         }
-
-        await sleep(500 + Math.random() * 700);
       }
 
       alert(
