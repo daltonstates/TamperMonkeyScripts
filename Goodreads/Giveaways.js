@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.7
+// @version      4.9
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with element polling.
@@ -37,6 +37,14 @@
    * ------------------------------------------------------------ */
   const LS_FILTER_ENABLED = "gr_filter_enabled";
   const LS_BLOCKED_GENRES = "gr_blocked_genres";
+  const LS_MAX_OPEN_TABS = "gr_max_open_tabs";
+  const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
+  const PROGRESS_HASH_INDEX = "grGiveawayIndex";
+  const PROGRESS_HASH_TOTAL = "grGiveawayTotal";
+  const PROGRESS_HASH_ID = "grGiveawayId";
+  const DEFAULT_MAX_OPEN_TABS = 8;
+  const MIN_OPEN_TABS = 1;
+  const MAX_OPEN_TABS = 50;
 
   /* ------------------------------------------------------------
    *  STATE MANAGEMENT
@@ -60,10 +68,28 @@
   const saveBlockedGenres = (list) =>
     localStorage.setItem(LS_BLOCKED_GENRES, JSON.stringify(list));
 
+  const normalizeMaxOpenTabs = (value) => {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return DEFAULT_MAX_OPEN_TABS;
+    return Math.min(MAX_OPEN_TABS, Math.max(MIN_OPEN_TABS, parsed));
+  };
+
+  const loadMaxOpenTabs = () =>
+    normalizeMaxOpenTabs(localStorage.getItem(LS_MAX_OPEN_TABS));
+
+  const saveMaxOpenTabs = (value) =>
+    localStorage.setItem(LS_MAX_OPEN_TABS, String(value));
+
   const defaultGenres = () => [];
 
   let filteringEnabled = loadFilterEnabled();
   let BLOCKED = new Set(loadBlockedGenres().map((g) => g.toLowerCase()));
+  let maxOpenTabs = loadMaxOpenTabs();
+  let openingGiveaways = false;
+  let openButton = null;
+
+  const openedGiveawayLinks = new Set();
+  const trackedGiveawayTabs = new Set();
 
   const normalize = (s) => s.trim().toLowerCase();
 
@@ -126,25 +152,170 @@
 
   const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-  async function openVisibleGiveaways() {
+  function isGiveawayEntryLink(href) {
+    try {
+      const url = new URL(href, window.location.href);
+      return (
+        url.origin === window.location.origin &&
+        url.pathname.startsWith("/giveaway/enter_choose_address/")
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function getGiveawayId(href) {
+    try {
+      const url = new URL(href, window.location.href);
+      const match = url.pathname.match(
+        /^\/giveaway\/(?:enter_choose_address|enter_print_giveaway|show)\/(\d+)/,
+      );
+      return match?.[1] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  function addGiveawayProgress(href, index, total) {
+    const url = new URL(href, window.location.href);
+    const giveawayId = getGiveawayId(url.href);
+    if (!giveawayId) return url.href;
+
+    const hash = new URLSearchParams(url.hash.slice(1));
+    hash.set(PROGRESS_HASH_INDEX, String(index));
+    hash.set(PROGRESS_HASH_TOTAL, String(total));
+    hash.set(PROGRESS_HASH_ID, giveawayId);
+    url.hash = hash.toString();
+    return url.href;
+  }
+
+  function getVisibleGiveawayLinks() {
     const buttons = document.querySelectorAll(
       ".BookListItem a.Button.Button--primary.Button--medium",
     );
 
-    const links = [...buttons]
+    return [...buttons]
       .filter((btn) => {
         const card = btn.closest("article.BookListItem");
         return card && card.dataset.hiddenByFilter !== "1";
       })
       .map((btn) => btn.href)
-      .filter((href, i, arr) => arr.indexOf(href) === i);
+      .filter(isGiveawayEntryLink)
+      .filter((href, i, arr) => arr.indexOf(href) === i)
+      .filter((href) => !openedGiveawayLinks.has(href));
+  }
 
-    for (const link of links) {
-      GM_openInTab(link, { active: false, close: true });
-      await sleep(500 + Math.random() * 700);
+  function setOpenButtonLabel(text) {
+    const label = openButton?.querySelector("span");
+    if (label) label.textContent = text;
+  }
+
+  function refreshOpenButton() {
+    if (!openButton || openingGiveaways) return;
+
+    const available = getVisibleGiveawayLinks().length;
+    openButton.disabled = available === 0;
+    setOpenButtonLabel(
+      available === 0
+        ? "No New Giveaways"
+        : `Open ${available} Giveaways (Filtered)`,
+    );
+  }
+
+  function trackGiveawayTab(tab) {
+    if (!tab || typeof tab !== "object") return;
+
+    let closedPromise;
+    closedPromise = new Promise((resolve) => {
+      let settled = false;
+      let pollId = null;
+
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        if (pollId !== null) clearInterval(pollId);
+        resolve();
+      };
+
+      try {
+        tab.onclose = settle;
+        if (tab.closed) {
+          settle();
+          return;
+        }
+      } catch {
+        settle();
+        return;
+      }
+
+      pollId = setInterval(() => {
+        try {
+          if (tab.closed) settle();
+        } catch {
+          settle();
+        }
+      }, 500);
+    });
+
+    trackedGiveawayTabs.add(closedPromise);
+    closedPromise.then(() => trackedGiveawayTabs.delete(closedPromise));
+  }
+
+  async function waitForOpenTabSlot() {
+    while (trackedGiveawayTabs.size >= maxOpenTabs) {
+      await Promise.race(trackedGiveawayTabs);
+    }
+  }
+
+  async function openVisibleGiveaways() {
+    if (openingGiveaways) return;
+
+    const links = getVisibleGiveawayLinks();
+    if (links.length === 0) {
+      refreshOpenButton();
+      return;
     }
 
-    alert(`Opened ${links.length} giveaways`);
+    openingGiveaways = true;
+    openButton.disabled = true;
+
+    let opened = 0;
+    let failed = 0;
+
+    try {
+      for (const [linkIndex, link] of links.entries()) {
+        await waitForOpenTabSlot();
+
+        try {
+          const numberedLink = addGiveawayProgress(
+            link,
+            linkIndex + 1,
+            links.length,
+          );
+          const tab = GM_openInTab(numberedLink, { active: false });
+          openedGiveawayLinks.add(link);
+          trackGiveawayTab(tab);
+          opened++;
+          setOpenButtonLabel(
+            `Opening ${opened}/${links.length} (${trackedGiveawayTabs.size} open)`,
+          );
+        } catch (error) {
+          failed++;
+          console.error("Could not open Goodreads giveaway", link, error);
+        }
+
+        await sleep(500 + Math.random() * 700);
+      }
+
+      alert(
+        `Opened ${opened} giveaways (maximum ${maxOpenTabs} at a time)${
+          failed ? `; ${failed} failed` : ""
+        }`,
+      );
+    } finally {
+      openingGiveaways = false;
+      refreshOpenButton();
+    }
   }
 
   /* ------------------------------------------------------------
@@ -170,6 +341,11 @@
                 gap: 6px;
             }
 
+            #gr-open-btn:disabled {
+                cursor: default;
+                opacity: 0.7;
+            }
+
             #gr-settings {
                 position: fixed;
                 top: 70px;
@@ -189,6 +365,23 @@
                 font-weight: bold;
                 margin-bottom: 6px;
                 user-select: none;
+            }
+
+            #gr-tab-limit-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                margin-top: 8px;
+            }
+
+            #gr-tab-limit-input {
+                width: 64px;
+                padding: 4px 6px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #fff;
+                color: #222;
             }
 
             #gr-accordion-content {
@@ -257,6 +450,26 @@
       updateCounts();
     };
     panel.appendChild(toggle);
+
+    /* Concurrent tab limit */
+    const tabLimitRow = document.createElement("label");
+    tabLimitRow.id = "gr-tab-limit-row";
+    tabLimitRow.textContent = "Max open tabs";
+
+    const tabLimitInput = document.createElement("input");
+    tabLimitInput.id = "gr-tab-limit-input";
+    tabLimitInput.type = "number";
+    tabLimitInput.min = String(MIN_OPEN_TABS);
+    tabLimitInput.max = String(MAX_OPEN_TABS);
+    tabLimitInput.value = String(maxOpenTabs);
+    tabLimitInput.addEventListener("change", () => {
+      maxOpenTabs = normalizeMaxOpenTabs(tabLimitInput.value);
+      tabLimitInput.value = String(maxOpenTabs);
+      saveMaxOpenTabs(maxOpenTabs);
+    });
+
+    tabLimitRow.appendChild(tabLimitInput);
+    panel.appendChild(tabLimitRow);
 
     /* Accordion header */
     const header = document.createElement("div");
@@ -341,11 +554,91 @@
     btn.innerHTML = `🗗 <span>Open Giveaways (Filtered)</span>`;
     btn.onclick = openVisibleGiveaways;
     document.body.appendChild(btn);
+    openButton = btn;
   }
 
   /* ------------------------------------------------------------
    * AUTO-CLOSE / WORKFLOW HANDLERS
    * ------------------------------------------------------------ */
+
+  function readGiveawayProgressFromHash() {
+    const hash = new URLSearchParams(window.location.hash.slice(1));
+    const index = Number.parseInt(hash.get(PROGRESS_HASH_INDEX), 10);
+    const total = Number.parseInt(hash.get(PROGRESS_HASH_TOTAL), 10);
+    const giveawayId = hash.get(PROGRESS_HASH_ID);
+
+    if (
+      !Number.isInteger(index) ||
+      !Number.isInteger(total) ||
+      index < 1 ||
+      total < index ||
+      !giveawayId ||
+      giveawayId !== getGiveawayId(window.location.href)
+    ) {
+      return null;
+    }
+
+    return { index, total, giveawayId };
+  }
+
+  function loadGiveawayProgress() {
+    const fromHash = readGiveawayProgressFromHash();
+    if (fromHash) {
+      try {
+        sessionStorage.setItem(
+          SS_GIVEAWAY_PROGRESS,
+          JSON.stringify(fromHash),
+        );
+      } catch {
+        // The hash still lets the first workflow page show its number.
+      }
+      return fromHash;
+    }
+
+    try {
+      const stored = JSON.parse(
+        sessionStorage.getItem(SS_GIVEAWAY_PROGRESS) ?? "null",
+      );
+      if (
+        Number.isInteger(stored?.index) &&
+        Number.isInteger(stored?.total) &&
+        stored.index >= 1 &&
+        stored.total >= stored.index &&
+        stored.giveawayId === getGiveawayId(window.location.href)
+      ) {
+        return stored;
+      }
+    } catch {
+      // Ignore unavailable or malformed per-tab progress state.
+    }
+
+    return null;
+  }
+
+  function createGiveawayProgressBadge() {
+    const progress = loadGiveawayProgress();
+    if (!progress || document.querySelector("#gr-giveaway-progress")) return;
+
+    const badge = document.createElement("div");
+    badge.id = "gr-giveaway-progress";
+    badge.setAttribute("role", "status");
+    badge.textContent = `Giveaway ${progress.index} of ${progress.total}`;
+    Object.assign(badge.style, {
+      position: "fixed",
+      right: "20px",
+      bottom: "20px",
+      zIndex: "99999",
+      padding: "8px 12px",
+      borderRadius: "999px",
+      background: "#00695C",
+      color: "#fff",
+      fontSize: "14px",
+      fontWeight: "600",
+      boxShadow: "0 2px 8px rgba(0, 0, 0, 0.25)",
+      pointerEvents: "none",
+    });
+    document.body.appendChild(badge);
+  }
 
   function handleAutoClose() {
     const url = window.location.href;
@@ -395,8 +688,10 @@
   const url = window.location.href;
 
   if (url.includes("/giveaway/enter_choose_address/")) {
+    createGiveawayProgressBadge();
     handleChooseAddressFlow();
   } else if (url.includes("/giveaway/enter_print_giveaway/")) {
+    createGiveawayProgressBadge();
     handlePrintGiveawayFlow();
   } else if (url.includes("/giveaway/show/")) {
     handleAutoClose();
@@ -408,6 +703,7 @@
     function tick() {
       runFilter();
       updateCounts();
+      refreshOpenButton();
     }
 
     tick();
