@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.11
+// @version      4.12
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with element polling.
@@ -45,6 +45,7 @@
   const DEFAULT_MAX_OPEN_TABS = 8;
   const MIN_OPEN_TABS = 1;
   const MAX_OPEN_TABS = 50;
+  const GIVEAWAY_LOAD_TIMEOUT_MS = 30000;
 
   /* ------------------------------------------------------------
    *  STATE MANAGEMENT
@@ -86,7 +87,9 @@
   let BLOCKED = new Set(loadBlockedGenres().map((g) => g.toLowerCase()));
   let maxOpenTabs = loadMaxOpenTabs();
   let openingGiveaways = false;
+  let loadingGiveaways = false;
   let openButton = null;
+  let openAllButton = null;
 
   const openedGiveawayLinks = new Set();
   const trackedGiveawayTabs = new Set();
@@ -209,15 +212,103 @@
   }
 
   function refreshOpenButton() {
+    if (openAllButton) {
+      openAllButton.disabled = loadingGiveaways || openingGiveaways;
+      openAllButton.textContent = loadingGiveaways
+        ? `Loading giveaways (${document.querySelectorAll("article.BookListItem").length} loaded)...`
+        : openingGiveaways
+          ? "Opening giveaways..."
+          : "Open all giveaways";
+    }
+
     if (!openButton || openingGiveaways) return;
 
     const available = getVisibleGiveawayLinks().length;
-    openButton.disabled = available === 0;
+    openButton.disabled = loadingGiveaways || available === 0;
     setOpenButtonLabel(
-      available === 0
-        ? "No New Giveaways"
-        : `Open ${available} Giveaways (Filtered)`,
+      loadingGiveaways
+        ? "Loading giveaways..."
+        : available === 0
+          ? "No New Giveaways"
+          : `Open ${available} Giveaways (Filtered)`,
     );
+  }
+
+  function findShowMoreGiveawaysButton() {
+    return [
+      ...document.querySelectorAll(".GiveawayIndexPage__content--main button"),
+    ].find(
+      (button) =>
+        button.textContent.replace(/\s+/g, " ").trim().toLowerCase() ===
+        "show more giveaways",
+    );
+  }
+
+  async function waitForGiveawayPage(previousCount = null) {
+    const deadline = Date.now() + GIVEAWAY_LOAD_TIMEOUT_MS;
+    let noButtonSince = null;
+
+    while (Date.now() < deadline) {
+      const count = document.querySelectorAll("article.BookListItem").length;
+      const button = findShowMoreGiveawaysButton();
+      const totalText = document
+        .querySelector('[data-testid="paginationStatus"]')
+        ?.textContent.match(/\bof\s+([\d,]+)/i)?.[1];
+      const total = totalText ? Number(totalText.replace(/,/g, "")) : null;
+      refreshOpenButton();
+
+      if (previousCount === null || count > previousCount) {
+        if (button) {
+          noButtonSince = null;
+          if (
+            !button.disabled &&
+            button.getAttribute("aria-disabled") !== "true"
+          ) {
+            return button;
+          }
+        } else if (total === null || count >= total) {
+          // Allow the page to finish rendering its next pagination control.
+          noButtonSince ??= Date.now();
+          if (Date.now() - noButtonSince >= 1000) return null;
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    throw new Error("Timed out waiting for Goodreads to load more giveaways.");
+  }
+
+  async function openAllGiveaways() {
+    if (loadingGiveaways || openingGiveaways) return;
+
+    loadingGiveaways = true;
+    refreshOpenButton();
+
+    try {
+      let button = await waitForGiveawayPage();
+      while (button) {
+        const previousCount = document.querySelectorAll(
+          "article.BookListItem",
+        ).length;
+        button.click();
+        button = await waitForGiveawayPage(previousCount);
+      }
+
+      runFilter();
+      updateCounts();
+    } catch (error) {
+      console.error("Could not load all Goodreads giveaways", error);
+      alert(
+        "Could not load all giveaways. Check the page and try again. No giveaways were opened.",
+      );
+      return;
+    } finally {
+      loadingGiveaways = false;
+      refreshOpenButton();
+    }
+
+    await openVisibleGiveaways();
   }
 
   function trackGiveawayTab(tab) {
@@ -266,7 +357,7 @@
   }
 
   async function openVisibleGiveaways() {
-    if (openingGiveaways) return;
+    if (openingGiveaways || loadingGiveaways) return;
 
     const links = getVisibleGiveawayLinks();
     if (links.length === 0) {
@@ -276,6 +367,7 @@
 
     openingGiveaways = true;
     openButton.disabled = true;
+    refreshOpenButton();
 
     let opened = 0;
     let failed = 0;
@@ -411,7 +503,8 @@
                 margin-bottom: 6px;
             }
 
-            #gr-add-btn {
+            #gr-add-btn,
+            #gr-open-all-btn {
                 width: 100%;
                 padding: 6px;
                 background: #00695C;
@@ -419,6 +512,15 @@
                 border: none;
                 border-radius: 4px;
                 cursor: pointer;
+            }
+
+            #gr-open-all-btn {
+                margin-top: 10px;
+            }
+
+            #gr-open-all-btn:disabled {
+                cursor: default;
+                opacity: 0.7;
             }
         `;
     const style = document.createElement("style");
@@ -536,6 +638,14 @@
       content.style.display = open ? "none" : "block";
       header.textContent = `${open ? "▶" : "▼"} Blocked Genres (${BLOCKED.size})`;
     };
+
+    /* Load every page, then use the filtered giveaway opener. */
+    openAllButton = document.createElement("button");
+    openAllButton.id = "gr-open-all-btn";
+    openAllButton.type = "button";
+    openAllButton.textContent = "Open all giveaways";
+    openAllButton.onclick = openAllGiveaways;
+    panel.appendChild(openAllButton);
 
     document.body.appendChild(panel);
   }
