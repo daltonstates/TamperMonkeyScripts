@@ -715,10 +715,7 @@
     const fromHash = readGiveawayProgressFromHash();
     if (fromHash) {
       try {
-        sessionStorage.setItem(
-          SS_GIVEAWAY_PROGRESS,
-          JSON.stringify(fromHash),
-        );
+        sessionStorage.setItem(SS_GIVEAWAY_PROGRESS, JSON.stringify(fromHash));
       } catch {
         // The hash still lets the first workflow page show its number.
       }

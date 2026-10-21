@@ -1,8 +1,0 @@
-artifacts/
-Controller/bin/
-Controller/obj/
-Diagnostics/RawInputMonitor/bin/
-Diagnostics/RawInputMonitor/obj/
-Driver/x64/
-Driver/VirtualH.*/
-*.user
