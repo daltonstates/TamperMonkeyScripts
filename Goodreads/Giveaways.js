@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.12
+// @version      4.13
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with element polling.
@@ -412,39 +412,48 @@
 
   function injectStyles() {
     const css = `
-            #gr-open-btn {
+            #gr-controls {
                 position: fixed;
                 top: 20px;
                 right: 20px;
+                width: 284px;
+                z-index: 99999;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            #gr-open-btn,
+            #gr-open-all-btn {
                 padding: 10px 15px;
                 background: #00695C;
                 color: white;
                 border: none;
                 border-radius: 6px;
                 cursor: pointer;
-                z-index: 99999;
                 font-size: 14px;
                 display: flex;
                 align-items: center;
+                justify-content: center;
                 gap: 6px;
             }
 
-            #gr-open-btn:disabled {
+            #gr-open-btn[hidden] {
+                display: none;
+            }
+
+            #gr-open-btn:disabled,
+            #gr-open-all-btn:disabled {
                 cursor: default;
                 opacity: 0.7;
             }
 
             #gr-settings {
-                position: fixed;
-                top: 70px;
-                right: 20px;
-                width: 260px;
                 padding: 12px;
                 background: #222;
                 color: #fff;
                 border-radius: 8px;
                 font-size: 14px;
-                z-index: 99999;
                 box-shadow: 0 0 8px rgba(0,0,0,0.4);
             }
 
@@ -503,8 +512,7 @@
                 margin-bottom: 6px;
             }
 
-            #gr-add-btn,
-            #gr-open-all-btn {
+            #gr-add-btn {
                 width: 100%;
                 padding: 6px;
                 background: #00695C;
@@ -512,15 +520,6 @@
                 border: none;
                 border-radius: 4px;
                 cursor: pointer;
-            }
-
-            #gr-open-all-btn {
-                margin-top: 10px;
-            }
-
-            #gr-open-all-btn:disabled {
-                cursor: default;
-                opacity: 0.7;
             }
         `;
     const style = document.createElement("style");
@@ -639,28 +638,53 @@
       header.textContent = `${open ? "▶" : "▼"} Blocked Genres (${BLOCKED.size})`;
     };
 
-    /* Load every page, then use the filtered giveaway opener. */
+    document.querySelector("#gr-controls").appendChild(panel);
+  }
+
+  /* ------------------------------------------------------------
+   *  OPEN BUTTONS
+   * ------------------------------------------------------------ */
+
+  function createOpenButtons() {
+    const controls = document.createElement("div");
+    controls.id = "gr-controls";
+
     openAllButton = document.createElement("button");
     openAllButton.id = "gr-open-all-btn";
     openAllButton.type = "button";
     openAllButton.textContent = "Open all giveaways";
     openAllButton.onclick = openAllGiveaways;
-    panel.appendChild(openAllButton);
+    controls.appendChild(openAllButton);
 
-    document.body.appendChild(panel);
-  }
-
-  /* ------------------------------------------------------------
-   *  OPEN BUTTON
-   * ------------------------------------------------------------ */
-
-  function createOpenButton() {
     const btn = document.createElement("button");
     btn.id = "gr-open-btn";
+    btn.type = "button";
+    btn.hidden = true;
     btn.innerHTML = `🗗 <span>Open Giveaways (Filtered)</span>`;
     btn.onclick = openVisibleGiveaways;
-    document.body.appendChild(btn);
+    controls.appendChild(btn);
+    document.body.appendChild(controls);
     openButton = btn;
+
+    document.addEventListener(
+      "click",
+      (event) => {
+        if (loadingGiveaways) return;
+
+        const button = event.target.closest?.(
+          ".GiveawayIndexPage__content--main button",
+        );
+        if (
+          button &&
+          button === findShowMoreGiveawaysButton() &&
+          !button.disabled &&
+          button.getAttribute("aria-disabled") !== "true"
+        ) {
+          openButton.hidden = false;
+        }
+      },
+      true,
+    );
   }
 
   /* ------------------------------------------------------------
@@ -811,7 +835,7 @@
     handleAutoClose();
   } else if (url.includes("/giveaway")) {
     injectStyles();
-    createOpenButton();
+    createOpenButtons();
     createSettingsPanel();
 
     function tick() {
