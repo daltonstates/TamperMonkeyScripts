@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.13
+// @version      4.14
 // @author       Dalton
 // @license      MIT
-// @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with element polling.
+// @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with stalled-page recovery.
 // @match        https://www.goodreads.com/giveaway*
 // @match        https://www.goodreads.com/giveaway/show/*
 // @match        https://www.goodreads.com/giveaway/enter_choose_address/*
 // @match        https://www.goodreads.com/giveaway/enter_print_giveaway/*
+// @run-at       document-start
 // @grant        GM_openInTab
 // @grant        window.close
 // @grant        window.focus
@@ -46,6 +47,9 @@
   const MIN_OPEN_TABS = 1;
   const MAX_OPEN_TABS = 50;
   const GIVEAWAY_LOAD_TIMEOUT_MS = 30000;
+  const GIVEAWAY_TAB_LOAD_TIMEOUT_MS = 5000;
+  const MAX_GIVEAWAY_RELOADS = 3;
+  const GIVEAWAY_RELOAD_PARAM = "grGiveawayReload";
 
   /* ------------------------------------------------------------
    *  STATE MANAGEMENT
@@ -743,6 +747,7 @@
   }
 
   function createGiveawayProgressBadge() {
+    if (!document.body) return;
     const progress = loadGiveawayProgress();
     if (!progress || document.querySelector("#gr-giveaway-progress")) return;
 
@@ -774,23 +779,108 @@
     }
   }
 
-  function handleChooseAddressFlow() {
-    const addressInterval = setInterval(() => {
-      const addressLink = document.querySelector("a.addressLink");
-      if (addressLink) {
-        clearInterval(addressInterval);
-        addressLink.focus();
+  function showGiveawayLoadFailure() {
+    if (!document.body) {
+      document.addEventListener("DOMContentLoaded", showGiveawayLoadFailure, {
+        once: true,
+      });
+      return;
+    }
+
+    const notice = document.createElement("div");
+    notice.id = "gr-giveaway-load-failure";
+    notice.setAttribute("role", "alert");
+    notice.textContent = `This giveaway still hasn't loaded after ${MAX_GIVEAWAY_RELOADS} refresh attempts. Check the page or your connection. `;
+    Object.assign(notice.style, {
+      position: "fixed",
+      top: "20px",
+      left: "20px",
+      right: "20px",
+      zIndex: "99999",
+      padding: "12px",
+      borderRadius: "8px",
+      background: "#fff3cd",
+      color: "#664d03",
+      fontSize: "14px",
+    });
+
+    const retryButton = document.createElement("button");
+    retryButton.type = "button";
+    retryButton.textContent = "Try again";
+    retryButton.addEventListener("click", () => {
+      const retryUrl = new URL(window.location.href);
+      retryUrl.searchParams.delete(GIVEAWAY_RELOAD_PARAM);
+      window.location.replace(retryUrl.href);
+    });
+    notice.appendChild(retryButton);
+    document.body.appendChild(notice);
+  }
+
+  function waitForGiveawayControls(findControls, onReady) {
+    let pollId = null;
+    let timeoutId = null;
+
+    const stopWaiting = () => {
+      clearInterval(pollId);
+      clearTimeout(timeoutId);
+      window.removeEventListener("pagehide", stopWaiting);
+    };
+
+    const checkControls = () => {
+      const controls = findControls();
+      if (!controls) return false;
+
+      stopWaiting();
+      const pageUrl = new URL(window.location.href);
+      if (pageUrl.searchParams.has(GIVEAWAY_RELOAD_PARAM)) {
+        pageUrl.searchParams.delete(GIVEAWAY_RELOAD_PARAM);
+        window.history.replaceState(window.history.state, "", pageUrl.href);
       }
-    }, 50);
+      onReady(controls);
+      return true;
+    };
+
+    window.addEventListener("pagehide", stopWaiting, { once: true });
+    pollId = setInterval(checkControls, 50);
+    timeoutId = setTimeout(() => {
+      // Check again in case the controls appeared just before the timeout.
+      if (checkControls()) return;
+      stopWaiting();
+
+      const retryUrl = new URL(window.location.href);
+      const retries = Math.max(
+        0,
+        Number.parseInt(retryUrl.searchParams.get(GIVEAWAY_RELOAD_PARAM), 10) || 0,
+      );
+      if (retries >= MAX_GIVEAWAY_RELOADS) {
+        showGiveawayLoadFailure();
+        return;
+      }
+
+      retryUrl.searchParams.set(GIVEAWAY_RELOAD_PARAM, String(retries + 1));
+      // A changed URL makes a fresh GET, even with a progress hash or after a POST.
+      window.location.replace(retryUrl.href);
+    }, GIVEAWAY_TAB_LOAD_TIMEOUT_MS);
+    checkControls();
+  }
+
+  function handleChooseAddressFlow() {
+    waitForGiveawayControls(
+      () => document.querySelector("a.addressLink"),
+      (addressLink) => {
+        addressLink.focus();
+      },
+    );
   }
 
   function handlePrintGiveawayFlow() {
-    const giveawayInterval = setInterval(() => {
-      const checkbox = document.querySelector("input#termsCheckBox");
-      const submitBtn = document.querySelector("input#giveawaySubmitButton");
-
-      if (checkbox && submitBtn) {
-        clearInterval(giveawayInterval);
+    waitForGiveawayControls(
+      () => {
+        const checkbox = document.querySelector("input#termsCheckBox");
+        const submitBtn = document.querySelector("input#giveawaySubmitButton");
+        return checkbox && submitBtn ? { checkbox, submitBtn } : null;
+      },
+      ({ checkbox, submitBtn }) => {
         checkbox.focus();
 
         document.addEventListener("change", (event) => {
@@ -812,8 +902,16 @@
             window.close();
           }, 50);
         });
-      }
-    }, 50);
+      },
+    );
+  }
+
+  function whenDocumentReady(callback) {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", callback, { once: true });
+    } else {
+      callback();
+    }
   }
 
   /* ------------------------------------------------------------
@@ -823,25 +921,27 @@
   const url = window.location.href;
 
   if (url.includes("/giveaway/enter_choose_address/")) {
-    createGiveawayProgressBadge();
+    whenDocumentReady(createGiveawayProgressBadge);
     handleChooseAddressFlow();
   } else if (url.includes("/giveaway/enter_print_giveaway/")) {
-    createGiveawayProgressBadge();
+    whenDocumentReady(createGiveawayProgressBadge);
     handlePrintGiveawayFlow();
   } else if (url.includes("/giveaway/show/")) {
     handleAutoClose();
   } else if (url.includes("/giveaway")) {
-    injectStyles();
-    createOpenButtons();
-    createSettingsPanel();
+    whenDocumentReady(() => {
+      injectStyles();
+      createOpenButtons();
+      createSettingsPanel();
 
-    function tick() {
-      runFilter();
-      updateCounts();
-      refreshOpenButton();
-    }
+      function tick() {
+        runFilter();
+        updateCounts();
+        refreshOpenButton();
+      }
 
-    tick();
-    setInterval(tick, 1000);
+      tick();
+      setInterval(tick, 1000);
+    });
   }
 })();
