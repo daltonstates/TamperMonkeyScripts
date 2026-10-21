@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.10
+// @version      4.11
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, handles auto-opening, auto-closing, and quick-keyboard flow with element polling.
@@ -662,8 +662,16 @@
         clearInterval(giveawayInterval);
         checkbox.focus();
 
-        checkbox.addEventListener("change", () => {
-          if (checkbox.checked) {
+        document.addEventListener("change", (event) => {
+          const changedCheckbox = event.target;
+          if (!changedCheckbox.checked) return;
+
+          if (changedCheckbox === checkbox) {
+            const ageCheckbox = document.querySelector(
+              "input#ageAttestationCheckBox",
+            );
+            (ageCheckbox || submitBtn).focus();
+          } else if (changedCheckbox.matches("input#ageAttestationCheckBox")) {
             submitBtn.focus();
           }
         });
