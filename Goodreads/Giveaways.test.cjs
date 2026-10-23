@@ -50,6 +50,8 @@ function createPage({
   sessionStored = new Map(),
   listing = null,
   untrackedTab = false,
+  helperFailure = null,
+  helperDelay = 0,
 } = {}) {
   let now = 0;
   let nextTimerId = 0;
@@ -58,6 +60,7 @@ function createPage({
   const controls = new Map();
   const elements = [];
   const openedTabs = [];
+  const helperRequests = [];
   const alerts = [];
   const errors = [];
   const cards = [];
@@ -266,19 +269,6 @@ function createPage({
     AbortController,
     TextEncoder,
     btoa: (value) => Buffer.from(value, "binary").toString("base64"),
-    crypto: {
-      randomUUID: () => webcrypto.randomUUID(),
-      subtle: {
-        async importKey(format, key) {
-          return Buffer.from(key);
-        },
-        async sign(algorithm, key, data) {
-          return Uint8Array.from(
-            createHmac("sha256", key).update(Buffer.from(data)).digest(),
-          ).buffer;
-        },
-      },
-    },
     Date: class extends Date {
       static now() {
         return now;
@@ -286,6 +276,34 @@ function createPage({
     },
     console: { error: (...args) => errors.push(args) },
     alert: (message) => alerts.push(message),
+    GM_xmlhttpRequest(options) {
+      helperRequests.push(options);
+      const callback = () => {
+        if (helperFailure === "offline") return options.onerror();
+        const config = JSON.parse(options.data).config;
+        const id = webcrypto.randomUUID().replace(/-/g, "");
+        const proof = createHmac("sha256", "c".repeat(64))
+          .update(`${id}:${config}`)
+          .digest("hex");
+        const response =
+          helperFailure === "macro"
+            ? { error: "No saved macro matches the selected name" }
+            : { protocol: 1, id, proof, config };
+        if (helperFailure === "invalid") response.id = "invalid";
+        options.onload({
+          status: helperFailure === "macro" ? 400 : 200,
+          responseText: JSON.stringify(response),
+        });
+      };
+      const timer =
+        helperFailure === "hang" ? null : schedule(callback, helperDelay);
+      return {
+        abort() {
+          timers.delete(timer);
+          options.onabort();
+        },
+      };
+    },
     GM_openInTab(href, options) {
       const tab = {
         href,
@@ -313,6 +331,7 @@ function createPage({
     window,
     addControl,
     openedTabs,
+    helperRequests,
     alerts,
     errors,
     localStorage,
@@ -608,7 +627,6 @@ for (const pathname of [
       stored: new Map([
         ["gr_auto_open_all", "1"],
         ["gr_keyfire_enabled", "1"],
-        ["gr_keyfire_pairing_key", "c".repeat(64)],
         ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
       ]),
       listing: { pages: [[1], [2]] },
@@ -859,7 +877,6 @@ function keyfirePage(listing = { pages: [[123, 456]] }) {
     stored: new Map([
       ["gr_auto_open_all", "1"],
       ["gr_keyfire_enabled", "1"],
-      ["gr_keyfire_pairing_key", "c".repeat(64)],
       ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
     ]),
     listing,
@@ -1352,7 +1369,7 @@ test("a background claim does not signal Keyfire until it becomes visible", asyn
   assert.match(entry.document.title, /^\[GR Keyfire /);
 });
 
-test("Keyfire progress carries a proof from this installation's pairing key", async () => {
+test("Keyfire progress carries the local helper's authorization proof", async () => {
   const page = keyfirePage();
   await page.advanceAsync(1250);
   const hash = new URLSearchParams(
@@ -1364,7 +1381,7 @@ test("Keyfire progress carries a proof from this installation's pairing key", as
   assert.equal(hash.get("grKeyfireProof"), expected);
 });
 
-test("an unpaired userscript hides Keyfire and keeps ordinary automatic opening available", async () => {
+test("a saved macro connects automatically without a browser pairing key", async () => {
   const page = createPage({
     pathname: automaticListPath,
     stored: new Map([
@@ -1376,16 +1393,181 @@ test("an unpaired userscript hides Keyfire and keeps ordinary automatic opening 
   });
   await page.advanceAsync(1500);
   assert.equal(page.openedTabs.length, 1);
-  assert.equal(page.openedTabs[0].options.active, false);
-  assert.equal(page.document.querySelector("#gr-keyfire-row").hidden, true);
+  assert.equal(page.openedTabs[0].options.active, true);
+  assert.equal(page.document.querySelector("#gr-keyfire-row").hidden, false);
+  assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "1");
+  assert.equal(page.localStorage.getItem("gr_keyfire_pairing_key"), null);
+  assert.equal(page.helperRequests.length, 1);
   assert.deepEqual(page.alerts, []);
+  const entry = createPage({
+    href: page.openedTabs[0].href,
+    stored: page.stored,
+    ready: true,
+  });
+  assert.match(entry.document.title, /^\[GR Keyfire /);
+});
+
+for (const failure of ["offline", "hang", "macro", "invalid"]) {
+  test(`helper failure ${failure} never falls back to background tabs`, async () => {
+    const page = createPage({
+      pathname: automaticListPath,
+      stored: new Map([
+        ["gr_auto_open_all", "1"],
+        ["gr_keyfire_enabled", "1"],
+        ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+      ]),
+      listing: { pages: [[1], [2]] },
+      helperFailure: failure,
+    });
+    await page.advanceAsync(6500);
+    assert.equal(page.openedTabs.length, 0);
+    assert.equal(page.paginationClicks, 0);
+    assert.equal(page.alerts.length, 1);
+    assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "1");
+    assert.equal(
+      page.document.querySelector("#gr-open-all-btn").disabled,
+      false,
+    );
+  });
+}
+
+test("cancelling while connecting to the helper prevents late tabs and heartbeat", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([
+      ["gr_auto_open_all", "1"],
+      ["gr_keyfire_enabled", "1"],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+    ]),
+    listing: { pages: [[1], [2]] },
+    helperDelay: 2000,
+  });
+  page.setAutoOpen(false);
+  await page.advanceAsync(6500);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.paginationClicks, 0);
+  assert.deepEqual(page.alerts, []);
+  assert.equal(
+    [...page.stored.keys()].some((key) => key.startsWith("gr_keyfire_run_")),
+    false,
+  );
+});
+
+test("ordinary tab opening does not need the Windows helper", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: { pages: [[123, 456]] },
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.openedTabs[0].options.active, false);
+  assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), null);
+  assert.deepEqual(page.alerts, []);
+});
+
+test("giveaway entry pages never erase the saved Keyfire choice when setup is missing", () => {
+  const stored = new Map([["gr_keyfire_enabled", "1"]]);
+  createPage({ pathname: addressPath, ready: true, stored });
+  assert.equal(stored.get("gr_keyfire_enabled"), "1");
+  createPage({ pathname: entryPath, ready: true, stored });
+  assert.equal(stored.get("gr_keyfire_enabled"), "1");
+});
+
+test("the visible workflow status distinguishes tab opening from Keyfire claiming", async () => {
+  const page = keyfirePage();
+  await page.advanceAsync(1250);
+  assert.match(
+    page.document.querySelector("#gr-workflow-status").textContent,
+    /Keyfire on/i,
+  );
+  assert.match(
+    page.document.querySelector("#gr-workflow-status").textContent,
+    /one giveaway at a time/i,
+  );
+  page.setKeyfire(false);
+  await page.flush();
+  assert.match(
+    page.document.querySelector("#gr-workflow-status").textContent,
+    /Keyfire off/i,
+  );
+  assert.match(
+    page.document.querySelector("#gr-workflow-status").textContent,
+    /manual entry/i,
+  );
+});
+
+test("enabling Keyfire after ordinary tabs opened retries them as focused managed entries", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([
+      ["gr_auto_open_all", "1"],
+      ["gr_max_open_tabs", "3"],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+    ]),
+    listing: { pages: [[1, 2, 3, 4, 5]] },
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 3);
+  assert.ok(page.openedTabs.every((tab) => tab.options.active === false));
+  page.setKeyfire(true);
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 3);
+  assert.match(
+    page.document.querySelector("#gr-workflow-status").textContent,
+    /waiting for 3 tabs/i,
+  );
+  await closeBatch(page, 3);
+  assert.equal(page.openedTabs.length, 4);
+  assert.equal(page.openedTabs[3].options.active, true);
+  assert.equal(new URL(page.openedTabs[3].href).pathname.split("/").pop(), "1");
+  const entry = createPage({
+    href: page.openedTabs[3].href,
+    stored: page.stored,
+    ready: true,
+  });
+  assert.match(entry.document.title, /^\[GR Keyfire /);
+  for (let i = 3; i < 8; i++) {
+    assert.equal(page.openedTabs.length, i + 1);
+    assert.equal(page.openedTabs[i].options.active, true);
+    page.openedTabs[i].close();
+    await page.flush();
+  }
+  assert.equal(page.openedTabs.length, 8);
+  assert.deepEqual(page.alerts, []);
+});
+
+test("enabling Keyfire starts a fresh automatic run after the ordinary opening queue finished", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([
+      ["gr_auto_open_all", "1"],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+    ]),
+    listing: { pages: [[1, 2]] },
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, false);
+  page.setKeyfire(true);
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 2);
+  await closeBatch(page, 2);
+  assert.equal(page.openedTabs.length, 3);
+  assert.equal(page.openedTabs[2].options.active, true);
+  assert.ok(new URL(page.openedTabs[2].href).hash.includes("grKeyfireRun="));
+  page.openedTabs[2].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 4);
+  page.openedTabs[3].close();
+  await page.flush();
   assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, false);
 });
 
 test("Keyfire setup is available but its action is hidden until a macro is saved", () => {
   const page = createPage({
     pathname: automaticListPath,
-    stored: new Map([["gr_keyfire_pairing_key", "c".repeat(64)]]),
+    stored: new Map(),
   });
   assert.ok(page.document.querySelector("#gr-keyfire-setup"));
   assert.equal(
@@ -1444,7 +1626,6 @@ test("blank, malformed, unsupported, and excessive saved settings hide the Keyfi
     const page = createPage({
       pathname: automaticListPath,
       stored: new Map([
-        ["gr_keyfire_pairing_key", "c".repeat(64)],
         ["gr_keyfire_enabled", "1"],
         [
           "gr_keyfire_settings",
@@ -1457,7 +1638,7 @@ test("blank, malformed, unsupported, and excessive saved settings hide the Keyfi
       page.document.querySelector("#gr-keyfire-enabled").checked,
       false,
     );
-    assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "0");
+    assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "1");
   }
 });
 
@@ -1494,6 +1675,32 @@ test("saving unchanged settings leaves the active batch running", async () => {
   assert.equal(page.openedTabs.length, 2);
 });
 
+test("changing valid Keyfire settings cancels the batch and preserves the enabled choice", async () => {
+  const page = keyfirePage();
+  await page.advanceAsync(1250);
+  const updated = { ...exampleKeyfireSettings, macroName: "Updated routine" };
+  page.saveKeyfireSettings(updated);
+  await page.flush();
+  assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "1");
+  assert.equal(
+    page.document.querySelector("#gr-keyfire-enabled").checked,
+    true,
+  );
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 1);
+  const next = createPage({
+    pathname: automaticListPath,
+    stored: page.stored,
+    listing: { pages: [[789]] },
+  });
+  await next.advanceAsync(1500);
+  assert.equal(next.openedTabs.length, 1);
+  assert.equal(next.openedTabs[0].options.active, true);
+  const hash = new URL(next.openedTabs[0].href).hash;
+  assert.ok(hash.includes("grKeyfireRun="));
+});
+
 test("custom macro, optional profile, and browser reach the authenticated batch", async () => {
   const selection = {
     macroName: "Books \u2014 \u672c",
@@ -1502,7 +1709,7 @@ test("custom macro, optional profile, and browser reach the authenticated batch"
   };
   const page = createPage({
     pathname: automaticListPath,
-    stored: new Map([["gr_keyfire_pairing_key", "c".repeat(64)]]),
+    stored: new Map(),
     listing: { pages: [[123]] },
   });
   page.saveKeyfireSettings(selection);

@@ -41,13 +41,10 @@ if (Test-Path -LiteralPath $pairingPath) {
     [IO.File]::WriteAllText($pairingPath, $pairingKey, (New-Object Text.UTF8Encoding $false))
 }
 $scriptPath = Join-Path $PSScriptRoot 'Giveaways.js'
-$pairedScriptPath = Join-Path $companionPath 'Giveaways.user.js'
+$preparedScriptPath = Join-Path $companionPath 'Giveaways.user.js'
 $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $scriptPath
-$placeholder = 'const KEYFIRE_PAIRING_KEY = "";'
-if (-not $source.Contains($placeholder)) { throw 'The userscript pairing placeholder was not found.' }
-$pairedSource = $source.Replace($placeholder, ('const KEYFIRE_PAIRING_KEY = "' + $pairingKey + '";'))
-[IO.File]::WriteAllText($pairedScriptPath, $pairedSource, (New-Object Text.UTF8Encoding $false))
-Write-Output "Install this paired file in Tampermonkey: $pairedScriptPath"
+[IO.File]::WriteAllText($preparedScriptPath, $source, (New-Object Text.UTF8Encoding $false))
+Write-Output "Install this userscript in Tampermonkey: $preparedScriptPath"
 if ($PrepareOnly) { return }
 
 $pythonwPath = Join-Path (Split-Path -Parent $pythonPath) 'pythonw.exe'

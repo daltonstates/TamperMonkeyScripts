@@ -1,7 +1,8 @@
 """Follow a user-selected Keyfire macro in a ready, managed giveaway tab.
 
-The paired userscript supplies the macro name, optional profile, browser, and
-a short-lived authenticated title marker. This companion reads the selected
+The userscript connects to this local helper to authorize each batch. It then
+supplies the macro name, optional profile, browser, and a short-lived authenticated
+title marker. This companion reads the selected
 macro without changing Keyfire and follows its supported key and Wait steps.
 """
 
@@ -15,10 +16,13 @@ from dataclasses import dataclass
 import json
 import hashlib
 import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import logging
 import os
 from pathlib import Path
 import re
+import secrets
+import threading
 import time
 
 
@@ -28,6 +32,7 @@ MARKER = re.compile(
 KEYS = {"Enter": 0x0D, "Space": 0x20, "Tab": 0x09}
 BROWSERS = {"edge": "msedge.exe", "chrome": "chrome.exe", "firefox": "firefox.exe"}
 MODIFIERS = {"Ctrl": (0x11,), "Shift": (0x10,), "Alt": (0x12,), "Win": (0x5B, 0x5C)}
+WORKFLOW_PORT = 17384
 
 
 @dataclass(frozen=True)
@@ -179,6 +184,102 @@ def read_workflow(config_path: Path, settings: Settings) -> Workflow:
     if not 0 <= delay <= 30000:
         raise ValueError("Invalid delay between workflow repetitions")
     return Workflow(steps, delay, storage_key, assignment_shortcut(storage_key))
+
+
+class WorkflowRequestHandler(BaseHTTPRequestHandler):
+    """Authorize a batch on loopback; never send keys or expose the private key."""
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(5)
+
+    def log_message(self, *_):
+        pass
+
+    def allowed_client(self):
+        origin = self.headers.get("Origin")
+        return (
+            self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
+            and (origin is None or origin == "https://www.goodreads.com"
+                 or re.fullmatch(r"(?:chrome|moz)-extension://[a-zA-Z0-9-]+", origin))
+        )
+
+    def reply(self, status, value):
+        body = json.dumps(value).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if self.allowed_client() and self.headers.get("Origin"):
+            self.send_header("Access-Control-Allow-Origin", self.headers["Origin"])
+            self.send_header("Vary", "Origin")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        requested_headers = {
+            value.strip().lower()
+            for value in self.headers.get("Access-Control-Request-Headers", "").split(",")
+        }
+        if (self.path != "/v1/workflow" or not self.allowed_client()
+                or self.headers.get("Access-Control-Request-Method") != "POST"
+                or not requested_headers.issubset({"content-type", "x-goodreads-companion"})):
+            self.reply(403, {"error": "This client is not allowed"})
+            return
+        self.send_response(204)
+        if self.headers.get("Origin"):
+            self.send_header("Access-Control-Allow-Origin", self.headers["Origin"])
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Goodreads-Companion")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        if (not self.allowed_client()
+                or self.headers.get("X-Goodreads-Companion") != "workflow"
+                or self.headers.get_content_type() != "application/json"):
+            self.reply(403, {"error": "This client is not allowed"})
+            return
+        if self.path != "/v1/workflow":
+            self.reply(404, {"error": "Unknown helper request"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 1 <= length <= 4096:
+                raise ValueError("Invalid request size")
+            value = json.loads(self.rfile.read(length))
+            config = value.get("config") if isinstance(value, dict) else None
+            if not isinstance(config, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,2048}", config):
+                raise ValueError("Invalid Keyfire settings")
+            settings = decode_settings(config)
+            workflow = read_workflow(self.server.config_path, settings)
+        except (ValueError, OSError) as error:
+            self.reply(400, {"error": str(error)})
+            return
+        run = secrets.token_hex(16)
+        proof = hmac.new(self.server.secret.encode("ascii"), f"{run}:{config}".encode("ascii"),
+                         hashlib.sha256).hexdigest()
+        self.reply(200, {"protocol": 1, "id": run, "proof": proof, "config": config})
+        logging.info("Prepared Keyfire batch: %s (%s)", workflow.storage_key, settings.browser)
+
+    def do_GET(self):
+        self.reply(405, {"error": "Use the giveaway userscript to start a workflow"})
+
+
+class WorkflowServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, config_path, secret, port=WORKFLOW_PORT):
+        self.config_path = config_path
+        self.secret = secret
+        super().__init__(("127.0.0.1", port), WorkflowRequestHandler)
+
+
+def start_workflow_server(config_path, secret, port=WORKFLOW_PORT):
+    server = WorkflowServer(config_path, secret, port)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+    return server
 
 
 class WorkflowRunner:
@@ -387,7 +488,7 @@ def main():
     read_config(args.config)
     secret = args.pairing_key_file.read_text(encoding="utf-8-sig").strip()
     if not re.fullmatch(r"[a-f0-9]{64}", secret):
-        raise ValueError("Invalid local pairing key; run Start-KeyfireGiveaways.ps1 again")
+        raise ValueError("Invalid helper authentication key; run Start-KeyfireGiveaways.ps1 again")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
@@ -401,8 +502,11 @@ def main():
     started = time.monotonic()
     last_run = None
     rejected_run = None
-    logging.info("Helper ready%s", " (dry run)" if args.dry_run else "")
+    server = None
     try:
+        server = start_workflow_server(args.config, secret)
+        logging.info("Automatic workflow connection ready on loopback port %s", server.server_port)
+        logging.info("Helper ready%s", " (dry run)" if args.dry_run else "")
         while args.seconds is None or time.monotonic() - started < args.seconds:
             cancel = desktop.pump_events()
             target = desktop.target()
@@ -430,6 +534,9 @@ def main():
         logging.exception("Helper stopped")
         raise
     finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
         desktop.close()
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle(mutex)

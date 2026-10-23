@@ -2,6 +2,7 @@ import json
 import base64
 import hashlib
 import hmac
+from http.client import HTTPConnection
 from pathlib import Path
 import tempfile
 import unittest
@@ -254,6 +255,7 @@ class CompanionLoopTests(unittest.TestCase):
                   patch.object(companion.ctypes, "WinDLL", return_value=kernel),
                   patch.object(companion.ctypes, "get_last_error", return_value=0),
                   patch.object(companion, "NativeDesktop", return_value=desktop),
+                  patch.object(companion, "start_workflow_server", return_value=MagicMock()),
                   patch.object(companion.time, "monotonic", side_effect=lambda: clock[0]),
                   patch.object(companion.time, "sleep", side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)),
                   self.assertLogs(level="INFO") as logs):
@@ -261,6 +263,109 @@ class CompanionLoopTests(unittest.TestCase):
         self.assertEqual(sent, [("Enter", "a" * 32), ("Space", "c" * 32)])
         self.assertTrue(any("Batch paused" in line for line in logs.output))
         desktop.close.assert_called_once()
+
+
+class AutomaticConnectionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.config = Path(self.directory.name) / "keyfire.json"
+        self.config.write_text(json.dumps({"assignments": {
+            MACRO_KEY: {"label": MACRO_NAME, "type": "macro", "data": {
+                "steps": [{"type": "Press Key", "value": "Enter"}],
+            }},
+        }}), encoding="utf-8")
+        self.secret = "c" * 64
+        self.server = companion.start_workflow_server(self.config, self.secret, port=0)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.directory.cleanup()
+
+    def request(self, *, method="POST", path="/v1/workflow", body=None, headers=None):
+        request_headers = {
+            "Origin": "https://www.goodreads.com",
+            "Content-Type": "application/json",
+            "X-Goodreads-Companion": "workflow",
+        }
+        request_headers.update(headers or {})
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        try:
+            connection.request(method, path, body if body is not None else json.dumps({"config": config_token()}),
+                               request_headers)
+            response = connection.getresponse()
+            raw = response.read()
+            return response.status, dict(response.getheaders()), json.loads(raw) if raw else None
+        finally:
+            connection.close()
+
+    def test_authorizes_a_batch_without_sharing_the_key_or_sending_any_keys(self):
+        before = self.config.read_bytes()
+        with patch.object(companion, "NativeDesktop") as desktop:
+            status, headers, value = self.request()
+        self.assertEqual(status, 200)
+        self.assertEqual(value["protocol"], 1)
+        self.assertNotIn(self.secret, json.dumps(value))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        title = f"[GR Keyfire {value['id']} {value['proof']} {value['config']} 123 address 1000] Goodreads"
+        target = parse_target(1, title, "msedge.exe", 999, self.secret)
+        self.assertEqual(target.settings, Settings(MACRO_NAME))
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.server.server_address[0], "127.0.0.1")
+        desktop.assert_not_called()
+
+    def test_other_web_origins_cannot_authorize_batches(self):
+        for origin in ("https://evil.example", "null", "http://www.goodreads.com",
+                       "https://www.goodreads.com.evil.example"):
+            with self.subTest(origin=origin):
+                status, headers, value = self.request(headers={"Origin": origin})
+                self.assertEqual(status, 403)
+                self.assertNotIn("Access-Control-Allow-Origin", headers)
+                self.assertNotIn("proof", value)
+
+    def test_rebinding_hosts_and_simple_browser_posts_are_rejected(self):
+        for headers in ({"Host": "evil.example"}, {"X-Goodreads-Companion": ""},
+                        {"Content-Type": "text/plain"}):
+            with self.subTest(headers=headers):
+                status, _, value = self.request(headers=headers)
+                self.assertEqual(status, 403)
+                self.assertNotIn("proof", value)
+
+    def test_the_userscript_extension_origin_is_supported(self):
+        for origin in ("chrome-extension://" + "a" * 32, "moz-extension://example-extension-id"):
+            with self.subTest(origin=origin):
+                status, _, value = self.request(headers={"Origin": origin})
+                self.assertEqual(status, 200)
+                self.assertIn("proof", value)
+
+    def test_only_the_goodreads_preflight_can_request_the_workflow_headers(self):
+        headers = {"Access-Control-Request-Method": "POST",
+                   "Access-Control-Request-Headers": "Content-Type, X-Goodreads-Companion"}
+        status, result_headers, _ = self.request(method="OPTIONS", headers=headers)
+        self.assertEqual(status, 204)
+        self.assertEqual(result_headers["Access-Control-Allow-Origin"], "https://www.goodreads.com")
+        status, _, _ = self.request(method="OPTIONS", headers={**headers, "Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_invalid_macros_and_payloads_never_get_an_authorization(self):
+        for body in ("bad JSON", "[]", "{}", "x" * 5000,
+                     json.dumps({"config": config_token(macroName="Missing")}),
+                     json.dumps({"config": config_token(browser="other")}),
+                     json.dumps({"config": ["bad"]})):
+            with self.subTest(body=body):
+                status, _, value = self.request(body=body)
+                self.assertEqual(status, 400)
+                self.assertNotIn("proof", value)
+
+    def test_plain_gets_and_other_paths_never_expose_authentication(self):
+        for method, path, expected in (("GET", "/v1/workflow", 405),
+                                       ("GET", "/pairing-key.txt", 405),
+                                       ("POST", "/other", 404)):
+            with self.subTest(method=method, path=path):
+                status, _, value = self.request(method=method, path=path)
+                self.assertEqual(status, expected)
+                self.assertNotIn("proof", value)
+                self.assertNotIn(self.secret, json.dumps(value))
 
 
 if __name__ == "__main__":

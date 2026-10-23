@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.18
+// @version      4.19
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, optionally opens all on load, and supports a Keyfire workflow companion while claiming.
@@ -11,6 +11,8 @@
 // @match        https://www.goodreads.com/giveaway/enter_print_giveaway/*
 // @run-at       document-start
 // @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
 // @grant        window.close
 // @grant        window.focus
 // ==/UserScript==
@@ -42,10 +44,8 @@
   const LS_AUTO_OPEN_ALL = "gr_auto_open_all";
   const LS_KEYFIRE_ENABLED = "gr_keyfire_enabled";
   const LS_KEYFIRE_RUN_PREFIX = "gr_keyfire_run_";
-  const LS_KEYFIRE_PAIRING_KEY = "gr_keyfire_pairing_key";
   const LS_KEYFIRE_SETTINGS = "gr_keyfire_settings";
-  // The local launcher fills this in only in its private, paired userscript.
-  const KEYFIRE_PAIRING_KEY = "";
+  const KEYFIRE_HELPER_URL = "http://127.0.0.1:17384/v1/workflow";
   const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
   const SS_GIVEAWAY_CONTINUATION = "gr_giveaway_continuation";
   const PROGRESS_HASH_INDEX = "grGiveawayIndex";
@@ -132,23 +132,18 @@
       settings.macroName.length > 0 &&
       settings.macroName.length <= 100 &&
       settings.profile.length <= 100 &&
-      Object.hasOwn(KEYFIRE_BROWSERS, settings.browser) &&
-      /^[a-f0-9]{64}$/.test(localStorage.getItem(LS_KEYFIRE_PAIRING_KEY) || "")
+      Object.hasOwn(KEYFIRE_BROWSERS, settings.browser)
     );
   }
 
-  if (KEYFIRE_PAIRING_KEY) {
-    localStorage.setItem(LS_KEYFIRE_PAIRING_KEY, KEYFIRE_PAIRING_KEY);
-  }
   let filteringEnabled = loadFilterEnabled();
   let BLOCKED = new Set(loadBlockedGenres().map((g) => g.toLowerCase()));
   let maxOpenTabs = loadMaxOpenTabs();
   let autoOpenAllEnabled = localStorage.getItem(LS_AUTO_OPEN_ALL) === "1";
   let keyfireSettings = loadKeyfireSettings();
-  let keyfireEnabled =
-    localStorage.getItem(LS_KEYFIRE_ENABLED) === "1" &&
-    isKeyfireConfigured(keyfireSettings);
-  if (!keyfireEnabled) localStorage.setItem(LS_KEYFIRE_ENABLED, "0");
+  // Keep the user's choice separate from setup readiness. Entry tabs must not
+  // turn a requested keyboard workflow into background-only tab opening.
+  let keyfireEnabled = localStorage.getItem(LS_KEYFIRE_ENABLED) === "1";
   let openingGiveaways = false;
   let giveawayBatchOpened = 0;
   let giveawayBatchTotal = 0;
@@ -159,9 +154,11 @@
   let leavingPage = false;
   let openButton = null;
   let openAllButton = null;
+  let workflowStatus = null;
 
   const openedGiveawayLinks = new Set();
   const trackedGiveawayTabs = new Set();
+  const manualGiveawayTabs = new Map();
 
   const normalize = (s) => s.trim().toLowerCase();
 
@@ -338,7 +335,32 @@
     if (label) label.textContent = text;
   }
 
+  function refreshWorkflowStatus() {
+    if (!workflowStatus) return;
+    workflowStatus.hidden = !keyfireSettings.macroName && !keyfireEnabled;
+    const text = keyfireEnabled
+      ? isKeyfireConfigured(keyfireSettings)
+        ? manualGiveawayTabs.size > 0
+          ? `Keyfire on. Waiting for ${manualGiveawayTabs.size} tabs opened for manual entry to close.`
+          : `Keyfire on: ${keyfireSettings.macroName}. One giveaway at a time.`
+        : "Keyfire needs setup. Open Keyfire setup before starting."
+      : "Keyfire off. Tabs open for manual entry. Check Use Keyfire workflow to claim automatically.";
+    if (workflowStatus.textContent !== text) workflowStatus.textContent = text;
+  }
+
+  function keyfireReadyToStart() {
+    if (!keyfireEnabled || isKeyfireConfigured(keyfireSettings)) return true;
+    const setup = document.querySelector("#gr-keyfire-setup");
+    if (setup) setup.open = true;
+    refreshWorkflowStatus();
+    alert(
+      "Keyfire is selected but needs setup. Save a valid macro and browser. No giveaway tabs were opened.",
+    );
+    return false;
+  }
+
   function refreshOpenButton() {
+    refreshWorkflowStatus();
     if (openAllButton) {
       openAllButton.disabled =
         loadingGiveaways || openingGiveaways || refreshingGiveaways;
@@ -460,6 +482,7 @@
 
   async function openAllGiveaways(continuation = null) {
     if (loadingGiveaways || openingGiveaways || refreshingGiveaways) return;
+    if (!keyfireReadyToStart()) return;
 
     const controller = new AbortController();
     // React can briefly remove both the status and button between pages.
@@ -467,12 +490,16 @@
     const pagination = { total: null };
     const previouslyOpenedIds = new Set(continuation?.openedIds ?? []);
     let capped = false;
+    let preparedWorkflow = null;
     giveawayRunController = controller;
     loadingGiveaways = true;
     refreshOpenButton();
 
     try {
       try {
+        if (keyfireEnabled) {
+          preparedWorkflow = await startKeyfireRun(controller.signal);
+        }
         let button = await waitForGiveawayPage(
           null,
           controller.signal,
@@ -520,7 +547,9 @@
         if (controller.signal.aborted) return;
         console.error("Could not load all Goodreads giveaways", error);
         alert(
-          "Could not load all giveaways. Check the page and try again. No giveaways were opened.",
+          keyfireEnabled && !preparedWorkflow
+            ? error.message
+            : "Could not load all giveaways. Check the page and try again. No giveaways were opened.",
         );
         return;
       } finally {
@@ -533,6 +562,7 @@
         rowLimit: MAX_GIVEAWAY_ROWS,
         skippedIds: previouslyOpenedIds,
         waitForAll: capped,
+        workflow: preparedWorkflow,
       });
       if (controller.signal.aborted || !capped || !result || result.failed)
         return;
@@ -566,11 +596,12 @@
       refreshOpenButton();
       window.location.reload();
     } finally {
+      preparedWorkflow?.stop();
       finishGiveawayRun(controller);
     }
   }
 
-  function trackGiveawayTab(tab) {
+  function trackGiveawayTab(tab, link, workflow) {
     if (!tab || typeof tab !== "object") return;
 
     let closedPromise;
@@ -606,8 +637,10 @@
     });
 
     trackedGiveawayTabs.add(closedPromise);
+    if (!workflow) manualGiveawayTabs.set(closedPromise, link);
     closedPromise.then(() => {
       trackedGiveawayTabs.delete(closedPromise);
+      manualGiveawayTabs.delete(closedPromise);
       refreshOpenButton();
     });
   }
@@ -623,6 +656,7 @@
 
   async function openVisibleGiveaways(controller = null, options = {}) {
     if (openingGiveaways || loadingGiveaways) return;
+    if (!keyfireReadyToStart()) return;
 
     const links = getVisibleGiveawayLinks(options);
     const openedIds = [];
@@ -646,7 +680,9 @@
     let workflow = null;
 
     try {
-      if (keyfireEnabled) workflow = await startKeyfireRun(signal);
+      if (keyfireEnabled) {
+        workflow = options.workflow ?? (await startKeyfireRun(signal));
+      }
       for (const [linkIndex, link] of links.entries()) {
         await waitForOpenTabSlot(signal);
         signal.throwIfAborted();
@@ -667,7 +703,7 @@
           }
           openedGiveawayLinks.add(link);
           openedIds.push(getGiveawayId(link));
-          trackGiveawayTab(tab);
+          trackGiveawayTab(tab, link, workflow);
           opened++;
           giveawayBatchOpened = opened;
           refreshOpenButton();
@@ -715,17 +751,79 @@
     }
   }
 
-  async function startKeyfireRun(signal) {
-    const secret = localStorage.getItem(LS_KEYFIRE_PAIRING_KEY);
-    if (!/^[a-f0-9]{64}$/.test(secret || "")) {
-      throw new Error(
-        "Install the paired userscript created by Start-KeyfireGiveaways.ps1 before enabling the Keyfire workflow.",
+  function prepareKeyfireWorkflow(config, signal) {
+    signal.throwIfAborted();
+    return new Promise((resolve, reject) => {
+      let request = null;
+      let settled = false;
+      const offline = new Error(
+        "The Goodreads Windows helper could not be reached. Start or update the helper, then try again.",
       );
-    }
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abort);
+        if (error) {
+          request?.abort();
+          reject(error);
+        } else {
+          resolve(value);
+        }
+      };
+      const abort = () => finish(signal.reason);
+      // Tampermonkey's fetch-backed requests can ignore their timeout option.
+      const timeout = setTimeout(() => finish(offline), 5000);
+      signal.addEventListener("abort", abort, { once: true });
+      try {
+        request = GM_xmlhttpRequest({
+          method: "POST",
+          url: KEYFIRE_HELPER_URL,
+          anonymous: true,
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goodreads-Companion": "workflow",
+          },
+          data: JSON.stringify({ config }),
+          onerror: () => finish(offline),
+          ontimeout: () => finish(offline),
+          onabort: () => finish(offline),
+          onload: (response) => {
+            try {
+              const value = JSON.parse(response.responseText);
+              if (response.status !== 200) {
+                throw new Error(
+                  typeof value.error === "string"
+                    ? `Keyfire could not start: ${value.error.slice(0, 200)}`
+                    : "The Windows helper could not prepare the selected workflow.",
+                );
+              }
+              if (
+                value.protocol !== 1 ||
+                !/^[a-f0-9]{32}$/.test(value.id || "") ||
+                !/^[a-f0-9]{64}$/.test(value.proof || "") ||
+                value.config !== config
+              ) {
+                throw new Error(
+                  "Update the Goodreads Windows helper and try again.",
+                );
+              }
+              finish(null, value);
+            } catch (error) {
+              finish(error);
+            }
+          },
+        });
+      } catch {
+        finish(offline);
+      }
+    });
+  }
+
+  async function startKeyfireRun(signal) {
     if (!isKeyfireConfigured(keyfireSettings)) {
       throw new Error("Choose a macro and browser under Keyfire setup first.");
     }
-    const id = crypto.randomUUID().replace(/-/g, "");
     const encoder = new TextEncoder();
     const config = btoa(
       String.fromCharCode(...encoder.encode(JSON.stringify(keyfireSettings))),
@@ -733,21 +831,7 @@
       .replace(/\+/g, "-")
       .replace(/\//g, "_")
       .replace(/=+$/, "");
-    const signingKey = await crypto.subtle.importKey(
-      "raw",
-      encoder.encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"],
-    );
-    const signature = await crypto.subtle.sign(
-      "HMAC",
-      signingKey,
-      encoder.encode(`${id}:${config}`),
-    );
-    const proof = Array.from(new Uint8Array(signature), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
+    const { id, proof } = await prepareKeyfireWorkflow(config, signal);
     signal.throwIfAborted();
     const key = LS_KEYFIRE_RUN_PREFIX + id;
     const heartbeat = () => {
@@ -830,6 +914,7 @@
                 top: 20px;
                 right: 20px;
                 width: 284px;
+                max-height: calc(100vh - 40px);
                 z-index: 99999;
                 display: flex;
                 flex-direction: column;
@@ -853,6 +938,7 @@
 
             #gr-open-all-row {
                 display: flex;
+                flex-shrink: 0;
                 align-items: stretch;
                 gap: 8px;
             }
@@ -875,7 +961,8 @@
             }
 
             #gr-open-btn[hidden],
-            #gr-keyfire-row[hidden] {
+            #gr-keyfire-row[hidden],
+            #gr-workflow-status[hidden] {
                 display: none;
             }
 
@@ -886,6 +973,8 @@
             }
 
             #gr-settings {
+                min-height: 0;
+                overflow-y: auto;
                 padding: 12px;
                 background: #222;
                 color: #fff;
@@ -917,6 +1006,13 @@
                 border-radius: 4px;
                 background: #fff;
                 color: #222;
+            }
+
+            #gr-workflow-status {
+                margin: 8px 0;
+                font-size: 12px;
+                line-height: 1.4;
+                overflow-wrap: anywhere;
             }
 
             #gr-keyfire-setup {
@@ -955,6 +1051,10 @@
             #gr-keyfire-save {
                 margin-top: 8px;
                 padding: 6px 10px;
+                background: #fff;
+                color: #222;
+                border: 1px solid #777;
+                border-radius: 4px;
                 cursor: pointer;
             }
 
@@ -1045,6 +1145,11 @@
     tabLimitRow.appendChild(tabLimitInput);
     panel.appendChild(tabLimitRow);
 
+    workflowStatus = document.createElement("p");
+    workflowStatus.id = "gr-workflow-status";
+    workflowStatus.setAttribute("role", "status");
+    panel.appendChild(workflowStatus);
+
     const keyfireRow = document.createElement("label");
     keyfireRow.id = "gr-keyfire-row";
     keyfireRow.textContent = "Use Keyfire workflow";
@@ -1053,17 +1158,37 @@
     keyfireCheckbox.type = "checkbox";
     keyfireCheckbox.checked = keyfireEnabled;
     keyfireCheckbox.addEventListener("change", () => {
+      if (keyfireCheckbox.checked && !isKeyfireConfigured(keyfireSettings)) {
+        keyfireCheckbox.checked = false;
+        return;
+      }
       keyfireEnabled =
         keyfireCheckbox.checked && isKeyfireConfigured(keyfireSettings);
       keyfireCheckbox.checked = keyfireEnabled;
       localStorage.setItem(LS_KEYFIRE_ENABLED, keyfireEnabled ? "1" : "0");
       sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
+      if (keyfireEnabled) {
+        // Existing manual tabs have no keyboard workflow. Once closed, retry
+        // those entries in fresh foreground tabs belonging to the new run.
+        for (const link of manualGiveawayTabs.values()) {
+          openedGiveawayLinks.delete(link);
+        }
+      }
       restartAutoOpen =
         Boolean(giveawayRunController) &&
         keyfireEnabled &&
         autoOpenAllEnabled &&
         isAutoOpenPage();
       giveawayRunController?.abort();
+      refreshOpenButton();
+      if (
+        !giveawayRunController &&
+        keyfireEnabled &&
+        autoOpenAllEnabled &&
+        isAutoOpenPage()
+      ) {
+        void openAllGiveaways();
+      }
     });
     keyfireRow.appendChild(keyfireCheckbox);
     panel.appendChild(keyfireRow);
@@ -1151,7 +1276,7 @@
 
     const description = document.createElement("p");
     description.textContent =
-      "The Windows companion reads a saved Keyfire macro and replays its steps itself, one giveaway at a time. Requires the helper and paired userscript.";
+      "The Windows companion reads a saved Keyfire macro and replays its steps itself, one giveaway at a time. It connects automatically when you start a run.";
     setup.appendChild(description);
 
     const addInput = (id, label, value, placeholder) => {
@@ -1209,13 +1334,16 @@
 
     const refresh = () => {
       row.hidden = !isKeyfireConfigured(keyfireSettings);
-      checkbox.checked = keyfireEnabled;
+      checkbox.checked = keyfireEnabled && !row.hidden;
       row.title = `Use ${keyfireSettings.macroName} to claim one giveaway at a time.`;
       status.textContent = !keyfireSettings.macroName
         ? "Enter and save a macro name to show the Keyfire control."
         : row.hidden
-          ? "Complete helper setup and install its paired userscript to enable the Keyfire control."
-          : `Saved: ${keyfireSettings.macroName}. Enable Use Keyfire workflow to use it.`;
+          ? "Save a valid macro name and supported browser to enable the Keyfire control."
+          : keyfireEnabled
+            ? `Saved: ${keyfireSettings.macroName}. Keyfire is enabled.`
+            : `Saved: ${keyfireSettings.macroName}. Check Use Keyfire workflow to enable automatic claiming.`;
+      refreshOpenButton();
     };
     save.onclick = () => {
       const next = normalizeKeyfireSettings({
@@ -1238,8 +1366,8 @@
           restartAutoOpen = false;
           giveawayRunController?.abort();
         }
-        keyfireEnabled = false;
-        localStorage.setItem(LS_KEYFIRE_ENABLED, "0");
+        keyfireEnabled = keyfireEnabled && isKeyfireConfigured(next);
+        localStorage.setItem(LS_KEYFIRE_ENABLED, keyfireEnabled ? "1" : "0");
         keyfireSettings = next;
         localStorage.setItem(LS_KEYFIRE_SETTINGS, JSON.stringify(next));
       }
