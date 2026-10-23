@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.15
+// @version      4.16
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, optionally opens all on load, and supports a Keyfire workflow companion while claiming.
@@ -43,6 +43,7 @@
   const LS_KEYFIRE_ENABLED = "gr_keyfire_enabled";
   const LS_KEYFIRE_RUN_PREFIX = "gr_keyfire_run_";
   const LS_KEYFIRE_PAIRING_KEY = "gr_keyfire_pairing_key";
+  const LS_KEYFIRE_SETTINGS = "gr_keyfire_settings";
   // The local launcher fills this in only in its private, paired userscript.
   const KEYFIRE_PAIRING_KEY = "";
   const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
@@ -51,6 +52,12 @@
   const PROGRESS_HASH_ID = "grGiveawayId";
   const PROGRESS_HASH_KEYFIRE_RUN = "grKeyfireRun";
   const PROGRESS_HASH_KEYFIRE_PROOF = "grKeyfireProof";
+  const PROGRESS_HASH_KEYFIRE_CONFIG = "grKeyfireConfig";
+  const KEYFIRE_BROWSERS = {
+    edge: "Microsoft Edge",
+    chrome: "Google Chrome",
+    firefox: "Mozilla Firefox",
+  };
   const DEFAULT_MAX_OPEN_TABS = 8;
   const MIN_OPEN_TABS = 1;
   const MAX_OPEN_TABS = 50;
@@ -97,6 +104,35 @@
 
   const defaultGenres = () => [];
 
+  function normalizeKeyfireSettings(value) {
+    return {
+      macroName:
+        typeof value?.macroName === "string" ? value.macroName.trim() : "",
+      profile: typeof value?.profile === "string" ? value.profile.trim() : "",
+      browser: value?.browser ?? "edge",
+    };
+  }
+
+  function loadKeyfireSettings() {
+    try {
+      return normalizeKeyfireSettings(
+        JSON.parse(localStorage.getItem(LS_KEYFIRE_SETTINGS)),
+      );
+    } catch {
+      return normalizeKeyfireSettings(null);
+    }
+  }
+
+  function isKeyfireConfigured(settings) {
+    return (
+      settings.macroName.length > 0 &&
+      settings.macroName.length <= 100 &&
+      settings.profile.length <= 100 &&
+      Object.hasOwn(KEYFIRE_BROWSERS, settings.browser) &&
+      /^[a-f0-9]{64}$/.test(localStorage.getItem(LS_KEYFIRE_PAIRING_KEY) || "")
+    );
+  }
+
   if (KEYFIRE_PAIRING_KEY) {
     localStorage.setItem(LS_KEYFIRE_PAIRING_KEY, KEYFIRE_PAIRING_KEY);
   }
@@ -104,7 +140,11 @@
   let BLOCKED = new Set(loadBlockedGenres().map((g) => g.toLowerCase()));
   let maxOpenTabs = loadMaxOpenTabs();
   let autoOpenAllEnabled = localStorage.getItem(LS_AUTO_OPEN_ALL) === "1";
-  let keyfireEnabled = localStorage.getItem(LS_KEYFIRE_ENABLED) === "1";
+  let keyfireSettings = loadKeyfireSettings();
+  let keyfireEnabled =
+    localStorage.getItem(LS_KEYFIRE_ENABLED) === "1" &&
+    isKeyfireConfigured(keyfireSettings);
+  if (!keyfireEnabled) localStorage.setItem(LS_KEYFIRE_ENABLED, "0");
   let openingGiveaways = false;
   let loadingGiveaways = false;
   let giveawayRunController = null;
@@ -211,6 +251,7 @@
     if (workflow) {
       hash.set(PROGRESS_HASH_KEYFIRE_RUN, workflow.id);
       hash.set(PROGRESS_HASH_KEYFIRE_PROOF, workflow.proof);
+      hash.set(PROGRESS_HASH_KEYFIRE_CONFIG, workflow.config);
     }
     url.hash = hash.toString();
     return url.href;
@@ -508,8 +549,17 @@
         "Install the paired userscript created by Start-KeyfireGiveaways.ps1 before enabling the Keyfire workflow.",
       );
     }
+    if (!isKeyfireConfigured(keyfireSettings)) {
+      throw new Error("Choose a macro and browser under Keyfire setup first.");
+    }
     const id = crypto.randomUUID().replace(/-/g, "");
     const encoder = new TextEncoder();
+    const config = btoa(
+      String.fromCharCode(...encoder.encode(JSON.stringify(keyfireSettings))),
+    )
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
     const signingKey = await crypto.subtle.importKey(
       "raw",
       encoder.encode(secret),
@@ -520,7 +570,7 @@
     const signature = await crypto.subtle.sign(
       "HMAC",
       signingKey,
-      encoder.encode(id),
+      encoder.encode(`${id}:${config}`),
     );
     const proof = Array.from(new Uint8Array(signature), (byte) =>
       byte.toString(16).padStart(2, "0"),
@@ -538,13 +588,18 @@
       signal.removeEventListener("abort", stop);
     };
     signal.addEventListener("abort", stop, { once: true });
-    return { id, proof, stop };
+    return { id, proof, config, stop };
   }
 
   function enableKeyfireForEntry(stage) {
     const progress = loadGiveawayProgress();
-    if (!progress?.keyfireRun || !progress.keyfireProof) return;
-    const prefix = `[GR Keyfire ${progress.keyfireRun} ${progress.keyfireProof} ${progress.giveawayId} ${stage}`;
+    if (
+      !progress?.keyfireRun ||
+      !progress.keyfireProof ||
+      !progress.keyfireConfig
+    )
+      return;
+    const prefix = `[GR Keyfire ${progress.keyfireRun} ${progress.keyfireProof} ${progress.keyfireConfig} ${progress.giveawayId} ${stage}`;
     const cleanTitle = () =>
       document.title.replace(/^\[GR Keyfire [^\]]+\] /, "");
     let stopped = false;
@@ -646,7 +701,8 @@
                 cursor: pointer;
             }
 
-            #gr-open-btn[hidden] {
+            #gr-open-btn[hidden],
+            #gr-keyfire-row[hidden] {
                 display: none;
             }
 
@@ -688,6 +744,45 @@
                 border-radius: 4px;
                 background: #fff;
                 color: #222;
+            }
+
+            #gr-keyfire-setup {
+                margin-top: 10px;
+                padding-top: 8px;
+                border-top: 1px solid #555;
+            }
+
+            #gr-keyfire-setup summary {
+                cursor: pointer;
+            }
+
+            #gr-keyfire-setup label {
+                display: block;
+                margin-top: 8px;
+            }
+
+            #gr-keyfire-setup input,
+            #gr-keyfire-setup select {
+                box-sizing: border-box;
+                width: 100%;
+                margin-top: 4px;
+                padding: 5px;
+                color: #222;
+                background: #fff;
+                border: 1px solid #777;
+                border-radius: 4px;
+            }
+
+            #gr-keyfire-setup p {
+                margin: 8px 0;
+                font-size: 12px;
+                line-height: 1.4;
+            }
+
+            #gr-keyfire-save {
+                margin-top: 8px;
+                padding: 6px 10px;
+                cursor: pointer;
             }
 
             #gr-accordion-content {
@@ -780,14 +875,14 @@
     const keyfireRow = document.createElement("label");
     keyfireRow.id = "gr-keyfire-row";
     keyfireRow.textContent = "Use Keyfire workflow";
-    keyfireRow.title =
-      "Use the local helper to follow your saved Keyfire F13 workflow, one giveaway at a time. Stop any manual F13 loop first.";
     const keyfireCheckbox = document.createElement("input");
     keyfireCheckbox.id = "gr-keyfire-enabled";
     keyfireCheckbox.type = "checkbox";
     keyfireCheckbox.checked = keyfireEnabled;
     keyfireCheckbox.addEventListener("change", () => {
-      keyfireEnabled = keyfireCheckbox.checked;
+      keyfireEnabled =
+        keyfireCheckbox.checked && isKeyfireConfigured(keyfireSettings);
+      keyfireCheckbox.checked = keyfireEnabled;
       localStorage.setItem(LS_KEYFIRE_ENABLED, keyfireEnabled ? "1" : "0");
       restartAutoOpen =
         Boolean(giveawayRunController) && keyfireEnabled && autoOpenAllEnabled;
@@ -795,6 +890,7 @@
     });
     keyfireRow.appendChild(keyfireCheckbox);
     panel.appendChild(keyfireRow);
+    createKeyfireSetup(panel, keyfireRow, keyfireCheckbox);
 
     /* Accordion header */
     const header = document.createElement("div");
@@ -867,6 +963,114 @@
     };
 
     document.querySelector("#gr-controls").appendChild(panel);
+  }
+
+  function createKeyfireSetup(panel, row, checkbox) {
+    const setup = document.createElement("details");
+    setup.id = "gr-keyfire-setup";
+    const summary = document.createElement("summary");
+    summary.textContent = "Keyfire setup";
+    setup.appendChild(summary);
+
+    const description = document.createElement("p");
+    description.textContent =
+      "The Windows companion reads a saved Keyfire macro and replays its steps itself, one giveaway at a time. Requires the helper and paired userscript.";
+    setup.appendChild(description);
+
+    const addInput = (id, label, value, placeholder) => {
+      const field = document.createElement("label");
+      field.textContent = label;
+      const input = document.createElement("input");
+      input.id = id;
+      input.type = "text";
+      input.maxLength = 100;
+      input.value = value;
+      input.placeholder = placeholder;
+      field.appendChild(input);
+      setup.appendChild(field);
+      return input;
+    };
+    const macro = addInput(
+      "gr-keyfire-macro",
+      "Macro name",
+      keyfireSettings.macroName,
+      "Name of your saved macro",
+    );
+    const profile = addInput(
+      "gr-keyfire-profile",
+      "Profile (optional)",
+      keyfireSettings.profile,
+      "Use when macro names repeat",
+    );
+    const browserLabel = document.createElement("label");
+    browserLabel.textContent = "Browser";
+    const browser = document.createElement("select");
+    browser.id = "gr-keyfire-browser";
+    for (const [value, text] of Object.entries(KEYFIRE_BROWSERS)) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      browser.appendChild(option);
+    }
+    browser.value = keyfireSettings.browser;
+    browserLabel.appendChild(browser);
+    setup.appendChild(browserLabel);
+
+    const help = document.createElement("p");
+    help.textContent =
+      "Match the macro name saved in Keyfire. Supported steps: Enter, Space, Tab, and Wait (ms). Switching away pauses typing. Escape pauses the batch. Unchecking the Keyfire control cancels it. Stop any manual macro loop before starting.";
+    setup.appendChild(help);
+    const save = document.createElement("button");
+    save.id = "gr-keyfire-save";
+    save.type = "button";
+    save.textContent = "Save Keyfire settings";
+    setup.appendChild(save);
+    const status = document.createElement("p");
+    status.id = "gr-keyfire-setup-status";
+    status.setAttribute("role", "status");
+    setup.appendChild(status);
+
+    const refresh = () => {
+      row.hidden = !isKeyfireConfigured(keyfireSettings);
+      checkbox.checked = keyfireEnabled;
+      row.title = `Use ${keyfireSettings.macroName} to claim one giveaway at a time.`;
+      status.textContent = !keyfireSettings.macroName
+        ? "Enter and save a macro name to show the Keyfire control."
+        : row.hidden
+          ? "Complete helper setup and install its paired userscript to enable the Keyfire control."
+          : `Saved: ${keyfireSettings.macroName}. Enable Use Keyfire workflow to use it.`;
+    };
+    save.onclick = () => {
+      const next = normalizeKeyfireSettings({
+        macroName: macro.value,
+        profile: profile.value,
+        browser: browser.value,
+      });
+      if (
+        next.macroName.length > 100 ||
+        next.profile.length > 100 ||
+        !Object.hasOwn(KEYFIRE_BROWSERS, next.browser)
+      ) {
+        status.textContent =
+          "Choose a supported browser and keep names to 100 characters or fewer.";
+        return;
+      }
+      if (JSON.stringify(next) !== JSON.stringify(keyfireSettings)) {
+        if (keyfireEnabled) {
+          restartAutoOpen = false;
+          giveawayRunController?.abort();
+        }
+        keyfireEnabled = false;
+        localStorage.setItem(LS_KEYFIRE_ENABLED, "0");
+        keyfireSettings = next;
+        localStorage.setItem(LS_KEYFIRE_SETTINGS, JSON.stringify(next));
+      }
+      macro.value = next.macroName;
+      profile.value = next.profile;
+      refresh();
+    };
+    refresh();
+    panel.appendChild(setup);
   }
 
   /* ------------------------------------------------------------
@@ -967,6 +1171,7 @@
 
     const keyfireRun = hash.get(PROGRESS_HASH_KEYFIRE_RUN);
     const keyfireProof = hash.get(PROGRESS_HASH_KEYFIRE_PROOF);
+    const keyfireConfig = hash.get(PROGRESS_HASH_KEYFIRE_CONFIG);
     return {
       index,
       total,
@@ -974,6 +1179,9 @@
       keyfireRun: /^[a-f0-9]{32}$/.test(keyfireRun || "") ? keyfireRun : null,
       keyfireProof: /^[a-f0-9]{64}$/.test(keyfireProof || "")
         ? keyfireProof
+        : null,
+      keyfireConfig: /^[A-Za-z0-9_-]{1,2048}$/.test(keyfireConfig || "")
+        ? keyfireConfig
         : null,
     };
   }

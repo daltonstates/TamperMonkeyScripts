@@ -9,6 +9,11 @@ const script = fs.readFileSync(path.join(__dirname, "Giveaways.js"), "utf8");
 const addressPath = "/giveaway/enter_choose_address/123";
 const entryPath = "/giveaway/enter_print_giveaway/123";
 const retryParam = "grGiveawayReload";
+const exampleKeyfireSettings = {
+  macroName: "Giveaway routine",
+  profile: "Books",
+  browser: "edge",
+};
 
 function eventTarget() {
   const listeners = new Map();
@@ -247,6 +252,7 @@ function createPage({
     URLSearchParams,
     AbortController,
     TextEncoder,
+    btoa: (value) => Buffer.from(value, "binary").toString("base64"),
     crypto: {
       randomUUID: () => webcrypto.randomUUID(),
       subtle: {
@@ -313,6 +319,15 @@ function createPage({
       const checkbox = document.querySelector("#gr-keyfire-enabled");
       checkbox.checked = checked;
       checkbox.emit("change");
+    },
+    saveKeyfireSettings(settings) {
+      document.querySelector("#gr-keyfire-macro").value =
+        settings.macroName ?? "";
+      document.querySelector("#gr-keyfire-profile").value =
+        settings.profile ?? "";
+      document.querySelector("#gr-keyfire-browser").value =
+        settings.browser ?? "edge";
+      document.querySelector("#gr-keyfire-save").click();
     },
     async flush() {
       for (let i = 0; i < 20; i++) await Promise.resolve();
@@ -679,6 +694,7 @@ function keyfirePage() {
       ["gr_auto_open_all", "1"],
       ["gr_keyfire_enabled", "1"],
       ["gr_keyfire_pairing_key", "c".repeat(64)],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
     ]),
     listing: { pages: [[123, 456]] },
   });
@@ -721,7 +737,7 @@ test("only a ready entry from the active Keyfire batch gets a helper marker", as
   entry.advance(50);
   assert.match(
     entry.document.title,
-    /^\[GR Keyfire [a-f0-9]{32} [a-f0-9]{64} 123 address \d+\] /,
+    /^\[GR Keyfire [a-f0-9]{32} [a-f0-9]{64} [A-Za-z0-9_-]+ 123 address \d+\] /,
   );
   assert.equal(entry.document.querySelector("#gr-controls"), null);
   assert.equal(entry.openedTabs.length, 0);
@@ -774,7 +790,7 @@ test("per-tab Keyfire progress survives navigation to the entry form without the
   });
   assert.match(
     entry.document.title,
-    /^\[GR Keyfire [a-f0-9]{32} [a-f0-9]{64} 123 entry \d+\] /,
+    /^\[GR Keyfire [a-f0-9]{32} [a-f0-9]{64} [A-Za-z0-9_-]+ 123 entry \d+\] /,
   );
   entry.document.emit("submit");
   assert.equal(entry.document.title, "Giveaways | Goodreads");
@@ -859,22 +875,166 @@ test("Keyfire progress carries a proof from this installation's pairing key", as
     new URL(page.openedTabs[0].href).hash.slice(1),
   );
   const expected = createHmac("sha256", "c".repeat(64))
-    .update(hash.get("grKeyfireRun"))
+    .update(`${hash.get("grKeyfireRun")}:${hash.get("grKeyfireConfig")}`)
     .digest("hex");
   assert.equal(hash.get("grKeyfireProof"), expected);
 });
 
-test("an unpaired userscript opens no claim tabs and explains how to pair it", async () => {
+test("an unpaired userscript hides Keyfire and keeps ordinary automatic opening available", async () => {
   const page = createPage({
     pathname: "/giveaway",
     stored: new Map([
       ["gr_auto_open_all", "1"],
       ["gr_keyfire_enabled", "1"],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
     ]),
     listing: { pages: [[123]] },
   });
   await page.advanceAsync(1500);
-  assert.equal(page.openedTabs.length, 0);
-  assert.match(page.alerts[0], /paired userscript/);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.openedTabs[0].options.active, false);
+  assert.equal(page.document.querySelector("#gr-keyfire-row").hidden, true);
+  assert.deepEqual(page.alerts, []);
   assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, false);
+});
+
+test("Keyfire setup is available but its action is hidden until a macro is saved", () => {
+  const page = createPage({
+    pathname: "/giveaway",
+    stored: new Map([["gr_keyfire_pairing_key", "c".repeat(64)]]),
+  });
+  assert.ok(page.document.querySelector("#gr-keyfire-setup"));
+  assert.equal(
+    Boolean(page.document.querySelector("#gr-keyfire-setup").open),
+    false,
+  );
+  assert.equal(page.document.querySelector("#gr-keyfire-row").hidden, true);
+  page.setKeyfire(true);
+  assert.equal(
+    page.document.querySelector("#gr-keyfire-enabled").checked,
+    false,
+  );
+  page.saveKeyfireSettings({
+    macroName: "  My saved macro  ",
+    profile: "  Personal  ",
+    browser: "chrome",
+  });
+  assert.equal(page.document.querySelector("#gr-keyfire-row").hidden, false);
+  assert.equal(
+    page.document.querySelector("#gr-keyfire-enabled").checked,
+    false,
+  );
+  assert.deepEqual(
+    JSON.parse(page.localStorage.getItem("gr_keyfire_settings")),
+    {
+      macroName: "My saved macro",
+      profile: "Personal",
+      browser: "chrome",
+    },
+  );
+  const next = createPage({ pathname: "/giveaway", stored: page.stored });
+  assert.equal(
+    next.document.querySelector("#gr-keyfire-macro").value,
+    "My saved macro",
+  );
+  assert.equal(
+    next.document.querySelector("#gr-keyfire-profile").value,
+    "Personal",
+  );
+  assert.equal(
+    next.document.querySelector("#gr-keyfire-browser").value,
+    "chrome",
+  );
+  assert.equal(next.document.querySelector("#gr-keyfire-row").hidden, false);
+});
+
+test("blank, malformed, unsupported, and excessive saved settings hide the Keyfire action", () => {
+  for (const settings of [
+    null,
+    "bad JSON",
+    { macroName: "   ", browser: "edge" },
+    { macroName: "My macro", browser: "other" },
+    { macroName: "x".repeat(101), browser: "edge" },
+    { macroName: ["not a name"], browser: "edge" },
+  ]) {
+    const page = createPage({
+      pathname: "/giveaway",
+      stored: new Map([
+        ["gr_keyfire_pairing_key", "c".repeat(64)],
+        ["gr_keyfire_enabled", "1"],
+        [
+          "gr_keyfire_settings",
+          typeof settings === "string" ? settings : JSON.stringify(settings),
+        ],
+      ]),
+    });
+    assert.equal(page.document.querySelector("#gr-keyfire-row").hidden, true);
+    assert.equal(
+      page.document.querySelector("#gr-keyfire-enabled").checked,
+      false,
+    );
+    assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "0");
+  }
+});
+
+test("clearing the selected macro cancels an active batch and hides its control", async () => {
+  const page = keyfirePage();
+  await page.advanceAsync(1250);
+  const entry = createPage({
+    href: page.openedTabs[0].href,
+    stored: page.stored,
+    ready: true,
+  });
+  assert.match(entry.document.title, /^\[GR Keyfire /);
+  page.saveKeyfireSettings({ macroName: "   " });
+  assert.equal(page.document.querySelector("#gr-keyfire-row").hidden, true);
+  assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "0");
+  entry.window.emit("storage");
+  assert.equal(entry.document.title, "Giveaways | Goodreads");
+  await page.flush();
+  page.openedTabs[0].close();
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 1);
+});
+
+test("saving unchanged settings leaves the active batch running", async () => {
+  const page = keyfirePage();
+  await page.advanceAsync(1250);
+  page.saveKeyfireSettings(exampleKeyfireSettings);
+  assert.equal(
+    page.document.querySelector("#gr-keyfire-enabled").checked,
+    true,
+  );
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 2);
+});
+
+test("custom macro, optional profile, and browser reach the authenticated batch", async () => {
+  const selection = {
+    macroName: "Books \u2014 \u672c",
+    profile: "",
+    browser: "firefox",
+  };
+  const page = createPage({
+    pathname: "/giveaway",
+    stored: new Map([["gr_keyfire_pairing_key", "c".repeat(64)]]),
+    listing: { pages: [[123]] },
+  });
+  page.saveKeyfireSettings(selection);
+  page.setKeyfire(true);
+  page.setAutoOpen(true);
+  await page.advanceAsync(1500);
+  const hash = new URLSearchParams(
+    new URL(page.openedTabs[0].href).hash.slice(1),
+  );
+  const config = hash.get("grKeyfireConfig");
+  assert.deepEqual(
+    JSON.parse(Buffer.from(config, "base64url").toString("utf8")),
+    selection,
+  );
+  const expected = createHmac("sha256", "c".repeat(64))
+    .update(`${hash.get("grKeyfireRun")}:${config}`)
+    .digest("hex");
+  assert.equal(hash.get("grKeyfireProof"), expected);
 });

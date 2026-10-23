@@ -1,13 +1,14 @@
-"""Run the saved Goodreads Keyfire steps only in a ready, managed Edge tab.
+"""Follow a user-selected Keyfire macro in a ready, managed giveaway tab.
 
-Keyfire has no external run/stop API. This companion reads its F13 assignment
-without changing it, then follows its Enter/Space/Tab and Wait steps. The
-userscript supplies a short-lived title marker while a claim is ready.
+The paired userscript supplies the macro name, optional profile, browser, and
+a short-lived authenticated title marker. This companion reads the selected
+macro without changing Keyfire and follows its supported key and Wait steps.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -21,12 +22,59 @@ import re
 import time
 
 
-WORKFLOW_KEY = "Edge::BARE::F13"
-WORKFLOW_NAME = "Goodreads Giveaway - no refresh"
 MARKER = re.compile(
-    r"^\[GR Keyfire ([a-f0-9]{32}) ([a-f0-9]{64}) (\d+) (address|entry) (\d+)\] "
+    r"^\[GR Keyfire ([a-f0-9]{32}) ([a-f0-9]{64}) ([A-Za-z0-9_-]{1,2048}) (\d+) (address|entry) (\d+)\] "
 )
 KEYS = {"Enter": 0x0D, "Space": 0x20, "Tab": 0x09}
+BROWSERS = {"edge": "msedge.exe", "chrome": "chrome.exe", "firefox": "firefox.exe"}
+MODIFIERS = {"Ctrl": (0x11,), "Shift": (0x10,), "Alt": (0x12,), "Win": (0x5B, 0x5C)}
+
+
+@dataclass(frozen=True)
+class Settings:
+    macro_name: str
+    profile: str = ""
+    browser: str = "edge"
+
+
+def decode_settings(token):
+    try:
+        value = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+    except (ValueError, UnicodeError) as error:
+        raise ValueError("Invalid Keyfire settings") from error
+    if not isinstance(value, dict):
+        raise ValueError("Invalid Keyfire settings")
+    name, profile, browser = value.get("macroName"), value.get("profile", ""), value.get("browser")
+    if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 100
+            or not isinstance(profile, str) or len(profile.strip()) > 100
+            or not isinstance(browser, str) or browser not in BROWSERS):
+        raise ValueError("Choose a macro name, optional profile, and supported browser")
+    return Settings(name.strip(), profile.strip(), browser)
+
+
+@dataclass(frozen=True)
+class Shortcut:
+    key: int
+    modifiers: frozenset[str]
+
+
+def assignment_shortcut(storage_key):
+    parts = storage_key.split("::")
+    if len(parts) != 3:
+        return None
+    _, modifiers, key = parts
+    modifiers = frozenset() if modifiers == "BARE" else frozenset(modifiers.split("+"))
+    if not modifiers.issubset(MODIFIERS):
+        return None
+    if re.fullmatch(r"F(?:[1-9]|1\d|2[0-4])", key):
+        key = 0x6F + int(key[1:])
+    elif re.fullmatch(r"Key[A-Z]", key):
+        key = ord(key[-1])
+    elif re.fullmatch(r"Digit[0-9]", key):
+        key = ord(key[-1])
+    else:
+        key = KEYS.get(key)
+    return Shortcut(key, modifiers) if key is not None else None
 
 
 @dataclass(frozen=True)
@@ -41,32 +89,69 @@ class Target:
     run: str
     giveaway: str
     stage: str
+    settings: Settings | None = None
 
 
 def parse_target(window, title, process, now, secret):
     marker = MARKER.match(title)
-    if not marker or process.lower() != "msedge.exe":
+    if not marker:
         return None
-    run, proof, giveaway, stage, expires = marker.groups()
+    run, proof, config, giveaway, stage, expires = marker.groups()
     if int(expires) <= now:
         return None
-    expected = hmac.new(secret.encode("ascii"), run.encode("ascii"), hashlib.sha256).hexdigest()
+    expected = hmac.new(secret.encode("ascii"), f"{run}:{config}".encode("ascii"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(proof, expected):
         return None
-    return Target(window, run, giveaway, stage)
+    try:
+        settings = decode_settings(config)
+    except ValueError:
+        return None
+    if process.lower() != BROWSERS[settings.browser]:
+        return None
+    return Target(window, run, giveaway, stage, settings)
 
 
-def read_workflow(config_path: Path) -> tuple[list[Step], int]:
+@dataclass(frozen=True)
+class Workflow:
+    steps: list[Step]
+    loop_delay: int
+    storage_key: str
+    shortcut: Shortcut | None
+
+
+def read_config(config_path):
     config = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    action = config.get("assignments", {}).get(WORKFLOW_KEY, {})
-    if action.get("type") != "macro" or action.get("label") != WORKFLOW_NAME:
-        raise ValueError(f"Expected {WORKFLOW_NAME!r} at {WORKFLOW_KEY}")
+    if not isinstance(config, dict) or not isinstance(config.get("assignments"), dict):
+        raise ValueError("The Keyfire settings file has no saved assignments")
+    return config
+
+
+def read_workflow(config_path: Path, settings: Settings) -> Workflow:
+    config = read_config(config_path)
+    matches = []
+    for storage_key, action in config["assignments"].items():
+        if not isinstance(action, dict) or action.get("type") != "macro":
+            continue
+        name = action.get("label", "")
+        profile = storage_key.split("::")[0]
+        if (isinstance(name, str) and name.strip().casefold() == settings.macro_name.casefold()
+                and (not settings.profile or profile.casefold() == settings.profile.casefold())):
+            matches.append((storage_key, action))
+    if not matches:
+        raise ValueError(f"No saved macro named {settings.macro_name!r} matches the selected profile")
+    if len(matches) > 1:
+        raise ValueError(f"More than one macro is named {settings.macro_name!r}; set a profile or give the macros unique names")
+    storage_key, action = matches[0]
     data = action.get("data", {})
+    if not isinstance(data, dict):
+        raise ValueError("The selected macro has invalid step settings")
     raw_steps = data.get("steps", [])
-    if not 1 <= len(raw_steps) <= 64:
+    if not isinstance(raw_steps, list) or not 1 <= len(raw_steps) <= 64:
         raise ValueError("The Goodreads workflow must contain 1 to 64 steps")
     steps = []
     for step in raw_steps:
+        if not isinstance(step, dict):
+            raise ValueError("The selected macro contains an invalid step")
         kind, value = step.get("type"), step.get("value")
         if kind == "Press Key" and value in KEYS:
             steps.append(Step("key", value))
@@ -82,10 +167,18 @@ def read_workflow(config_path: Path) -> tuple[list[Step], int]:
             )
     if not any(step.kind == "key" for step in steps):
         raise ValueError("The workflow has no key steps")
-    delay = int(data.get("loop", {}).get("delayMs", 250))
+    loop = data.get("loop")
+    if loop is None:
+        loop = {}
+    if not isinstance(loop, dict):
+        raise ValueError("The selected macro has invalid repetition settings")
+    try:
+        delay = int(loop.get("delayMs", 250))
+    except (ValueError, TypeError) as error:
+        raise ValueError("Invalid delay between workflow repetitions") from error
     if not 0 <= delay <= 30000:
         raise ValueError("Invalid delay between workflow repetitions")
-    return steps, delay
+    return Workflow(steps, delay, storage_key, assignment_shortcut(storage_key))
 
 
 class WorkflowRunner:
@@ -142,6 +235,7 @@ class NativeDesktop:
         self.dry_run = dry_run
         self.secret = secret
         self.cancel_requested = False
+        self.manual_shortcut = None
         self.user32.GetForegroundWindow.restype = wintypes.HWND
         self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         self.user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -172,8 +266,14 @@ class NativeDesktop:
         def keyboard_hook(code, message, data):
             if code >= 0 and message in (0x100, 0x104):
                 event = ctypes.cast(data, ctypes.POINTER(KeyboardEvent)).contents
-                if not event.flags & 0x10 and event.vk in (0x1B, 0x7C):
-                    self.cancel_requested = True
+                if not event.flags & 0x10:
+                    shortcut = self.manual_shortcut
+                    modifiers = frozenset(
+                        name for name, keys in MODIFIERS.items()
+                        if any(self.user32.GetAsyncKeyState(key) & 0x8000 for key in keys)
+                    )
+                    if event.vk == 0x1B or (shortcut and event.vk == shortcut.key and modifiers == shortcut.modifiers):
+                        self.cancel_requested = True
             return self.user32.CallNextHookEx(None, code, message, data)
 
         self.hook_callback = hook_type(keyboard_hook)
@@ -193,7 +293,7 @@ class NativeDesktop:
         window = self.user32.GetForegroundWindow()
         if not window:
             return None
-        title = ctypes.create_unicode_buffer(1024)
+        title = ctypes.create_unicode_buffer(4096)
         self.user32.GetWindowTextW(window, title, len(title))
         marker = MARKER.match(title.value)
         if not marker:
@@ -208,11 +308,12 @@ class NativeDesktop:
             length = wintypes.DWORD(len(executable))
             if not self.kernel32.QueryFullProcessImageNameW(process, 0, executable, ctypes.byref(length)):
                 return None
-            if Path(executable.value).name.lower() != "msedge.exe":
+            process_name = Path(executable.value).name.lower()
+            if process_name not in BROWSERS.values():
                 return None
         finally:
             self.kernel32.CloseHandle(process)
-        return parse_target(window, title.value, "msedge.exe", time.time() * 1000, self.secret)
+        return parse_target(window, title.value, process_name, time.time() * 1000, self.secret)
 
     def modifiers_down(self):
         return any(self.user32.GetAsyncKeyState(key) & 0x8000
@@ -259,21 +360,31 @@ def main():
     parser.add_argument("--config", type=Path, default=Path(os.environ.get("APPDATA", ""))
                         / "com.nodescaffold.trigr" / "keyforge-config.json")
     parser.add_argument("--check", action="store_true", help="Validate the saved workflow without sending keys")
+    parser.add_argument("--macro-name", help="Macro name to validate with --check")
+    parser.add_argument("--profile", default="", help="Optional profile to validate with --check")
     parser.add_argument("--dry-run", action="store_true", help="Log keys instead of sending them")
     parser.add_argument("--seconds", type=float, help="Exit after this many seconds (for checking the helper)")
     parser.add_argument("--pairing-key-file", type=Path, default=Path(os.environ.get("LOCALAPPDATA", ""))
                         / "GoodreadsKeyfireCompanion" / "pairing-key.txt")
     args = parser.parse_args()
+    if args.profile and not args.macro_name:
+        parser.error("--profile requires --macro-name")
+    if (args.macro_name or args.profile) and not args.check:
+        parser.error("--macro-name and --profile are validation options; select the runtime macro in Keyfire setup on the giveaway page")
     if args.check:
-        steps, loop_delay = read_workflow(args.config)
-        print(f"Ready: {WORKFLOW_NAME} ({WORKFLOW_KEY}), {len(steps)} supported steps")
+        if args.macro_name:
+            workflow = read_workflow(args.config, Settings(args.macro_name.strip(), args.profile.strip()))
+            print(f"Ready: {args.macro_name} ({workflow.storage_key}), {len(workflow.steps)} supported steps")
+        else:
+            read_config(args.config)
+            print("Keyfire settings readable. Select your saved macro under Keyfire setup on the giveaway page.")
         return
 
     log_dir = Path(os.environ["LOCALAPPDATA"]) / "GoodreadsKeyfireCompanion"
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=log_dir / "helper.log", level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    steps, loop_delay = read_workflow(args.config)
+    read_config(args.config)
     secret = args.pairing_key_file.read_text(encoding="utf-8-sig").strip()
     if not re.fullmatch(r"[a-f0-9]{64}", secret):
         raise ValueError("Invalid local pairing key; run Start-KeyfireGiveaways.ps1 again")
@@ -286,22 +397,34 @@ def main():
     if ctypes.get_last_error() == 183:
         return
     desktop = NativeDesktop(secret, dry_run=args.dry_run)
-    runner = WorkflowRunner(steps, loop_delay, desktop.send_key)
+    runner = None
     started = time.monotonic()
     last_run = None
+    rejected_run = None
     logging.info("Helper ready%s", " (dry run)" if args.dry_run else "")
     try:
         while args.seconds is None or time.monotonic() - started < args.seconds:
             cancel = desktop.pump_events()
             target = desktop.target()
             if target and target.run != last_run:
-                # Pick up saved edits when a new batch starts; unsupported steps stop the helper.
-                steps, loop_delay = read_workflow(args.config)
-                runner.steps = steps
-                runner.loop_delay = loop_delay
                 last_run = target.run
-            runner.tick(target, time.monotonic() * 1000, cancel=cancel,
-                        modifiers=desktop.modifiers_down())
+                try:
+                    workflow = read_workflow(args.config, target.settings)
+                except (ValueError, OSError) as error:
+                    logging.error("Batch paused: %s", error)
+                    rejected_run = target.run
+                    desktop.manual_shortcut = None
+                else:
+                    rejected_run = None
+                    desktop.manual_shortcut = workflow.shortcut
+                    if runner is None:
+                        runner = WorkflowRunner(workflow.steps, workflow.loop_delay, desktop.send_key)
+                    else:
+                        runner.steps = workflow.steps
+                        runner.loop_delay = workflow.loop_delay
+            if runner is not None and (not target or target.run != rejected_run):
+                runner.tick(target, time.monotonic() * 1000, cancel=cancel,
+                            modifiers=desktop.modifiers_down())
             time.sleep(0.025)
     except Exception:
         logging.exception("Helper stopped")
