@@ -9,6 +9,7 @@ const script = fs.readFileSync(path.join(__dirname, "Giveaways.js"), "utf8");
 const addressPath = "/giveaway/enter_choose_address/123";
 const entryPath = "/giveaway/enter_print_giveaway/123";
 const retryParam = "grGiveawayReload";
+const automaticListPath = "/giveaway?sort=ending_soon&format=print";
 const exampleKeyfireSettings = {
   macroName: "Giveaway routine",
   profile: "Books",
@@ -224,7 +225,16 @@ function createPage({
         if (listing.stalled) return;
         schedule(() => {
           addGiveaways(listing.pages[++pageIndex]);
-          updatePagination();
+          if (listing.paginationGap) {
+            pagination = null;
+            controls.delete('[data-testid="paginationStatus"]');
+            schedule(() => {
+              controls.set('[data-testid="paginationStatus"]', status);
+              updatePagination();
+            }, listing.paginationGap);
+          } else {
+            updatePagination();
+          }
         }, listing.delay ?? 500);
       };
     };
@@ -236,7 +246,8 @@ function createPage({
     return control;
   };
   if (ready) {
-    if (location.pathname === addressPath) addControl("a.addressLink");
+    if (location.pathname.startsWith("/giveaway/enter_choose_address/"))
+      addControl("a.addressLink");
     else {
       addControl("input#termsCheckBox");
       addControl("input#giveawaySubmitButton");
@@ -481,7 +492,7 @@ for (const hasAgeConfirmation of [false, true]) {
 }
 
 test("the giveaway list waits for the DOM and initializes its controls", () => {
-  const page = createPage({ pathname: "/giveaway", loading: true });
+  const page = createPage({ pathname: automaticListPath, loading: true });
   page.advance(30000);
   assert.deepEqual(page.navigations, []);
   assert.equal(page.document.querySelector("#gr-controls"), null);
@@ -501,7 +512,7 @@ test("completed giveaways still close immediately", () => {
 
 test("auto-open is off by default and sits beside Open all giveaways", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     listing: { pages: [[1], [2]] },
   });
   const row = page.document.querySelector("#gr-open-all-row");
@@ -518,7 +529,7 @@ test("auto-open is off by default and sits beside Open all giveaways", async () 
 
 test("saved auto-open waits for DOM readiness, loads the full list, and keeps filters", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     loading: true,
     stored: new Map([
       ["gr_auto_open_all", "1"],
@@ -547,13 +558,16 @@ test("saved auto-open waits for DOM readiness, loads the full list, and keeps fi
 });
 
 test("checking auto-open starts immediately and saves the choice for future visits", async () => {
-  const page = createPage({ pathname: "/giveaway", listing: { pages: [[1]] } });
+  const page = createPage({
+    pathname: automaticListPath,
+    listing: { pages: [[1]] },
+  });
   page.setAutoOpen(true);
   assert.equal(page.localStorage.getItem("gr_auto_open_all"), "1");
   await page.advanceAsync(1250);
   assert.equal(page.openedTabs.length, 1);
   const nextPage = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: page.stored,
     listing: { pages: [[2]] },
   });
@@ -565,9 +579,140 @@ test("checking auto-open starts immediately and saves the choice for future visi
   assert.equal(nextPage.openedTabs.length, 1);
 });
 
+test("automatic startup accepts reordered query parameters and a fragment", async () => {
+  const page = createPage({
+    href: "https://www.goodreads.com/giveaway?format=print&sort=ending_soon#giveaways",
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: { pages: [[1], [2]] },
+  });
+  await page.advanceAsync(2500);
+  assert.equal(page.paginationClicks, 1);
+  assert.equal(page.openedTabs.length, 2);
+});
+
+for (const pathname of [
+  "/giveaway",
+  "/giveaway?sort=ending_soon",
+  "/giveaway?format=print",
+  "/giveaway?sort=recently_listed&format=print",
+  "/giveaway?sort=ending_soon&format=kindle",
+  "/giveaway?sort=ending_soon&format=print&format=kindle",
+  "/giveaway?sort=ending_soon&sort=recently_listed&format=print",
+  "/giveaway/list?sort=ending_soon&format=print",
+]) {
+  test(`saved automatic settings stay idle on ${pathname}`, async () => {
+    const page = createPage({
+      pathname,
+      stored: new Map([
+        ["gr_auto_open_all", "1"],
+        ["gr_keyfire_enabled", "1"],
+        ["gr_keyfire_pairing_key", "c".repeat(64)],
+        ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+      ]),
+      listing: { pages: [[1], [2]] },
+    });
+    await page.advanceAsync(4000);
+    assert.equal(page.paginationClicks, 0);
+    assert.equal(page.openedTabs.length, 0);
+    assert.equal(page.document.querySelector("#gr-auto-open-all").disabled, true);
+    assert.equal(page.document.querySelector("#gr-auto-open-all").checked, false);
+    page.setAutoOpen(true);
+    page.setKeyfire(false);
+    page.setKeyfire(true);
+    await page.advanceAsync(4000);
+    assert.equal(page.paginationClicks, 0);
+    assert.equal(page.openedTabs.length, 0);
+    assert.equal(page.localStorage.getItem("gr_auto_open_all"), "1");
+  });
+}
+
+test("manual Open all remains available on other giveaway lists", async () => {
+  const page = createPage({
+    pathname: "/giveaway?sort=recently_listed&format=kindle",
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: { pages: [[1], [2]] },
+  });
+  const opening = page.document.querySelector("#gr-open-all-btn").onclick();
+  await page.advanceAsync(2500);
+  await opening;
+  assert.equal(page.paginationClicks, 1);
+  assert.equal(page.openedTabs.length, 2);
+});
+
+test("loading all waits through missing pagination until the known total is reached", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: { pages: [[1, 2], [3, 4], [5, 6]], paginationGap: 2000 },
+  });
+  await page.advanceAsync(2000);
+  assert.equal(page.openedTabs.length, 0);
+  await page.advanceAsync(5000);
+  assert.equal(page.paginationClicks, 2);
+  assert.equal(page.openedTabs.length, 6);
+  assert.deepEqual(page.alerts, []);
+});
+
+test("turning filtering off includes all visible genres in the opening queue", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([
+      ["gr_auto_open_all", "1"],
+      ["gr_filter_enabled", "0"],
+      ["gr_blocked_genres", '["horror"]'],
+    ]),
+    listing: { pages: [[1, { id: 2, genres: ["Horror"] }, 3]] },
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 3);
+  assert.equal(page.cards[1].style.display, "");
+});
+
+test("the full queue includes direct print-entry links", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: { pages: [[1, 2, 3]] },
+  });
+  page.cards[1].link.href =
+    "https://www.goodreads.com/giveaway/enter_print_giveaway/2";
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 3);
+  assert.equal(
+    new URL(page.openedTabs[1].href).pathname,
+    "/giveaway/enter_print_giveaway/2",
+  );
+});
+
+test("a full tab limit waits for closed tabs and continues through the entire list", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([
+      ["gr_auto_open_all", "1"],
+      ["gr_max_open_tabs", "3"],
+    ]),
+    listing: { pages: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]] },
+  });
+  await page.advanceAsync(3000);
+  assert.equal(page.openedTabs.length, 3);
+  assert.match(
+    page.document.querySelector("#gr-open-all-btn").textContent,
+    /Waiting.*3 of 12/i,
+  );
+  for (let i = 0; i < 12; i++) {
+    assert.ok(page.openedTabs[i], `giveaway ${i + 1} should open`);
+    page.openedTabs[i].close();
+    await page.flush();
+    assert.ok(page.openedTabs.filter((tab) => !tab.closed).length <= 3);
+  }
+  assert.equal(page.openedTabs.length, 12);
+  assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, false);
+  assert.deepEqual(page.errors, []);
+});
+
 test("unchecking cancels a pending page load without opening its late results", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
     listing: { pages: [[1], [2], [3]], delay: 2000 },
   });
@@ -587,7 +732,7 @@ test("unchecking cancels a pending page load without opening its late results", 
 
 test("unchecking before the first asynchronous page result prevents any pagination", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
     listing: { pages: [[1], [2]] },
   });
@@ -600,7 +745,7 @@ test("unchecking before the first asynchronous page result prevents any paginati
 
 test("unchecking interrupts a full tab queue and leaves existing tabs available", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([
       ["gr_auto_open_all", "1"],
       ["gr_max_open_tabs", "1"],
@@ -621,7 +766,7 @@ test("unchecking interrupts a full tab queue and leaves existing tabs available"
 
 test("turning auto-open back on while cancellation settles starts one fresh run", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
     listing: { pages: [[1], [2], [3]], delay: 2000 },
   });
@@ -636,7 +781,7 @@ test("turning auto-open back on while cancellation settles starts one fresh run"
 
 test("manual Open all giveaways still works after cancellation and avoids duplicates", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
     listing: { pages: [[1], [2], [3]] },
   });
@@ -660,7 +805,7 @@ test("manual Open all giveaways still works after cancellation and avoids duplic
 
 test("stalled automatic pagination times out once and can be cancelled or retried", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
     listing: { pages: [[1], [2]], stalled: true },
   });
@@ -675,7 +820,7 @@ test("stalled automatic pagination times out once and can be cancelled or retrie
 
 test("leaving the list cancels auto-open without restarting it", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
     listing: { pages: [[1], [2], [3]] },
   });
@@ -687,16 +832,16 @@ test("leaving the list cancels auto-open without restarting it", async () => {
   assert.deepEqual(page.alerts, []);
 });
 
-function keyfirePage() {
+function keyfirePage(listing = { pages: [[123, 456]] }) {
   return createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([
       ["gr_auto_open_all", "1"],
       ["gr_keyfire_enabled", "1"],
       ["gr_keyfire_pairing_key", "c".repeat(64)],
       ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
     ]),
-    listing: { pages: [[123, 456]] },
+    listing,
   });
 }
 
@@ -723,6 +868,45 @@ test("Keyfire uses one active claim tab at a time and remains active through the
   assert.equal(page.localStorage.getItem(key), null);
   assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, false);
   assert.deepEqual(page.alerts, []);
+});
+
+test("Keyfire continues beyond four books through a full paginated list", async () => {
+  const page = keyfirePage({
+    pages: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]],
+    paginationGap: 2000,
+  });
+  await page.advanceAsync(7000);
+  assert.equal(page.paginationClicks, 2);
+  const run = new URL(page.openedTabs[0].href).hash.match(
+    /grKeyfireRun=([a-f0-9]{32})/,
+  )[1];
+  for (let i = 0; i < 12; i++) {
+    assert.equal(page.openedTabs.length, i + 1);
+    assert.equal(page.openedTabs.filter((tab) => !tab.closed).length, 1);
+    assert.equal(page.openedTabs[i].options.active, true);
+    const entry = createPage({
+      href: page.openedTabs[i].href,
+      stored: page.stored,
+      ready: true,
+    });
+    assert.ok(entry.document.title.includes(`[GR Keyfire ${run} `));
+    assert.match(
+      page.document.querySelector("#gr-open-all-btn").textContent,
+      new RegExp(`${i + 1} of 12`),
+    );
+    if (i === 3) {
+      // A missed onclose event must still free the next slot via polling.
+      page.openedTabs[i].closed = true;
+      await page.advanceAsync(500);
+    } else {
+      page.openedTabs[i].close();
+      await page.flush();
+    }
+  }
+  assert.equal(page.openedTabs.length, 12);
+  assert.equal(page.localStorage.getItem("gr_keyfire_run_" + run), null);
+  assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, false);
+  assert.deepEqual(page.errors, []);
 });
 
 test("only a ready entry from the active Keyfire batch gets a helper marker", async () => {
@@ -820,14 +1004,14 @@ test("disabling Keyfire cancels claiming without starting a background opening r
 
 test("auto-open waits for a late initial list instead of treating it as empty", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
   });
   await page.advanceAsync(4000);
   assert.equal(page.openedTabs.length, 0);
   assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, true);
   page.addGiveaways([123]);
-  await page.advanceAsync(1500);
+  await page.advanceAsync(5500);
   assert.equal(page.openedTabs.length, 1);
   assert.deepEqual(page.alerts, []);
 });
@@ -882,7 +1066,7 @@ test("Keyfire progress carries a proof from this installation's pairing key", as
 
 test("an unpaired userscript hides Keyfire and keeps ordinary automatic opening available", async () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([
       ["gr_auto_open_all", "1"],
       ["gr_keyfire_enabled", "1"],
@@ -900,7 +1084,7 @@ test("an unpaired userscript hides Keyfire and keeps ordinary automatic opening 
 
 test("Keyfire setup is available but its action is hidden until a macro is saved", () => {
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_keyfire_pairing_key", "c".repeat(64)]]),
   });
   assert.ok(page.document.querySelector("#gr-keyfire-setup"));
@@ -932,7 +1116,7 @@ test("Keyfire setup is available but its action is hidden until a macro is saved
       browser: "chrome",
     },
   );
-  const next = createPage({ pathname: "/giveaway", stored: page.stored });
+  const next = createPage({ pathname: automaticListPath, stored: page.stored });
   assert.equal(
     next.document.querySelector("#gr-keyfire-macro").value,
     "My saved macro",
@@ -958,7 +1142,7 @@ test("blank, malformed, unsupported, and excessive saved settings hide the Keyfi
     { macroName: ["not a name"], browser: "edge" },
   ]) {
     const page = createPage({
-      pathname: "/giveaway",
+      pathname: automaticListPath,
       stored: new Map([
         ["gr_keyfire_pairing_key", "c".repeat(64)],
         ["gr_keyfire_enabled", "1"],
@@ -1017,7 +1201,7 @@ test("custom macro, optional profile, and browser reach the authenticated batch"
     browser: "firefox",
   };
   const page = createPage({
-    pathname: "/giveaway",
+    pathname: automaticListPath,
     stored: new Map([["gr_keyfire_pairing_key", "c".repeat(64)]]),
     listing: { pages: [[123]] },
   });
