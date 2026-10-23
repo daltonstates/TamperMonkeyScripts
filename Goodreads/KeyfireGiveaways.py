@@ -33,6 +33,8 @@ KEYS = {"Enter": 0x0D, "Space": 0x20, "Tab": 0x09}
 BROWSERS = {"edge": "msedge.exe", "chrome": "chrome.exe", "firefox": "firefox.exe"}
 MODIFIERS = {"Ctrl": (0x11,), "Shift": (0x10,), "Alt": (0x12,), "Win": (0x5B, 0x5C)}
 WORKFLOW_PORT = 17384
+ADDRESS_RETRY_MS = 5000
+MAX_ADDRESS_RETRIES = 3
 
 
 @dataclass(frozen=True)
@@ -293,6 +295,8 @@ class WorkflowRunner:
         self.index = 0
         self.due = 0
         self.paused_runs = set()
+        self.address_attempts = 0
+        self.address_sent_at = None
 
     def tick(self, target, now, *, cancel=False, modifiers=False):
         if cancel and (target or self.current):
@@ -304,6 +308,8 @@ class WorkflowRunner:
             self.current = identity
             self.index = 0
             self.due = now
+            self.address_attempts = 0
+            self.address_sent_at = None
         if now < self.due:
             return
         # A redirect may skip address selection. Start at the checkbox steps.
@@ -318,9 +324,21 @@ class WorkflowRunner:
         else:
             # Never send the checkbox keys while address navigation is pending.
             if target.stage == "address" and step.value != "Enter":
+                if (self.address_sent_at is not None
+                        and now - self.address_sent_at >= ADDRESS_RETRY_MS
+                        and self.address_attempts <= MAX_ADDRESS_RETRIES):
+                    # An Enter can arrive before Goodreads accepts navigation.
+                    # Retry the address step, keeping checkbox keys on the entry page.
+                    self.index = 0
+                    self.due = now
+                    logging.info("Retrying address selection for giveaway %s (%s/%s)",
+                                 target.giveaway, self.address_attempts, MAX_ADDRESS_RETRIES)
                 return
             if not self.send_key(step.value, target):
                 return
+            if target.stage == "address" and step.value == "Enter":
+                self.address_attempts += 1
+                self.address_sent_at = now
         self.index += 1
         if self.index == len(self.steps):
             self.index = 0

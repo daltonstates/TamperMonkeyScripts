@@ -66,8 +66,49 @@ class WorkflowTests(unittest.TestCase):
     def test_does_not_send_checkbox_keys_before_address_navigation(self):
         self.runner.tick(self.address, 0)
         self.runner.tick(self.address, 25)
-        self.runner.tick(self.address, 10000)
+        self.runner.tick(self.address, 4999)
         self.assertEqual([key for key, _, _ in self.sent], ["Enter"])
+
+    def test_retries_a_stalled_address_after_five_seconds(self):
+        self.runner.tick(self.address, 0)
+        self.runner.tick(self.address, 25)
+        self.runner.tick(self.address, 4999)
+        self.assertEqual([key for key, _, _ in self.sent], ["Enter"])
+        self.runner.tick(self.address, 5000)
+        self.runner.tick(self.address, 5025)
+        self.assertEqual([key for key, _, _ in self.sent], ["Enter", "Enter"])
+        self.runner.tick(self.entry, 5050)
+        self.runner.tick(self.entry, 5800)
+        self.assertEqual(self.sent[-1], ("Space", "entry", "123"))
+
+    def test_address_retries_stop_after_three_and_manual_navigation_can_resume(self):
+        self.runner.tick(self.address, 0)
+        for now in range(25, 60001, 25):
+            self.runner.tick(self.address, now)
+        self.assertEqual([key for key, _, _ in self.sent], ["Enter"] * 4)
+        self.runner.tick(self.entry, 60025)
+        self.assertEqual(self.sent[-1], ("Space", "entry", "123"))
+
+    def test_pending_address_retry_respects_focus_modifiers_and_cancellation(self):
+        for pause in ("focus", "modifiers", "cancel"):
+            with self.subTest(pause=pause):
+                sent = []
+                runner = WorkflowRunner(self.steps, 250, lambda key, target: sent.append(key) or True)
+                runner.tick(self.address, 0)
+                runner.tick(self.address, 25)
+                runner.tick(None if pause == "focus" else self.address, 6000,
+                            modifiers=pause == "modifiers", cancel=pause == "cancel")
+                self.assertEqual(sent, ["Enter"])
+                if pause == "cancel":
+                    runner.tick(self.address, 7000)
+                    self.assertEqual(sent, ["Enter"])
+
+    def test_navigation_before_a_pending_retry_skips_enter_on_the_entry_page(self):
+        self.runner.tick(self.address, 0)
+        self.runner.tick(self.address, 25)
+        self.runner.tick(self.address, 5000)
+        self.runner.tick(self.entry, 5025)
+        self.assertEqual(self.sent, [("Enter", "address", "123"), ("Space", "entry", "123")])
 
     def test_direct_entry_starts_with_space_instead_of_submitting_with_enter(self):
         self.runner.tick(self.entry, 0)

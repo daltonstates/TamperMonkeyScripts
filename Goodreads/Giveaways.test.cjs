@@ -52,8 +52,10 @@ function createPage({
   untrackedTab = false,
   helperFailure = null,
   helperDelay = 0,
+  blankTabs = false,
+  startTime = 0,
 } = {}) {
-  let now = 0;
+  let now = startTime;
   let nextTimerId = 0;
   const timers = new Map();
   const navigations = [];
@@ -268,6 +270,7 @@ function createPage({
     URLSearchParams,
     AbortController,
     TextEncoder,
+    crypto: webcrypto,
     btoa: (value) => Buffer.from(value, "binary").toString("base64"),
     Date: class extends Date {
       static now() {
@@ -315,6 +318,12 @@ function createPage({
         },
       };
       openedTabs.push(tab);
+      if (!blankTabs) {
+        const token = new URLSearchParams(new URL(href).hash.slice(1)).get(
+          "grGiveawayTab",
+        );
+        if (token) stored.set("gr_giveaway_tab_" + token, "started");
+      }
       return untrackedTab ? undefined : tab;
     },
     setInterval: (callback, delay) => schedule(callback, delay, true),
@@ -381,6 +390,9 @@ function createPage({
     get closeCount() {
       return closeCount;
     },
+    get now() {
+      return now;
+    },
     finishLoading() {
       document.head = element("head");
       document.body = element("body");
@@ -427,6 +439,59 @@ test("a slow address page becomes ready just before the timeout", () => {
   assert.equal(link.focusCount, 1);
   page.advance(120000);
   assert.deepEqual(page.navigations, []);
+});
+
+for (const pathname of [addressPath, entryPath]) {
+  test(`${pathname}: initial focus recovers after loading clears it`, () => {
+    const page = createPage({ pathname, ready: true, loading: true });
+    const firstControl = page.controls.get(
+      pathname === addressPath ? "a.addressLink" : "input#termsCheckBox",
+    );
+    page.document.activeElement = null;
+    page.finishLoading();
+    assert.equal(page.document.activeElement, firstControl);
+    assert.equal(firstControl.focusCount, 2);
+    assert.deepEqual(page.navigations, []);
+  });
+}
+
+test("address focus follows a replaced control without stealing manual focus", () => {
+  const page = createPage({ ready: true });
+  const replacement = page.addControl("a.addressLink");
+  page.document.activeElement = page.document.body;
+  page.advance(250);
+  assert.equal(page.document.activeElement, replacement);
+  const search = page.addControl("input#search");
+  search.focus();
+  page.document.emit("pointerdown", { target: search });
+  page.advance(1000);
+  assert.equal(page.document.activeElement, search);
+  page.document.activeElement = page.document.body;
+  page.window.emit("focus");
+  assert.equal(page.document.activeElement, page.document.body);
+});
+
+test("initial focus can resume when a background tab is selected", () => {
+  const page = createPage({ ready: true });
+  const link = page.controls.get("a.addressLink");
+  page.document.visibilityState = "hidden";
+  page.document.focused = false;
+  page.document.activeElement = page.document.body;
+  page.advance(10000);
+  assert.equal(link.focusCount, 1);
+  page.document.visibilityState = "visible";
+  page.document.focused = true;
+  page.window.emit("focus");
+  assert.equal(page.document.activeElement, link);
+});
+
+test("navigation cancels pending initial focus recovery", () => {
+  const page = createPage({ ready: true });
+  page.window.emit("pagehide");
+  page.document.activeElement = page.document.body;
+  page.advance(5000);
+  page.window.emit("focus");
+  assert.equal(page.document.activeElement, page.document.body);
 });
 
 test("a partially loaded entry form still refreshes", () => {
@@ -871,7 +936,7 @@ test("leaving the list cancels auto-open without restarting it", async () => {
   assert.deepEqual(page.alerts, []);
 });
 
-function keyfirePage(listing = { pages: [[123, 456]] }) {
+function keyfirePage(listing = { pages: [[123, 456]] }, options = {}) {
   return createPage({
     pathname: automaticListPath,
     stored: new Map([
@@ -880,8 +945,262 @@ function keyfirePage(listing = { pages: [[123, 456]] }) {
       ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
     ]),
     listing,
+    ...options,
   });
 }
+
+test("the opener recovers a blank tab even when its userscript never executes", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  const original = page.openedTabs[0];
+  await page.advanceAsync(4749);
+  assert.equal(page.openedTabs.length, 1);
+  await page.advanceAsync(1);
+  assert.equal(original.closed, true);
+  await page.advanceAsync(500);
+  assert.equal(page.openedTabs.length, 2);
+  const retry = page.openedTabs[1];
+  const originalUrl = new URL(original.href);
+  const retryUrl = new URL(retry.href);
+  assert.equal(retryUrl.pathname, originalUrl.pathname);
+  assert.equal(retryUrl.hash, originalUrl.hash);
+  assert.equal(retryUrl.searchParams.get(retryParam), "1");
+  assert.equal(retry.options.active, true);
+  assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, true);
+  const entry = createPage({
+    href: retry.href,
+    stored: page.stored,
+    ready: true,
+  });
+  assert.match(entry.document.title, /^\[GR Keyfire /);
+  await page.advanceAsync(120000);
+  assert.equal(page.openedTabs.length, 2);
+  assert.deepEqual(page.alerts, []);
+  retry.close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 3);
+  assert.match(page.openedTabs[2].href, /enter_choose_address\/456/);
+});
+
+test("blank-tab recovery stops after three retries and leaves the last tab open", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(40000);
+  assert.equal(page.openedTabs.length, 4);
+  assert.ok(page.openedTabs.slice(0, 3).every((tab) => tab.closed));
+  assert.equal(page.openedTabs[3].closed, false);
+  assert.ok(
+    page.openedTabs.every((tab) => /enter_choose_address\/123/.test(tab.href)),
+  );
+  assert.match(page.alerts.join(" "), /3.*(?:reopen|retr)/i);
+  assert.equal(page.alerts.length, 1);
+  assert.equal(page.navigations.length, 0);
+  assert.equal(
+    [...page.stored.keys()].some((key) => key.startsWith("gr_giveaway_tab_")),
+    false,
+  );
+});
+
+test("a running child owns its five-second refresh timer without duplicate tabs", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  const entry = createPage({
+    href: page.openedTabs[0].href,
+    stored: page.stored,
+  });
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 1);
+  entry.advance(5000);
+  assert.equal(entry.navigations.length, 1);
+  assert.equal(new URL(entry.navigations[0]).searchParams.get(retryParam), "1");
+  assert.deepEqual(page.alerts, []);
+});
+
+test("the opener also recovers a refresh that goes blank before the next script runs", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  const entry = createPage({
+    href: page.openedTabs[0].href,
+    stored: page.stored,
+    startTime: page.now,
+  });
+  entry.advance(5000);
+  entry.window.emit("pagehide");
+  await page.advanceAsync(11000);
+  assert.equal(page.openedTabs.length, 2);
+  const retryUrl = new URL(page.openedTabs[1].href);
+  assert.equal(retryUrl.searchParams.get(retryParam), "2");
+  assert.equal(retryUrl.hash, new URL(page.openedTabs[0].href).hash);
+  createPage({ href: retryUrl.href, stored: page.stored, ready: true });
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 2);
+  assert.deepEqual(page.alerts, []);
+});
+
+test("blank address-to-entry navigation reopens the entry URL with its address and workflow", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  const address = createPage({
+    href: page.openedTabs[0].href,
+    stored: page.stored,
+    ready: true,
+    startTime: page.now,
+  });
+  const link = address.controls.get("a.addressLink");
+  link.href = `https://www.goodreads.com${entryPath}?address=456`;
+  link.closest = () => link;
+  address.document.emit("click", { target: link });
+  address.window.emit("pagehide");
+  await page.advanceAsync(6000);
+  assert.equal(page.openedTabs.length, 2);
+  const retryUrl = new URL(page.openedTabs[1].href);
+  assert.equal(retryUrl.pathname, entryPath);
+  assert.equal(retryUrl.searchParams.get("address"), "456");
+  assert.equal(retryUrl.searchParams.get(retryParam), "1");
+  assert.equal(retryUrl.hash, new URL(page.openedTabs[0].href).hash);
+  const entry = createPage({
+    href: retryUrl.href,
+    stored: page.stored,
+    ready: true,
+  });
+  assert.match(entry.document.title, / 123 entry \d+\] /);
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 2);
+  assert.deepEqual(page.alerts, []);
+});
+
+test("an entry script without a progress hash acknowledges navigation using per-tab storage", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  const address = createPage({
+    href: page.openedTabs[0].href,
+    stored: page.stored,
+    ready: true,
+    startTime: page.now,
+  });
+  const link = address.controls.get("a.addressLink");
+  link.href = `https://www.goodreads.com${entryPath}?address=456`;
+  link.closest = () => link;
+  address.document.emit("click", { target: link });
+  address.window.emit("pagehide");
+  const entry = createPage({
+    href: link.href,
+    stored: page.stored,
+    sessionStored: address.sessionStored,
+    ready: true,
+    startTime: page.now,
+  });
+  assert.match(entry.document.title, / 123 entry \d+\] /);
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 1);
+  assert.deepEqual(page.alerts, []);
+});
+
+for (const cancel of ["auto", "keyfire", "pagehide"]) {
+  test(`blank-tab recovery stops on ${cancel} cancellation`, async () => {
+    const page = keyfirePage(undefined, { blankTabs: true });
+    await page.advanceAsync(1250);
+    if (cancel === "auto") page.setAutoOpen(false);
+    else if (cancel === "keyfire") page.setKeyfire(false);
+    else page.window.emit("pagehide");
+    await page.advanceAsync(35000);
+    assert.equal(page.openedTabs.length, 1);
+    assert.equal(page.openedTabs[0].closed, false);
+    assert.deepEqual(page.alerts, []);
+    assert.equal(
+      [...page.stored.keys()].some((key) => key.startsWith("gr_giveaway_tab_")),
+      false,
+    );
+  });
+}
+
+test("a blank tab must close before its replacement opens", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  const tab = page.openedTabs[0];
+  tab.close = () => {};
+  await page.advanceAsync(9000);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(tab.closed, false);
+  tab.closed = true;
+  tab.onclose();
+  await page.advanceAsync(500);
+  assert.equal(page.openedTabs.length, 2);
+  assert.match(page.openedTabs[1].href, /enter_choose_address\/123/);
+});
+
+test("a delayed close event from the old blank tab cannot finish its replacement", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  const original = page.openedTabs[0];
+  const oldClose = original.onclose;
+  original.close = () => {
+    original.closed = true;
+  };
+  await page.advanceAsync(5500);
+  assert.equal(page.openedTabs.length, 2);
+  const replacement = page.openedTabs[1];
+  createPage({ href: replacement.href, stored: page.stored, ready: true });
+  oldClose();
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(replacement.closed, false);
+  assert.equal(page.document.querySelector("#gr-open-all-btn").disabled, true);
+  replacement.close();
+  await page.flush();
+  assert.match(page.openedTabs[2].href, /enter_choose_address\/456/);
+});
+
+test("a tab that cannot be closed cancels recovery without opening a duplicate", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  page.openedTabs[0].close = () => {
+    throw new Error("Tab close failed");
+  };
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.openedTabs[0].closed, false);
+  assert.equal(page.alerts.length, 1);
+  assert.match(page.alerts[0], /could not be reopened/);
+  assert.equal(page.navigations.length, 0);
+});
+
+test("closing a blank tab manually cancels its recovery and advances normally", async () => {
+  const page = keyfirePage(undefined, { blankTabs: true });
+  await page.advanceAsync(1250);
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 2);
+  assert.match(page.openedTabs[1].href, /enter_choose_address\/456/);
+  createPage({
+    href: page.openedTabs[1].href,
+    stored: page.stored,
+    ready: true,
+  });
+  await page.advanceAsync(35000);
+  assert.equal(page.openedTabs.length, 2);
+  assert.deepEqual(page.alerts, []);
+});
+
+test("background recovery preserves the tab limit and background opening", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([
+      ["gr_auto_open_all", "1"],
+      ["gr_max_open_tabs", "2"],
+    ]),
+    listing: { pages: [[123, 456, 789]] },
+    blankTabs: true,
+  });
+  await page.advanceAsync(1250);
+  assert.equal(page.openedTabs.length, 2);
+  await page.advanceAsync(5500);
+  assert.equal(page.openedTabs.length, 4);
+  assert.equal(page.openedTabs.filter((tab) => !tab.closed).length, 2);
+  assert.ok(page.openedTabs.every((tab) => tab.options.active === false));
+  assert.ok(
+    page.openedTabs.every((tab) => !/enter_choose_address\/789/.test(tab.href)),
+  );
+});
 
 function giveawayPages(first, count, pageSize = 20) {
   return Array.from({ length: Math.ceil(count / pageSize) }, (_, page) =>

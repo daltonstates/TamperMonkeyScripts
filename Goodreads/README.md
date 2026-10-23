@@ -1,10 +1,10 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.19 connects to the Windows helper automatically, preserves the selected
-Keyfire mode, and reports the current mode beside its checkbox. No pairing code
-or special paired userscript is required. Lists still run in batches of up to 100
-rows with a main-page refresh between batches. Automatic startup remains limited
-to ending-soon print giveaways.
+Version 4.20 recovers blank giveaway tabs from the opener, restores initial focus
+after loading, and retries stalled address selection in the Windows companion.
+No pairing code or special paired userscript is required. Lists still run in
+batches of up to 100 rows with a main-page refresh between batches. Automatic
+startup remains limited to ending-soon print giveaways.
 Install [Giveaways.js](Giveaways.js) in Tampermonkey. The Windows helper below is
 required when using a Keyfire macro; ordinary tab opening works without it.
 
@@ -57,6 +57,30 @@ is reached. Closing a giveaway tab lets the next one open; the limit does not
 limit the total batch. With Keyfire, the button shows the current giveaway number
 and the batch total, and only one giveaway stays open at a time. An unfinished tab
 must finish or close before the next book opens.
+
+## Blank tabs and address selection
+
+A giveaway with missing controls refreshes after five seconds, up to three
+times. If the page stays blank before Tampermonkey can start, the opener closes
+that tab and reopens the **same giveaway**. It waits for the old tab to close
+before opening the replacement, preserving its number, selected address, and
+Keyfire authorization. This also covers a refresh or address-selection navigation
+that goes blank. Once the entry script runs, its own loading timer takes over.
+Browser throttling can delay checks in a background opener tab.
+
+After three failed attempts, automatic recovery stops and the unfinished tab
+stays open. It is never counted as a completed entry. Canceling the run or leaving
+the opener stops further reopen attempts. Keep the opener tab open while claiming.
+
+The script restores initial address or checkbox focus if loading clears it. It
+stops restoring focus when you press a key or use the mouse. The companion also
+retries Enter on an authorized, focused address link after five seconds, up to
+three times. It sends no checkbox keys while the address page remains open.
+If those attempts fail, selecting the address manually can still resume the run.
+
+When updating to 4.20, replace the existing Tampermonkey script and restart the
+Windows companion to load its address retry fix. Reload the giveaway list before
+starting a fresh run.
 
 ## What the Keyfire companion does
 

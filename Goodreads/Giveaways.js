@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.19
+// @version      4.20
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, optionally opens all on load, and supports a Keyfire workflow companion while claiming.
@@ -45,12 +45,14 @@
   const LS_KEYFIRE_ENABLED = "gr_keyfire_enabled";
   const LS_KEYFIRE_RUN_PREFIX = "gr_keyfire_run_";
   const LS_KEYFIRE_SETTINGS = "gr_keyfire_settings";
+  const LS_GIVEAWAY_TAB_PREFIX = "gr_giveaway_tab_";
   const KEYFIRE_HELPER_URL = "http://127.0.0.1:17384/v1/workflow";
   const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
   const SS_GIVEAWAY_CONTINUATION = "gr_giveaway_continuation";
   const PROGRESS_HASH_INDEX = "grGiveawayIndex";
   const PROGRESS_HASH_TOTAL = "grGiveawayTotal";
   const PROGRESS_HASH_ID = "grGiveawayId";
+  const PROGRESS_HASH_TAB = "grGiveawayTab";
   const PROGRESS_HASH_KEYFIRE_RUN = "grKeyfireRun";
   const PROGRESS_HASH_KEYFIRE_PROOF = "grKeyfireProof";
   const PROGRESS_HASH_KEYFIRE_CONFIG = "grKeyfireConfig";
@@ -286,7 +288,7 @@
     }
   }
 
-  function addGiveawayProgress(href, index, total, workflow = null) {
+  function addGiveawayProgress(href, index, total, workflow, tabId) {
     const url = new URL(href, window.location.href);
     const giveawayId = getGiveawayId(url.href);
     if (!giveawayId) return url.href;
@@ -295,6 +297,7 @@
     hash.set(PROGRESS_HASH_INDEX, String(index));
     hash.set(PROGRESS_HASH_TOTAL, String(total));
     hash.set(PROGRESS_HASH_ID, giveawayId);
+    hash.set(PROGRESS_HASH_TAB, tabId);
     if (workflow) {
       hash.set(PROGRESS_HASH_KEYFIRE_RUN, workflow.id);
       hash.set(PROGRESS_HASH_KEYFIRE_PROOF, workflow.proof);
@@ -601,39 +604,136 @@
     }
   }
 
-  function trackGiveawayTab(tab, link, workflow) {
-    if (!tab || typeof tab !== "object") return;
+  function trackGiveawayTab(tab, link, workflow, recovery) {
+    if (!tab || typeof tab !== "object") {
+      localStorage.removeItem(recovery.key);
+      return;
+    }
 
     let closedPromise;
     closedPromise = new Promise((resolve) => {
       let settled = false;
       let pollId = null;
+      let recovering = true;
+      let retryPending = false;
+      let closed = false;
+      let openedAt = Date.now();
+      const retryUrl = new URL(recovery.href);
+
+      const stopRecovery = () => {
+        recovering = false;
+        retryPending = false;
+        localStorage.removeItem(recovery.key);
+        recovery.controller.signal.removeEventListener("abort", stopRecovery);
+        window.removeEventListener("pagehide", stopRecovery);
+      };
 
       const settle = () => {
         if (settled) return;
         settled = true;
+        stopRecovery();
         if (pollId !== null) clearInterval(pollId);
         resolve();
       };
 
-      try {
-        tab.onclose = settle;
+      const watchClose = () => {
+        const watchedTab = tab;
+        watchedTab.onclose = () => {
+          if (tab !== watchedTab) return;
+          closed = true;
+          if (!retryPending) settle();
+        };
         if (tab.closed) {
           settle();
-          return;
         }
+      };
+
+      recovery.controller.signal.addEventListener("abort", stopRecovery, {
+        once: true,
+      });
+      window.addEventListener("pagehide", stopRecovery, { once: true });
+
+      const checkTab = () => {
+        try {
+          closed ||= tab.closed;
+          if (closed) {
+            if (!retryPending) {
+              settle();
+              return;
+            }
+            // Wait for the old tab to close so a retry never uses another slot.
+            retryPending = false;
+            localStorage.setItem(recovery.key, "waiting");
+            tab = GM_openInTab(retryUrl.href, { active: Boolean(workflow) });
+            if (!tab || typeof tab !== "object") {
+              throw new Error(
+                "The replacement giveaway tab could not be tracked.",
+              );
+            }
+            closed = false;
+            openedAt = Date.now();
+            watchClose();
+            return;
+          }
+          if (!recovering || retryPending) return;
+          const status = localStorage.getItem(recovery.key);
+          // While a document is running, its own controls watchdog owns recovery.
+          if (status === "started") return;
+          if (status && status !== "waiting") {
+            const navigation = JSON.parse(status);
+            if (
+              !Number.isFinite(navigation.at) ||
+              !isGiveawayEntryLink(navigation.href) ||
+              getGiveawayId(navigation.href) !== getGiveawayId(link)
+            )
+              return;
+            retryUrl.href = navigation.href;
+            // A replacement tab has no per-tab session storage after a redirect.
+            const hash = new URLSearchParams(retryUrl.hash.slice(1));
+            for (const [key, value] of new URLSearchParams(
+              new URL(recovery.href).hash.slice(1),
+            )) {
+              hash.set(key, value);
+            }
+            retryUrl.hash = hash.toString();
+            openedAt = navigation.at;
+          }
+          if (Date.now() - openedAt < GIVEAWAY_TAB_LOAD_TIMEOUT_MS) return;
+
+          const retries = Math.max(
+            0,
+            Number.parseInt(
+              retryUrl.searchParams.get(GIVEAWAY_RELOAD_PARAM),
+              10,
+            ) || 0,
+          );
+          if (retries >= MAX_GIVEAWAY_RELOADS) {
+            stopRecovery();
+            alert(
+              `This giveaway stayed blank after ${MAX_GIVEAWAY_RELOADS} reopen attempts. Check Tampermonkey and your connection, then finish or close the tab.`,
+            );
+            return;
+          }
+          retryUrl.searchParams.set(GIVEAWAY_RELOAD_PARAM, String(retries + 1));
+          retryPending = true;
+          tab.close();
+        } catch (error) {
+          stopRecovery();
+          recovery.controller.abort();
+          console.error("Could not recover a blank Goodreads tab", error);
+          alert(
+            "The blank giveaway tab could not be reopened. Check the tab, then try again.",
+          );
+          if (closed) settle();
+        }
+      };
+
+      try {
+        watchClose();
       } catch {
         settle();
-        return;
       }
-
-      pollId = setInterval(() => {
-        try {
-          if (tab.closed) settle();
-        } catch {
-          settle();
-        }
-      }, 500);
+      if (!settled) pollId = setInterval(checkTab, 500);
     });
 
     trackedGiveawayTabs.add(closedPromise);
@@ -687,13 +787,17 @@
         await waitForOpenTabSlot(signal);
         signal.throwIfAborted();
 
+        const tabId = crypto.randomUUID().replace(/-/g, "");
+        const tabKey = LS_GIVEAWAY_TAB_PREFIX + tabId;
         try {
           const numberedLink = addGiveawayProgress(
             link,
             linkIndex + 1,
             links.length,
             workflow,
+            tabId,
           );
+          localStorage.setItem(tabKey, "waiting");
           const tab = GM_openInTab(numberedLink, { active: Boolean(workflow) });
           if (
             (workflow || options.waitForAll) &&
@@ -703,7 +807,11 @@
           }
           openedGiveawayLinks.add(link);
           openedIds.push(getGiveawayId(link));
-          trackGiveawayTab(tab, link, workflow);
+          trackGiveawayTab(tab, link, workflow, {
+            key: tabKey,
+            href: numberedLink,
+            controller,
+          });
           opened++;
           giveawayBatchOpened = opened;
           refreshOpenButton();
@@ -711,6 +819,7 @@
             `Opening ${opened}/${links.length} (${trackedGiveawayTabs.size} open)`,
           );
         } catch (error) {
+          localStorage.removeItem(tabKey);
           failed++;
           console.error("Could not open Goodreads giveaway", link, error);
           if (workflow || options.waitForAll) throw error;
@@ -1494,6 +1603,9 @@
       keyfireConfig: /^[A-Za-z0-9_-]{1,2048}$/.test(keyfireConfig || "")
         ? keyfireConfig
         : null,
+      tabId: /^[a-f0-9]{32}$/.test(hash.get(PROGRESS_HASH_TAB) || "")
+        ? hash.get(PROGRESS_HASH_TAB)
+        : null,
     };
   }
 
@@ -1592,6 +1704,7 @@
     retryButton.addEventListener("click", () => {
       const retryUrl = new URL(window.location.href);
       retryUrl.searchParams.delete(GIVEAWAY_RELOAD_PARAM);
+      reportGiveawayNavigation(retryUrl.href);
       window.location.replace(retryUrl.href);
     });
     notice.appendChild(retryButton);
@@ -1642,6 +1755,7 @@
 
       retryUrl.searchParams.set(GIVEAWAY_RELOAD_PARAM, String(retries + 1));
       // A changed URL makes a fresh GET, even with a progress hash or after a POST.
+      reportGiveawayNavigation(retryUrl.href);
       window.location.replace(retryUrl.href);
     }, GIVEAWAY_TAB_LOAD_TIMEOUT_MS);
     checkControls();
@@ -1650,9 +1764,26 @@
   function handleChooseAddressFlow() {
     waitForGiveawayControls(
       () => document.querySelector("a.addressLink"),
-      (addressLink) => {
-        addressLink.focus();
+      () => {
+        focusInitialGiveawayControl("a.addressLink");
         enableKeyfireForEntry("address");
+        let nextAddressPage = null;
+        document.addEventListener(
+          "click",
+          (event) => {
+            const link = event.target.closest?.("a.addressLink");
+            if (link && isGiveawayEntryLink(link.href))
+              nextAddressPage = link.href;
+          },
+          true,
+        );
+        window.addEventListener(
+          "pagehide",
+          () => {
+            if (nextAddressPage) reportGiveawayNavigation(nextAddressPage);
+          },
+          { once: true },
+        );
       },
     );
   }
@@ -1665,7 +1796,7 @@
         return checkbox && submitBtn ? { checkbox, submitBtn } : null;
       },
       ({ checkbox, submitBtn }) => {
-        checkbox.focus();
+        focusInitialGiveawayControl("input#termsCheckBox");
         enableKeyfireForEntry("entry");
 
         document.addEventListener("change", (event) => {
@@ -1699,6 +1830,72 @@
     }
   }
 
+  function acknowledgeGiveawayTab() {
+    const progress = loadGiveawayProgress();
+    if (!progress?.tabId) return;
+    const key = LS_GIVEAWAY_TAB_PREFIX + progress.tabId;
+    if (localStorage.getItem(key) !== null) {
+      localStorage.setItem(key, "started");
+    }
+  }
+
+  function reportGiveawayNavigation(href) {
+    const progress = loadGiveawayProgress();
+    if (!progress?.tabId || !isGiveawayEntryLink(href)) return;
+    const key = LS_GIVEAWAY_TAB_PREFIX + progress.tabId;
+    if (localStorage.getItem(key) !== null) {
+      localStorage.setItem(key, JSON.stringify({ href, at: Date.now() }));
+    }
+  }
+
+  function focusInitialGiveawayControl(selector) {
+    let stopped = false;
+    const focus = () => {
+      if (
+        stopped ||
+        !document.hasFocus() ||
+        document.visibilityState === "hidden"
+      )
+        return;
+      const control = document.querySelector(selector);
+      const active = document.activeElement;
+      if (active === control) return;
+      // Loading can reset focus to the body. Other controls belong to the user.
+      if (
+        active &&
+        active !== document.body &&
+        active !== document.documentElement
+      )
+        return;
+      control?.focus();
+    };
+    const timer = setInterval(focus, 250);
+    const timeout = setTimeout(
+      () => clearInterval(timer),
+      GIVEAWAY_TAB_LOAD_TIMEOUT_MS,
+    );
+    const stop = () => {
+      stopped = true;
+      clearInterval(timer);
+      clearTimeout(timeout);
+      document.removeEventListener("DOMContentLoaded", focus);
+      document.removeEventListener("visibilitychange", focus);
+      document.removeEventListener("pointerdown", stop, true);
+      document.removeEventListener("keydown", stop, true);
+      window.removeEventListener("focus", focus);
+      window.removeEventListener("load", focus);
+      window.removeEventListener("pagehide", stop);
+    };
+    document.addEventListener("DOMContentLoaded", focus);
+    document.addEventListener("visibilitychange", focus);
+    document.addEventListener("pointerdown", stop, true);
+    document.addEventListener("keydown", stop, true);
+    window.addEventListener("focus", focus);
+    window.addEventListener("load", focus);
+    window.addEventListener("pagehide", stop, { once: true });
+    focus();
+  }
+
   /* ------------------------------------------------------------
    * MAIN INITIALIZATION ROUTER
    * ------------------------------------------------------------ */
@@ -1706,12 +1903,15 @@
   const url = window.location.href;
 
   if (url.includes("/giveaway/enter_choose_address/")) {
+    acknowledgeGiveawayTab();
     whenDocumentReady(createGiveawayProgressBadge);
     handleChooseAddressFlow();
   } else if (url.includes("/giveaway/enter_print_giveaway/")) {
+    acknowledgeGiveawayTab();
     whenDocumentReady(createGiveawayProgressBadge);
     handlePrintGiveawayFlow();
   } else if (url.includes("/giveaway/show/")) {
+    acknowledgeGiveawayTab();
     handleAutoClose();
   } else if (url.includes("/giveaway")) {
     whenDocumentReady(() => {
