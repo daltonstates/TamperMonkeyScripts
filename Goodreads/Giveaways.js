@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.17
+// @version      4.18
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, optionally opens all on load, and supports a Keyfire workflow companion while claiming.
@@ -47,6 +47,7 @@
   // The local launcher fills this in only in its private, paired userscript.
   const KEYFIRE_PAIRING_KEY = "";
   const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
+  const SS_GIVEAWAY_CONTINUATION = "gr_giveaway_continuation";
   const PROGRESS_HASH_INDEX = "grGiveawayIndex";
   const PROGRESS_HASH_TOTAL = "grGiveawayTotal";
   const PROGRESS_HASH_ID = "grGiveawayId";
@@ -61,6 +62,7 @@
   const DEFAULT_MAX_OPEN_TABS = 8;
   const MIN_OPEN_TABS = 1;
   const MAX_OPEN_TABS = 50;
+  const MAX_GIVEAWAY_ROWS = 100;
   const GIVEAWAY_LOAD_TIMEOUT_MS = 30000;
   const AUTO_OPEN_LIST_URL =
     "https://www.goodreads.com/giveaway?sort=ending_soon&format=print";
@@ -151,6 +153,7 @@
   let giveawayBatchOpened = 0;
   let giveawayBatchTotal = 0;
   let loadingGiveaways = false;
+  let refreshingGiveaways = false;
   let giveawayRunController = null;
   let restartAutoOpen = false;
   let leavingPage = false;
@@ -231,6 +234,35 @@
     );
   }
 
+  function giveawayListPageKey() {
+    const url = new URL(window.location.href);
+    url.hash = "";
+    url.searchParams.sort();
+    return url.href;
+  }
+
+  function takeGiveawayContinuation() {
+    const raw = sessionStorage.getItem(SS_GIVEAWAY_CONTINUATION);
+    sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
+    if (!raw || !isAutoOpenPage()) return null;
+    try {
+      const next = JSON.parse(raw);
+      return next?.page === giveawayListPageKey() &&
+        next.auto === autoOpenAllEnabled &&
+        next.workflow ===
+          (keyfireEnabled ? JSON.stringify(keyfireSettings) : null) &&
+        Number.isFinite(next.createdAt) &&
+        Date.now() - next.createdAt <= 30 * 60 * 1000 &&
+        Array.isArray(next.openedIds) &&
+        next.openedIds.length > 0 &&
+        next.openedIds.every((id) => typeof id === "string" && /^\d+$/.test(id))
+        ? next
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
   function isGiveawayEntryLink(href) {
     try {
       const url = new URL(href, window.location.href);
@@ -275,7 +307,13 @@
     return url.href;
   }
 
-  function getVisibleGiveawayLinks() {
+  function getVisibleGiveawayLinks({
+    rowLimit = Infinity,
+    skippedIds = new Set(),
+  } = {}) {
+    const rows = new Set(
+      [...document.querySelectorAll("article.BookListItem")].slice(0, rowLimit),
+    );
     const buttons = document.querySelectorAll(
       ".BookListItem a.Button.Button--primary.Button--medium",
     );
@@ -283,11 +321,15 @@
     return [...buttons]
       .filter((btn) => {
         const card = btn.closest("article.BookListItem");
-        return card && (!filteringEnabled || card.dataset.hiddenByFilter !== "1");
+        return (
+          rows.has(card) &&
+          (!filteringEnabled || card.dataset.hiddenByFilter !== "1")
+        );
       })
       .map((btn) => btn.href)
       .filter(isGiveawayEntryLink)
       .filter((href, i, arr) => arr.indexOf(href) === i)
+      .filter((href) => !skippedIds.has(getGiveawayId(href)))
       .filter((href) => !openedGiveawayLinks.has(href));
   }
 
@@ -298,20 +340,23 @@
 
   function refreshOpenButton() {
     if (openAllButton) {
-      openAllButton.disabled = loadingGiveaways || openingGiveaways;
+      openAllButton.disabled =
+        loadingGiveaways || openingGiveaways || refreshingGiveaways;
       const progress = `${giveawayBatchOpened} of ${giveawayBatchTotal}`;
       const waitingForTabs =
         giveawayBatchOpened < giveawayBatchTotal &&
         trackedGiveawayTabs.size >= maxOpenTabs;
-      openAllButton.textContent = loadingGiveaways
-        ? `Loading giveaways (${document.querySelectorAll("article.BookListItem").length} loaded)...`
-        : openingGiveaways
-          ? keyfireEnabled
-            ? `Claiming giveaway ${progress}...`
-            : waitingForTabs
-              ? `Waiting for tabs to close (${progress} opened)...`
-              : `Opening giveaways (${progress})...`
-          : "Open all giveaways";
+      openAllButton.textContent = refreshingGiveaways
+        ? "Refreshing for the next batch..."
+        : loadingGiveaways
+          ? `Loading giveaways (${document.querySelectorAll("article.BookListItem").length}/${MAX_GIVEAWAY_ROWS} rows)...`
+          : openingGiveaways
+            ? keyfireEnabled
+              ? `Claiming giveaway ${progress}...`
+              : waitingForTabs
+                ? `Waiting for tabs to close (${progress} opened)...`
+                : `Opening giveaways (${progress})...`
+            : "Open all giveaways";
     }
 
     if (!openButton || openingGiveaways) return;
@@ -345,6 +390,7 @@
       restartAutoOpen &&
       autoOpenAllEnabled &&
       isAutoOpenPage() &&
+      !refreshingGiveaways &&
       !leavingPage;
     restartAutoOpen = false;
     if (restart) {
@@ -386,6 +432,7 @@
         initialPageReady &&
         (previousCount === null || count > previousCount)
       ) {
+        if (count >= MAX_GIVEAWAY_ROWS) return button ?? null;
         if (button) {
           noButtonSince = null;
           if (
@@ -411,13 +458,15 @@
     throw new Error("Timed out waiting for Goodreads to load more giveaways.");
   }
 
-  async function openAllGiveaways() {
-    if (loadingGiveaways || openingGiveaways) return;
+  async function openAllGiveaways(continuation = null) {
+    if (loadingGiveaways || openingGiveaways || refreshingGiveaways) return;
 
     const controller = new AbortController();
     // React can briefly remove both the status and button between pages.
     // Keep the last known total until the entire list has loaded.
     const pagination = { total: null };
+    const previouslyOpenedIds = new Set(continuation?.openedIds ?? []);
+    let capped = false;
     giveawayRunController = controller;
     loadingGiveaways = true;
     refreshOpenButton();
@@ -429,18 +478,41 @@
           controller.signal,
           pagination,
         );
+        let pageSize = document.querySelectorAll("article.BookListItem").length;
         while (button) {
           controller.signal.throwIfAborted();
           const previousCount = document.querySelectorAll(
             "article.BookListItem",
           ).length;
+          const nextPageSize =
+            pagination.total === null
+              ? Math.max(1, pageSize)
+              : Math.min(
+                  Math.max(1, pageSize),
+                  pagination.total - previousCount,
+                );
+          if (
+            previousCount >= MAX_GIVEAWAY_ROWS ||
+            previousCount + nextPageSize > MAX_GIVEAWAY_ROWS
+          ) {
+            capped = true;
+            break;
+          }
           button.click();
           button = await waitForGiveawayPage(
             previousCount,
             controller.signal,
             pagination,
           );
+          pageSize = Math.max(
+            pageSize,
+            document.querySelectorAll("article.BookListItem").length -
+              previousCount,
+          );
         }
+        capped ||=
+          document.querySelectorAll("article.BookListItem").length >=
+          MAX_GIVEAWAY_ROWS;
 
         runFilter();
         updateCounts();
@@ -456,7 +528,43 @@
         refreshOpenButton();
       }
 
-      if (!controller.signal.aborted) await openVisibleGiveaways(controller);
+      if (controller.signal.aborted) return;
+      const result = await openVisibleGiveaways(controller, {
+        rowLimit: MAX_GIVEAWAY_ROWS,
+        skippedIds: previouslyOpenedIds,
+        waitForAll: capped,
+      });
+      if (controller.signal.aborted || !capped || !result || result.failed)
+        return;
+      if (result.openedIds.length === 0) {
+        alert(
+          "No new eligible giveaways in this batch. Check the remaining entries and genre filters before starting again.",
+        );
+        return;
+      }
+      if (!isAutoOpenPage()) return;
+      result.openedIds.forEach((id) => previouslyOpenedIds.add(id));
+      try {
+        sessionStorage.setItem(
+          SS_GIVEAWAY_CONTINUATION,
+          JSON.stringify({
+            page: giveawayListPageKey(),
+            auto: autoOpenAllEnabled,
+            workflow: keyfireEnabled ? JSON.stringify(keyfireSettings) : null,
+            createdAt: Date.now(),
+            openedIds: [...previouslyOpenedIds],
+          }),
+        );
+      } catch (error) {
+        console.error("Could not save the next Goodreads batch", error);
+        alert(
+          "Could not save the next batch. Refresh the list and start again.",
+        );
+        return;
+      }
+      refreshingGiveaways = true;
+      refreshOpenButton();
+      window.location.reload();
     } finally {
       finishGiveawayRun(controller);
     }
@@ -513,13 +621,14 @@
     signal.throwIfAborted();
   }
 
-  async function openVisibleGiveaways(controller = null) {
+  async function openVisibleGiveaways(controller = null, options = {}) {
     if (openingGiveaways || loadingGiveaways) return;
 
-    const links = getVisibleGiveawayLinks();
+    const links = getVisibleGiveawayLinks(options);
+    const openedIds = [];
     if (links.length === 0) {
       refreshOpenButton();
-      return;
+      return { openedIds, failed: 0 };
     }
 
     const ownsRun = controller === null;
@@ -550,7 +659,14 @@
             workflow,
           );
           const tab = GM_openInTab(numberedLink, { active: Boolean(workflow) });
+          if (
+            (workflow || options.waitForAll) &&
+            (!tab || typeof tab !== "object")
+          ) {
+            throw new Error("The giveaway tab could not be tracked.");
+          }
           openedGiveawayLinks.add(link);
+          openedIds.push(getGiveawayId(link));
           trackGiveawayTab(tab);
           opened++;
           giveawayBatchOpened = opened;
@@ -561,20 +677,27 @@
         } catch (error) {
           failed++;
           console.error("Could not open Goodreads giveaway", link, error);
+          if (workflow || options.waitForAll) throw error;
         }
       }
 
-      if (workflow) {
+      if (workflow || options.waitForAll) {
         // Keep the run alive through the last claim, after the opening queue ends.
         await waitForGiveawayTask(Promise.all(trackedGiveawayTabs), signal);
       }
-      if (!autoOpenAllEnabled && !workflow && !signal.aborted) {
+      if (
+        !autoOpenAllEnabled &&
+        !workflow &&
+        !options.waitForAll &&
+        !signal.aborted
+      ) {
         alert(
           `Opened ${opened} giveaways (maximum ${maxOpenTabs} at a time)${
             failed ? `; ${failed} failed` : ""
           }`,
         );
       }
+      return { openedIds, failed };
     } catch (error) {
       if (!signal.aborted) {
         console.error("Could not run Goodreads giveaway opening", error);
@@ -583,6 +706,7 @@
             "Could not open giveaways. Check the page and try again.",
         );
       }
+      return { openedIds, failed: failed + 1 };
     } finally {
       workflow?.stop();
       openingGiveaways = false;
@@ -933,6 +1057,7 @@
         keyfireCheckbox.checked && isKeyfireConfigured(keyfireSettings);
       keyfireCheckbox.checked = keyfireEnabled;
       localStorage.setItem(LS_KEYFIRE_ENABLED, keyfireEnabled ? "1" : "0");
+      sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
       restartAutoOpen =
         Boolean(giveawayRunController) &&
         keyfireEnabled &&
@@ -1108,6 +1233,7 @@
         return;
       }
       if (JSON.stringify(next) !== JSON.stringify(keyfireSettings)) {
+        sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
         if (keyfireEnabled) {
           restartAutoOpen = false;
           giveawayRunController?.abort();
@@ -1145,8 +1271,7 @@
 
     const autoOpenLabel = document.createElement("label");
     autoOpenLabel.id = "gr-auto-open-label";
-    autoOpenLabel.title =
-      `Automatically open all filtered giveaways only on ${AUTO_OPEN_LIST_URL}. Uncheck to stop loading and opening more giveaways.`;
+    autoOpenLabel.title = `Automatically open all filtered giveaways only on ${AUTO_OPEN_LIST_URL}. Uncheck to stop loading and opening more giveaways.`;
     const autoOpenCheckbox = document.createElement("input");
     autoOpenCheckbox.id = "gr-auto-open-all";
     autoOpenCheckbox.type = "checkbox";
@@ -1164,6 +1289,7 @@
         void openAllGiveaways();
       } else {
         restartAutoOpen = false;
+        sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
         giveawayRunController?.abort();
       }
     });
@@ -1477,7 +1603,10 @@
         leavingPage = true;
         giveawayRunController?.abort();
       });
-      if (autoOpenAllEnabled && isAutoOpenPage()) void openAllGiveaways();
+      const continuation = takeGiveawayContinuation();
+      if (continuation || (autoOpenAllEnabled && isAutoOpenPage())) {
+        void openAllGiveaways(continuation);
+      }
     });
   }
 })();

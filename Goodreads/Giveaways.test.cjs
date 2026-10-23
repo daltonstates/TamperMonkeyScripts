@@ -49,6 +49,7 @@ function createPage({
   stored = new Map(),
   sessionStored = new Map(),
   listing = null,
+  untrackedTab = false,
 } = {}) {
   let now = 0;
   let nextTimerId = 0;
@@ -161,6 +162,7 @@ function createPage({
   };
   const location = new URL(href || `https://www.goodreads.com${pathname}`);
   location.replace = (url) => navigations.push(url);
+  location.reload = () => navigations.push(location.href);
   const window = {
     ...eventTarget(),
     location,
@@ -295,7 +297,7 @@ function createPage({
         },
       };
       openedTabs.push(tab);
-      return tab;
+      return untrackedTab ? undefined : tab;
     },
     setInterval: (callback, delay) => schedule(callback, delay, true),
     setTimeout: schedule,
@@ -614,8 +616,14 @@ for (const pathname of [
     await page.advanceAsync(4000);
     assert.equal(page.paginationClicks, 0);
     assert.equal(page.openedTabs.length, 0);
-    assert.equal(page.document.querySelector("#gr-auto-open-all").disabled, true);
-    assert.equal(page.document.querySelector("#gr-auto-open-all").checked, false);
+    assert.equal(
+      page.document.querySelector("#gr-auto-open-all").disabled,
+      true,
+    );
+    assert.equal(
+      page.document.querySelector("#gr-auto-open-all").checked,
+      false,
+    );
     page.setAutoOpen(true);
     page.setKeyfire(false);
     page.setKeyfire(true);
@@ -643,7 +651,14 @@ test("loading all waits through missing pagination until the known total is reac
   const page = createPage({
     pathname: automaticListPath,
     stored: new Map([["gr_auto_open_all", "1"]]),
-    listing: { pages: [[1, 2], [3, 4], [5, 6]], paginationGap: 2000 },
+    listing: {
+      pages: [
+        [1, 2],
+        [3, 4],
+        [5, 6],
+      ],
+      paginationGap: 2000,
+    },
   });
   await page.advanceAsync(2000);
   assert.equal(page.openedTabs.length, 0);
@@ -691,7 +706,13 @@ test("a full tab limit waits for closed tabs and continues through the entire li
       ["gr_auto_open_all", "1"],
       ["gr_max_open_tabs", "3"],
     ]),
-    listing: { pages: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]] },
+    listing: {
+      pages: [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+      ],
+    },
   });
   await page.advanceAsync(3000);
   assert.equal(page.openedTabs.length, 3);
@@ -845,6 +866,281 @@ function keyfirePage(listing = { pages: [[123, 456]] }) {
   });
 }
 
+function giveawayPages(first, count, pageSize = 20) {
+  return Array.from({ length: Math.ceil(count / pageSize) }, (_, page) =>
+    Array.from(
+      { length: Math.min(pageSize, count - page * pageSize) },
+      (_, row) => first + page * pageSize + row,
+    ),
+  );
+}
+
+async function closeBatch(page, count) {
+  for (let i = 0; i < count; i++) {
+    assert.ok(page.openedTabs[i], `giveaway ${i + 1} should have opened`);
+    page.openedTabs[i].close();
+    await page.flush();
+  }
+}
+
+test("a 100-row batch waits for the last Keyfire tab before refreshing", async () => {
+  const page = keyfirePage({ pages: giveawayPages(1, 225) });
+  await page.advanceAsync(4500);
+  assert.equal(page.cards.length, 100);
+  assert.equal(page.paginationClicks, 4);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.navigations.length, 0);
+  await closeBatch(page, 99);
+  assert.equal(page.openedTabs.length, 100);
+  assert.equal(page.sessionStored.has("gr_giveaway_continuation"), false);
+  assert.equal(page.navigations.length, 0);
+  page.openedTabs[99].close();
+  await page.flush();
+  assert.deepEqual(page.navigations, [page.window.location.href]);
+  const next = JSON.parse(page.sessionStored.get("gr_giveaway_continuation"));
+  assert.equal(next.openedIds.length, 100);
+  assert.equal(page.openedTabs.length, 100);
+  const run = new URL(page.openedTabs[99].href).hash.match(
+    /grKeyfireRun=([a-f0-9]{32})/,
+  )[1];
+  assert.equal(page.localStorage.getItem("gr_keyfire_run_" + run), null);
+});
+
+test("refresh continuation processes 225 books as 100, 100, and 25", async () => {
+  const first = keyfirePage({ pages: giveawayPages(1, 225) });
+  await first.advanceAsync(4500);
+  await closeBatch(first, 100);
+  assert.equal(first.navigations.length, 1);
+  const second = createPage({
+    pathname: automaticListPath,
+    stored: first.stored,
+    sessionStored: first.sessionStored,
+    listing: { pages: giveawayPages(101, 125) },
+  });
+  await second.advanceAsync(4500);
+  assert.equal(second.cards.length, 100);
+  await closeBatch(second, 100);
+  assert.equal(second.navigations.length, 1);
+  const third = createPage({
+    pathname: automaticListPath,
+    stored: second.stored,
+    sessionStored: second.sessionStored,
+    listing: { pages: giveawayPages(201, 25) },
+  });
+  await third.advanceAsync(2500);
+  await closeBatch(third, 25);
+  assert.equal(third.cards.length, 25);
+  assert.equal(third.navigations.length, 0);
+  assert.equal(third.sessionStored.has("gr_giveaway_continuation"), false);
+  const ids = [
+    ...first.openedTabs,
+    ...second.openedTabs,
+    ...third.openedTabs,
+  ].map((tab) => new URL(tab.href).pathname.split("/").pop());
+  assert.equal(new Set(ids).size, 225);
+});
+
+test("30-row pages stop at 90 instead of loading 120 rows", async () => {
+  const page = keyfirePage({ pages: giveawayPages(1, 240, 30) });
+  await page.advanceAsync(4500);
+  assert.equal(page.cards.length, 90);
+  assert.equal(page.paginationClicks, 2);
+  await closeBatch(page, 90);
+  assert.equal(page.navigations.length, 1);
+  assert.equal(page.openedTabs.length, 90);
+});
+
+test("a smaller final Goodreads page can fill the batch to exactly 100", async () => {
+  const page = keyfirePage({ pages: giveawayPages(1, 100, 30) });
+  await page.advanceAsync(4500);
+  assert.equal(page.cards.length, 100);
+  assert.equal(page.paginationClicks, 3);
+  await closeBatch(page, 100);
+  assert.equal(page.navigations.length, 1);
+});
+
+test("cancelling a capped batch prevents refresh and continuation", async () => {
+  const page = keyfirePage({ pages: giveawayPages(1, 200) });
+  await page.advanceAsync(4500);
+  await closeBatch(page, 99);
+  page.setAutoOpen(false);
+  page.openedTabs[99].close();
+  await page.advanceAsync(5000);
+  assert.equal(page.navigations.length, 0);
+  assert.equal(page.sessionStored.has("gr_giveaway_continuation"), false);
+});
+
+test("background batches wait for all tabs to close before refreshing", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: { pages: giveawayPages(1, 200) },
+  });
+  await page.advanceAsync(4500);
+  assert.equal(page.cards.length, 100);
+  assert.equal(page.openedTabs.length, 8);
+  await closeBatch(page, 99);
+  assert.equal(page.navigations.length, 0);
+  page.openedTabs[99].close();
+  await page.flush();
+  assert.equal(page.navigations.length, 1);
+});
+
+test("a refreshed batch skips previously opened books and stops if no progress is possible", async () => {
+  const first = keyfirePage({ pages: giveawayPages(1, 200) });
+  await first.advanceAsync(4500);
+  await closeBatch(first, 100);
+  const next = createPage({
+    pathname: automaticListPath,
+    stored: first.stored,
+    sessionStored: first.sessionStored,
+    listing: { pages: giveawayPages(1, 200) },
+  });
+  await next.advanceAsync(4500);
+  assert.equal(next.cards.length, 100);
+  assert.equal(next.openedTabs.length, 0);
+  assert.equal(next.navigations.length, 0);
+  assert.equal(next.sessionStored.has("gr_giveaway_continuation"), false);
+  assert.match(next.alerts.join(" "), /no new|same giveaways/i);
+});
+
+test("a manual full run resumes after refresh even with Auto on load off", async () => {
+  const first = keyfirePage({ pages: giveawayPages(1, 200) });
+  first.setAutoOpen(false);
+  await first.flush();
+  const opening = first.document.querySelector("#gr-open-all-btn").onclick();
+  await first.advanceAsync(4500);
+  await closeBatch(first, 100);
+  await opening;
+  assert.equal(first.localStorage.getItem("gr_auto_open_all"), "0");
+  const next = createPage({
+    pathname: automaticListPath,
+    stored: first.stored,
+    sessionStored: first.sessionStored,
+    listing: { pages: giveawayPages(101, 25) },
+  });
+  await next.advanceAsync(2500);
+  assert.equal(next.openedTabs.length, 1);
+  await closeBatch(next, 25);
+  assert.equal(next.navigations.length, 0);
+  const later = createPage({
+    pathname: automaticListPath,
+    stored: next.stored,
+    sessionStored: next.sessionStored,
+    listing: { pages: [[126]] },
+  });
+  await later.advanceAsync(2500);
+  assert.equal(later.openedTabs.length, 0);
+});
+
+test("a fresh list with no giveaways finishes without a refresh loop", async () => {
+  const first = keyfirePage({ pages: giveawayPages(1, 100) });
+  await first.advanceAsync(4500);
+  await closeBatch(first, 100);
+  const next = createPage({
+    pathname: automaticListPath,
+    stored: first.stored,
+    sessionStored: first.sessionStored,
+    listing: { pages: [[]] },
+  });
+  await next.advanceAsync(5000);
+  assert.equal(next.navigations.length, 0);
+  assert.equal(next.openedTabs.length, 0);
+  assert.deepEqual(next.alerts, []);
+  assert.equal(next.document.querySelector("#gr-open-all-btn").disabled, false);
+});
+
+test("cancelling Keyfire on the last book prevents the next refresh", async () => {
+  const page = keyfirePage({ pages: giveawayPages(1, 200) });
+  await page.advanceAsync(4500);
+  await closeBatch(page, 99);
+  page.setKeyfire(false);
+  page.openedTabs[99].close();
+  await page.advanceAsync(5000);
+  assert.equal(page.navigations.length, 0);
+  assert.equal(page.sessionStored.has("gr_giveaway_continuation"), false);
+});
+
+test("already expanded lists open at most the first 100 rows before refreshing", async () => {
+  const page = keyfirePage({ pages: giveawayPages(1, 160, 160) });
+  await page.advanceAsync(1500);
+  assert.equal(page.paginationClicks, 0);
+  await closeBatch(page, 100);
+  assert.equal(page.openedTabs.length, 100);
+  assert.equal(page.navigations.length, 1);
+});
+
+test("an untrackable tab stops the batch without refreshing or opening more tabs", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: { pages: giveawayPages(1, 200) },
+    untrackedTab: true,
+  });
+  await page.advanceAsync(4500);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.navigations.length, 0);
+  assert.equal(page.sessionStored.has("gr_giveaway_continuation"), false);
+  assert.match(page.alerts.join(" "), /could not be tracked/i);
+});
+
+test("continuation cannot bypass the page, settings, expiry, or saved auto choice", async () => {
+  const first = keyfirePage({ pages: giveawayPages(1, 200) });
+  first.setAutoOpen(false);
+  await first.flush();
+  const opening = first.document.querySelector("#gr-open-all-btn").onclick();
+  await first.advanceAsync(4500);
+  await closeBatch(first, 100);
+  await opening;
+  const saved = first.sessionStored.get("gr_giveaway_continuation");
+  assert.ok(saved);
+  for (const change of [
+    "page",
+    "workflow",
+    "keyfire",
+    "auto",
+    "expired",
+    "malformed",
+  ]) {
+    const stored = new Map(first.stored);
+    const next = JSON.parse(saved);
+    if (change === "workflow") next.workflow = "another workflow";
+    if (change === "keyfire") stored.set("gr_keyfire_enabled", "0");
+    if (change === "auto") next.auto = true;
+    if (change === "expired") next.createdAt = -31 * 60 * 1000;
+    const sessionStored = new Map([
+      [
+        "gr_giveaway_continuation",
+        change === "malformed" ? "bad JSON" : JSON.stringify(next),
+      ],
+    ]);
+    const page = createPage({
+      pathname:
+        change === "page" ? "/giveaway?format=kindle" : automaticListPath,
+      stored,
+      sessionStored,
+      listing: { pages: [[101]] },
+    });
+    await page.advanceAsync(2500);
+    assert.equal(page.openedTabs.length, 0, change);
+    assert.equal(sessionStored.has("gr_giveaway_continuation"), false, change);
+  }
+});
+
+test("manual batches on other lists stay capped and never resume automatically", async () => {
+  const page = createPage({
+    pathname: "/giveaway?sort=recently_listed&format=print",
+    listing: { pages: giveawayPages(1, 200) },
+  });
+  const opening = page.document.querySelector("#gr-open-all-btn").onclick();
+  await page.advanceAsync(4500);
+  await closeBatch(page, 100);
+  await opening;
+  assert.equal(page.cards.length, 100);
+  assert.equal(page.navigations.length, 0);
+  assert.equal(page.sessionStored.has("gr_giveaway_continuation"), false);
+});
+
 test("Keyfire uses one active claim tab at a time and remains active through the last tab", async () => {
   const page = keyfirePage();
   await page.advanceAsync(1250);
@@ -872,7 +1168,11 @@ test("Keyfire uses one active claim tab at a time and remains active through the
 
 test("Keyfire continues beyond four books through a full paginated list", async () => {
   const page = keyfirePage({
-    pages: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]],
+    pages: [
+      [1, 2, 3, 4],
+      [5, 6, 7, 8],
+      [9, 10, 11, 12],
+    ],
     paginationGap: 2000,
   });
   await page.advanceAsync(7000);
