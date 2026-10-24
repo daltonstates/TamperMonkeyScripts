@@ -54,6 +54,8 @@ function createPage({
   helperDelay = 0,
   blankTabs = false,
   startTime = 0,
+  dailyMode = "run",
+  dailyFailure = null,
 } = {}) {
   let now = startTime;
   let nextTimerId = 0;
@@ -63,6 +65,7 @@ function createPage({
   const elements = [];
   const openedTabs = [];
   const helperRequests = [];
+  const dailyRequests = [];
   const alerts = [];
   const errors = [];
   const cards = [];
@@ -280,6 +283,26 @@ function createPage({
     console: { error: (...args) => errors.push(args) },
     alert: (message) => alerts.push(message),
     GM_xmlhttpRequest(options) {
+      if (options.url.endsWith("/v1/daily")) {
+        const value = JSON.parse(options.data);
+        dailyRequests.push(value);
+        schedule(() => {
+          if (dailyFailure === "offline") return options.onerror();
+          options.onload({
+            status: 200,
+            responseText: JSON.stringify({
+              protocol: 1,
+              mode: dailyMode,
+              cancel: dailyFailure === "cancel" && value.state === "running",
+            }),
+          });
+        }, 0);
+        return {
+          abort() {
+            options.onabort();
+          },
+        };
+      }
       helperRequests.push(options);
       const callback = () => {
         if (helperFailure === "offline") return options.onerror();
@@ -341,6 +364,7 @@ function createPage({
     addControl,
     openedTabs,
     helperRequests,
+    dailyRequests,
     alerts,
     errors,
     localStorage,
@@ -1698,6 +1722,141 @@ test("Keyfire progress carries the local helper's authorization proof", async ()
     .update(`${hash.get("grKeyfireRun")}:${hash.get("grKeyfireConfig")}`)
     .digest("hex");
   assert.equal(hash.get("grKeyfireProof"), expected);
+});
+
+function dailyPage(options = {}) {
+  return createPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}`,
+    stored: new Map([
+      ["gr_keyfire_enabled", "1"],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+    ]),
+    listing: { pages: [[123, 456]] },
+    ...options,
+  });
+}
+
+test("daily verification checks the macro without entry tabs even with saved auto-on-load", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com/giveaway#grDailyToken=${"d".repeat(64)}`,
+    dailyMode: "verify",
+    stored: new Map([
+      ["gr_auto_open_all", "1"],
+      ["gr_keyfire_enabled", "1"],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+    ]),
+  });
+  await page.advanceAsync(12000);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.helperRequests.length, 1);
+  assert.deepEqual(
+    page.dailyRequests.map((r) => r.state),
+    ["ready", "verified"],
+  );
+  assert.equal(
+    [...page.stored.keys()].some((key) => key.startsWith("gr_keyfire_run_")),
+    false,
+  );
+});
+
+test("daily completion waits for the final Keyfire tab to close", async () => {
+  const page = dailyPage();
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.openedTabs[0].options.active, true);
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(
+    page.dailyRequests.some((r) => r.state === "finished"),
+    false,
+  );
+  page.openedTabs[1].close();
+  await page.advanceAsync(0);
+  assert.equal(page.dailyRequests.at(-1).state, "finished");
+  assert.equal(
+    [...page.stored.keys()].some((key) => key.startsWith("gr_keyfire_run_")),
+    false,
+  );
+});
+
+test("an unreachable daily runner never falls back to saved automatic claiming", async () => {
+  const page = dailyPage({ dailyFailure: "offline" });
+  await page.advanceAsync(10000);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.helperRequests.length, 0);
+  assert.equal(page.alerts.length, 0);
+});
+
+test("missing per-profile setup fails the daily run without ordinary tabs", async () => {
+  const page = dailyPage({ stored: new Map() });
+  await page.advanceAsync(1000);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+  assert.match(page.dailyRequests.at(-1).reason, /enable Use Keyfire/);
+});
+
+test("runner cancellation removes keyboard authorization and opens no more tabs", async () => {
+  const page = dailyPage({ dailyFailure: "cancel" });
+  await page.advanceAsync(5500);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(
+    [...page.stored.keys()].some((key) => key.startsWith("gr_keyfire_run_")),
+    false,
+  );
+  page.openedTabs[0].close();
+  await page.advanceAsync(2000);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(
+    page.dailyRequests.some((r) => r.state === "finished"),
+    false,
+  );
+});
+
+test("a rejected macro is a recorded daily failure without a modal alert", async () => {
+  const page = dailyPage({ helperFailure: "macro" });
+  await page.advanceAsync(2000);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.alerts.length, 0);
+});
+
+test("a scheduled request cannot start claiming on another giveaway list", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com/giveaway#grDailyToken=${"d".repeat(64)}`,
+  });
+  await page.advanceAsync(1000);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+  assert.equal(page.openedTabs.length, 0);
+});
+
+test("capped daily batches refresh with their token without reporting completion early", async () => {
+  const page = dailyPage({
+    listing: { pages: [Array.from({ length: 100 }, (_, i) => i + 1)] },
+  });
+  await page.advanceAsync(1500);
+  for (let i = 0; i < 100; i++) {
+    assert.ok(page.openedTabs[i]);
+    page.openedTabs[i].close();
+    await page.flush();
+  }
+  assert.equal(page.navigations.length, 1);
+  assert.ok(page.navigations[0].includes("grDailyToken="));
+  assert.equal(
+    page.dailyRequests.some((r) => r.state === "finished"),
+    false,
+  );
+  const resumed = dailyPage({
+    href: page.navigations[0],
+    stored: page.stored,
+    sessionStored: page.sessionStored,
+    listing: { pages: [[101]] },
+    startTime: page.now,
+  });
+  await resumed.advanceAsync(1500);
+  resumed.openedTabs[0].close();
+  await resumed.advanceAsync(0);
+  assert.equal(resumed.dailyRequests.at(-1).state, "finished");
 });
 
 test("a saved macro connects automatically without a browser pairing key", async () => {

@@ -1,7 +1,7 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.20 recovers blank giveaway tabs from the opener, restores initial focus
-after loading, and retries stalled address selection in the Windows companion.
+Version 4.21 adds a daily Edge profile runner with completion, cancellation,
+and timeout reporting. Blank-tab and address-selection recovery remain available.
 No pairing code or special paired userscript is required. Lists still run in
 batches of up to 100 rows with a main-page refresh between batches. Automatic
 startup remains limited to ending-soon print giveaways.
@@ -227,12 +227,79 @@ To remove automatic startup, open `shell:startup` and delete **Goodreads Keyfire
 helper**. To stop the current helper, end the `pythonw.exe` process whose command
 line contains `Goodreads\KeyfireGiveaways.py` in Task Manager.
 
+## Daily Edge profiles
+
+Install the updated **4.21** userscript in every profile. Each profile must have
+its own signed-in Goodreads session, saved **Keyfire setup**, and **Use Keyfire
+workflow** enabled. **Auto on load** can remain off: an authenticated request from
+the scheduled runner starts that visit explicitly. Existing filters still apply.
+The setup field named **Profile** refers to a Keyfire profile, not an Edge profile.
+
+For Dalton (`Default`), Profile 2, and Profile 3, install the daily Windows task:
+
+```powershell
+powershell -NoProfile -File Goodreads/Install-DailyGiveaways.ps1
+```
+
+The task **Goodreads daily profiles** starts at **4:00 a.m. Eastern** every day.
+It targets Dalton at 4:00, Profile 2 at 4:30, and Profile 3 at 5:00. If a previous
+account is still running, the next waits until it finishes. Only one daily runner
+and one macro workflow run at a time. There is no automatic log-in or unlocking;
+Windows must stay signed in and unlocked. The monitor can be off. The task asks
+Windows to wake the PC, subject to the computer's power settings. A missed run
+does not launch later in the day. No power, sign-in, or security settings change.
+
+The installer checks the Eastern Windows time zone and the actual profile folders
+before saving the task. It never creates browser profiles or copies cookies.
+For other setups, pass `-At '04:00'`, `-SpacingMinutes 30`, `-ProfileNames`, and
+`-ProfileDirectories`. Use `edge://version` in each profile to find its actual
+profile folder; its display name can differ. `-MacroName` and `-MacroProfile`
+validate the expected saved Keyfire macro. Runtime uses each profile's saved macro.
+
+Check files and the saved macro without launching a browser:
+
+```powershell
+powershell -NoProfile -File Goodreads/Install-DailyGiveaways.ps1 -CheckOnly
+```
+
+After installing 4.21 in all profiles, verify the per-profile setup without
+opening giveaway entry tabs or sending keys:
+
+```powershell
+powershell -NoProfile -File Goodreads/Install-DailyGiveaways.ps1 -VerifyOnly
+```
+
+Verification opens the ordinary giveaway list, where older versions do not
+auto-start, and checks the companion connection and saved macro in each profile.
+It does not prove successful Goodreads entries or persistent sign-in. Confirm the
+intended account is signed in in each profile before leaving the daily task on.
+
+The runner stops the remaining accounts if a userscript does not connect within
+two minutes, contact is lost for two minutes, progress stalls for three minutes,
+an account runs for 45 minutes, the user cancels, or Windows locks. It does not
+close unfinished tabs, kill Edge, or launch the next account after a failure.
+Scheduled userscripts remove keyboard authorization when the runner cancels or
+cannot be reached. A background tab can delay this check until its next timer.
+The local status endpoint is `127.0.0.1:17385`; each account uses a fresh temporary
+token in its URL fragment. It accepts only the active token and expected origins.
+
+Read `%LOCALAPPDATA%\GoodreadsKeyfireCompanion\daily-last-run.json` for the last
+run, `daily-verification.json` for setup checks, and `daily.log` for diagnostics.
+**Finished** means the opened tab queue closed. It does not confirm Goodreads
+accepted every entry. Settings are saved beside the reports in `daily-settings.json`.
+Disable **Goodreads daily profiles** in Task Scheduler to stop future daily runs.
+
+Goodreads' [giveaway terms](https://www.goodreads.com/giveaway/terms) disqualify
+automated entries and limit each giveaway to one entry per person and household.
+Separate browser profiles do not change those eligibility rules.
+
 ## Checks
 
 ```powershell
 node --check Goodreads/Giveaways.js
 node --test Goodreads/Giveaways.test.cjs
 python Goodreads/KeyfireGiveaways.test.py
+python Goodreads/DailyGiveaways.test.py
 powershell -NoProfile -File Goodreads/Start-KeyfireGiveaways.ps1 -CheckOnly
 python Goodreads/KeyfireGiveaways.py --dry-run --seconds 2
 ```

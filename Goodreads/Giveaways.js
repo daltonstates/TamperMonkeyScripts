@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      4.20
+// @version      4.21
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, optionally opens all on load, and supports a Keyfire workflow companion while claiming.
@@ -47,6 +47,7 @@
   const LS_KEYFIRE_SETTINGS = "gr_keyfire_settings";
   const LS_GIVEAWAY_TAB_PREFIX = "gr_giveaway_tab_";
   const KEYFIRE_HELPER_URL = "http://127.0.0.1:17384/v1/workflow";
+  const DAILY_HELPER_URL = "http://127.0.0.1:17385/v1/daily";
   const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
   const SS_GIVEAWAY_CONTINUATION = "gr_giveaway_continuation";
   const PROGRESS_HASH_INDEX = "grGiveawayIndex";
@@ -157,6 +158,7 @@
   let openButton = null;
   let openAllButton = null;
   let workflowStatus = null;
+  let dailyRun = null;
 
   const openedGiveawayLinks = new Set();
   const trackedGiveawayTabs = new Set();
@@ -231,6 +233,144 @@
       url.searchParams.getAll("format").length === 1 &&
       url.searchParams.get("format") === "print"
     );
+  }
+
+  function dailyProgress() {
+    return `${dailyRun?.baseOpened + giveawayBatchOpened || 0}/${giveawayBatchTotal};${trackedGiveawayTabs.size} open;${loadingGiveaways ? "loading" : "claiming"}`;
+  }
+
+  function dailyRequest(token, state, reason = "") {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let request;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else resolve(value);
+      };
+      const timer = setTimeout(() => {
+        finish(new Error("The daily runner did not respond."));
+        request?.abort();
+      }, 5000);
+      try {
+        request = GM_xmlhttpRequest({
+          method: "POST",
+          url: DAILY_HELPER_URL,
+          anonymous: true,
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goodreads-Companion": "daily",
+          },
+          data: JSON.stringify({
+            token,
+            state,
+            reason: reason.slice(0, 300),
+            progress: dailyProgress(),
+          }),
+          onerror: () =>
+            finish(new Error("The daily runner connection failed.")),
+          onabort: () =>
+            finish(new Error("The daily runner connection stopped.")),
+          ontimeout: () =>
+            finish(new Error("The daily runner connection timed out.")),
+          onload: (response) => {
+            try {
+              const value = JSON.parse(response.responseText);
+              if (
+                response.status !== 200 ||
+                value.protocol !== 1 ||
+                value.cancel
+              )
+                throw new Error(
+                  value.error || "The daily runner stopped this account.",
+                );
+              finish(null, value);
+            } catch (error) {
+              finish(error);
+            }
+          },
+        });
+      } catch (error) {
+        finish(error);
+      }
+    });
+  }
+
+  function giveawayError(message) {
+    if (!dailyRun) {
+      alert(message);
+      return;
+    }
+    if (dailyRun.stopped) return;
+    dailyRun.stopped = true;
+    dailyRun.message = `Daily run stopped: ${message}`;
+    clearInterval(dailyRun.timer);
+    giveawayRunController?.abort();
+    sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
+    void dailyRequest(dailyRun.token, "failed", message).catch(() => {});
+    if (workflowStatus)
+      workflowStatus.textContent = `Daily run stopped: ${message}`;
+  }
+
+  async function startDailyGiveaways(token, continuation) {
+    if (!/^[a-f0-9]{64}$/.test(token)) return;
+    dailyRun = {
+      token,
+      stopped: false,
+      timer: null,
+      baseOpened: continuation?.openedIds.length ?? 0,
+    };
+    try {
+      const response = await dailyRequest(token, "ready");
+      if (!keyfireEnabled || !isKeyfireConfigured(keyfireSettings))
+        throw new Error(
+          "Save Keyfire setup and enable Use Keyfire workflow in this Edge profile.",
+        );
+      if (response.mode === "verify") {
+        const controller = new AbortController();
+        const workflow = await startKeyfireRun(controller.signal);
+        workflow.stop();
+        await dailyRequest(token, "verified");
+        dailyRun.stopped = true;
+        dailyRun.message =
+          "Daily setup verified. No giveaway tabs were opened.";
+        refreshWorkflowStatus();
+        return;
+      }
+      if (response.mode !== "run")
+        throw new Error("Update the daily runner and try again.");
+      if (!isAutoOpenPage())
+        throw new Error(
+          "Daily runs are limited to ending-soon print giveaways.",
+        );
+      let pending = false;
+      dailyRun.timer = setInterval(async () => {
+        if (pending || dailyRun.stopped) return;
+        pending = true;
+        try {
+          await dailyRequest(token, "running");
+        } catch (error) {
+          giveawayError(error.message);
+        } finally {
+          pending = false;
+        }
+      }, 5000);
+      window.addEventListener("pagehide", () => clearInterval(dailyRun.timer), {
+        once: true,
+      });
+      await openAllGiveaways(continuation);
+      if (dailyRun.stopped || refreshingGiveaways || leavingPage) return;
+      clearInterval(dailyRun.timer);
+      await dailyRequest(token, "finished");
+      dailyRun.stopped = true;
+      dailyRun.message =
+        "Daily run finished. All opened giveaway tabs have closed.";
+      refreshWorkflowStatus();
+    } catch (error) {
+      giveawayError(error.message);
+    }
   }
 
   function giveawayListPageKey() {
@@ -340,6 +480,11 @@
 
   function refreshWorkflowStatus() {
     if (!workflowStatus) return;
+    if (dailyRun?.message) {
+      workflowStatus.hidden = false;
+      workflowStatus.textContent = dailyRun.message;
+      return;
+    }
     workflowStatus.hidden = !keyfireSettings.macroName && !keyfireEnabled;
     const text = keyfireEnabled
       ? isKeyfireConfigured(keyfireSettings)
@@ -418,7 +563,14 @@
       !refreshingGiveaways &&
       !leavingPage;
     restartAutoOpen = false;
-    if (restart) {
+    if (
+      dailyRun &&
+      controller.signal.aborted &&
+      !refreshingGiveaways &&
+      !leavingPage
+    )
+      giveawayError("The giveaway run was cancelled or its setup changed.");
+    if (restart && !dailyRun) {
       void openAllGiveaways();
     }
   }
@@ -549,7 +701,7 @@
       } catch (error) {
         if (controller.signal.aborted) return;
         console.error("Could not load all Goodreads giveaways", error);
-        alert(
+        giveawayError(
           keyfireEnabled && !preparedWorkflow
             ? error.message
             : "Could not load all giveaways. Check the page and try again. No giveaways were opened.",
@@ -570,7 +722,7 @@
       if (controller.signal.aborted || !capped || !result || result.failed)
         return;
       if (result.openedIds.length === 0) {
-        alert(
+        giveawayError(
           "No new eligible giveaways in this batch. Check the remaining entries and genre filters before starting again.",
         );
         return;
@@ -590,7 +742,7 @@
         );
       } catch (error) {
         console.error("Could not save the next Goodreads batch", error);
-        alert(
+        giveawayError(
           "Could not save the next batch. Refresh the list and start again.",
         );
         return;
@@ -709,7 +861,7 @@
           );
           if (retries >= MAX_GIVEAWAY_RELOADS) {
             stopRecovery();
-            alert(
+            giveawayError(
               `This giveaway stayed blank after ${MAX_GIVEAWAY_RELOADS} reopen attempts. Check Tampermonkey and your connection, then finish or close the tab.`,
             );
             return;
@@ -721,7 +873,7 @@
           stopRecovery();
           recovery.controller.abort();
           console.error("Could not recover a blank Goodreads tab", error);
-          alert(
+          giveawayError(
             "The blank giveaway tab could not be reopened. Check the tab, then try again.",
           );
           if (closed) settle();
@@ -846,7 +998,7 @@
     } catch (error) {
       if (!signal.aborted) {
         console.error("Could not run Goodreads giveaway opening", error);
-        alert(
+        giveawayError(
           error.message ||
             "Could not open giveaways. Check the page and try again.",
         );
@@ -1932,7 +2084,12 @@
         giveawayRunController?.abort();
       });
       const continuation = takeGiveawayContinuation();
-      if (continuation || (autoOpenAllEnabled && isAutoOpenPage())) {
+      const dailyToken = new URLSearchParams(window.location.hash.slice(1)).get(
+        "grDailyToken",
+      );
+      if (dailyToken !== null) {
+        void startDailyGiveaways(dailyToken, continuation);
+      } else if (continuation || (autoOpenAllEnabled && isAutoOpenPage())) {
         void openAllGiveaways(continuation);
       }
     });
