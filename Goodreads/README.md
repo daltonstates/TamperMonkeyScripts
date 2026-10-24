@@ -1,12 +1,41 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.21 adds a daily Edge profile runner with completion, cancellation,
-and timeout reporting. Blank-tab and address-selection recovery remain available.
+Version 4.22 adds automatic userscript updates from this GitHub repository.
+The daily Edge profile runner, completion reports, and recovery remain available.
 No pairing code or special paired userscript is required. Lists still run in
 batches of up to 100 rows with a main-page refresh between batches. Automatic
 startup remains limited to ending-soon print giveaways.
 Install [Giveaways.js](Giveaways.js) in Tampermonkey. The Windows helper below is
 required when using a Keyfire macro; ordinary tab opening works without it.
+
+## Automatic GitHub updates
+
+Update the existing Tampermonkey script to **4.22** once in each Edge profile.
+Keep automatic userscript update checks enabled in each profile's Tampermonkey
+installation. Future updates can then download automatically from the
+[published script](https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js).
+The update runs on Tampermonkey's configured check interval while the browser is
+available; pushing to GitHub does not instantly update every profile.
+
+The header contains `@updateURL` and `@downloadURL`, both pointing at the script
+on `main`. `@namespace` identifies the script; a GitHub profile in that field
+alone does not enable updates. Keep its name and namespace stable, increase
+`@version` for each new userscript version, and commit and push that version to
+`main`. Local edits that have not been pushed are unavailable to the updater.
+
+For a script installed by pasting or opening a local file, this is a one-time
+replacement of its contents. Avoid leaving two enabled copies of the giveaway
+script. If you previously overrode its update/download URLs in Tampermonkey,
+reset those overrides to the script's GitHub URLs and allow update checks.
+
+These updates cover `Giveaways.js`. Changes to the Windows Python/PowerShell
+companion or daily runner still need a repository update on the PC and, when
+applicable, a companion restart. User settings and signed-in browser sessions
+are not copied between profiles.
+
+See [Tampermonkey's update documentation](https://www.tampermonkey.net/documentation.php?locale=en&q=update_url).
+
+## Giveaway workflow
 
 **Auto on load**, beside **Open all giveaways**, saves your choice. It runs only
 on [ending-soon print giveaways](https://www.goodreads.com/giveaway?sort=ending_soon&format=print).
@@ -229,7 +258,7 @@ line contains `Goodreads\KeyfireGiveaways.py` in Task Manager.
 
 ## Daily Edge profiles
 
-Install the updated **4.21** userscript in every profile. Each profile must have
+Install the current **4.22 or later** userscript in every profile. Each profile must have
 its own signed-in Goodreads session, saved **Keyfire setup**, and **Use Keyfire
 workflow** enabled. **Auto on load** can remain off: an authenticated request from
 the scheduled runner starts that visit explicitly. Existing filters still apply.
@@ -262,7 +291,7 @@ Check files and the saved macro without launching a browser:
 powershell -NoProfile -File Goodreads/Install-DailyGiveaways.ps1 -CheckOnly
 ```
 
-After installing 4.21 in all profiles, verify the per-profile setup without
+After installing the current script in all profiles, verify the per-profile setup without
 opening giveaway entry tabs or sending keys:
 
 ```powershell
