@@ -700,6 +700,200 @@ test("automatic startup accepts reordered query parameters and a fragment", asyn
   assert.equal(page.openedTabs.length, 2);
 });
 
+test("autoload=1 starts a visit without saving Auto on load or affecting normal visits", async () => {
+  for (const saved of [null, "0"]) {
+    const stored = new Map([["gr_blocked_genres", '["horror"]']]);
+    if (saved !== null) stored.set("gr_auto_open_all", saved);
+    const page = createPage({
+      href: "https://www.goodreads.com/giveaway?format=print&autoload=1&sort=ending_soon#books",
+      stored,
+      listing: { pages: [[1], [{ id: 2, genres: ["Horror"] }, 3]] },
+    });
+    assert.equal(
+      page.document.querySelector("#gr-auto-open-all").checked,
+      true,
+    );
+    await page.advanceAsync(2500);
+    assert.equal(page.openedTabs.length, 2);
+    assert.equal(page.localStorage.getItem("gr_auto_open_all"), saved);
+    const browsing = createPage({
+      pathname: automaticListPath,
+      stored,
+      listing: { pages: [[4]] },
+    });
+    await browsing.advanceAsync(2500);
+    assert.equal(
+      browsing.document.querySelector("#gr-auto-open-all").checked,
+      false,
+    );
+    assert.equal(browsing.openedTabs.length, 0);
+  }
+});
+
+test("autoload=1 waits for the document before loading or opening giveaways", async () => {
+  const page = createPage({
+    pathname: `${automaticListPath}&autoload=1`,
+    loading: true,
+    listing: { pages: [[1], [2]] },
+  });
+  await page.advanceAsync(5000);
+  assert.equal(page.paginationClicks, 0);
+  assert.equal(page.openedTabs.length, 0);
+  page.finishLoading();
+  await page.advanceAsync(2500);
+  assert.equal(page.paginationClicks, 1);
+  assert.equal(page.openedTabs.length, 2);
+});
+
+test("invalid or repeated autoload parameters do not start a run", async () => {
+  for (const query of [
+    "autoload",
+    "autoload=0",
+    "autoload=true",
+    "autoload=2",
+    "autoload=1&autoload=1",
+    "autoload=1&autoload=0",
+  ]) {
+    const page = createPage({
+      pathname: `${automaticListPath}&${query}`,
+      listing: { pages: [[1], [2]] },
+    });
+    await page.advanceAsync(2500);
+    assert.equal(page.openedTabs.length, 0, query);
+    assert.equal(page.paginationClicks, 0, query);
+    assert.equal(
+      page.document.querySelector("#gr-auto-open-all").checked,
+      false,
+      query,
+    );
+  }
+});
+
+test("the autoload URL option cannot bypass the ending-soon print restriction", async () => {
+  for (const pathname of [
+    "/giveaway?autoload=1",
+    "/giveaway?sort=recently_listed&format=print&autoload=1",
+    "/giveaway?sort=ending_soon&format=kindle&autoload=1",
+    "/giveaway/list?sort=ending_soon&format=print&autoload=1",
+    "/giveaway?sort=ending_soon&sort=recently_listed&format=print&autoload=1",
+  ]) {
+    const page = createPage({ pathname, listing: { pages: [[1], [2]] } });
+    await page.advanceAsync(2500);
+    assert.equal(page.openedTabs.length, 0, pathname);
+    assert.equal(page.paginationClicks, 0, pathname);
+    assert.equal(
+      page.document.querySelector("#gr-auto-open-all").disabled,
+      true,
+      pathname,
+    );
+  }
+});
+
+test("cancelling URL auto-load removes only its flag and prevents a reload restart", async () => {
+  const page = createPage({
+    href: `https://www.goodreads.com${automaticListPath}&autoload=1&extra=kept#books`,
+    listing: { pages: [[1], [2]], delay: 5000 },
+  });
+  await page.flush();
+  page.setAutoOpen(false);
+  const stopped = new URL(page.window.location.href);
+  assert.equal(stopped.searchParams.has("autoload"), false);
+  assert.equal(stopped.searchParams.get("sort"), "ending_soon");
+  assert.equal(stopped.searchParams.get("format"), "print");
+  assert.equal(stopped.searchParams.get("extra"), "kept");
+  assert.equal(stopped.hash, "#books");
+  assert.deepEqual(page.window.history.state, { preserved: true });
+  await page.advanceAsync(10000);
+  assert.equal(page.openedTabs.length, 0);
+  const reloaded = createPage({
+    href: stopped.href,
+    stored: page.stored,
+    sessionStored: page.sessionStored,
+    listing: { pages: [[3]] },
+  });
+  await reloaded.advanceAsync(2500);
+  assert.equal(reloaded.openedTabs.length, 0);
+});
+
+test("URL auto-load honors foreground Keyfire mode and cancellation keeps the current tab", async () => {
+  const page = keyfirePage(undefined, {
+    pathname: `${automaticListPath}&autoload=1`,
+    stored: new Map([
+      ["gr_keyfire_enabled", "1"],
+      ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+    ]),
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.openedTabs[0].options.active, true);
+  assert.equal(page.localStorage.getItem("gr_auto_open_all"), null);
+  page.setAutoOpen(false);
+  await page.advanceAsync(1000);
+  assert.equal(page.openedTabs[0].closed, false);
+  assert.equal(
+    [...page.stored.keys()].some((key) => key.startsWith("gr_keyfire_run_")),
+    false,
+  );
+  page.openedTabs[0].close();
+  await page.advanceAsync(2000);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(
+    new URL(page.window.location.href).searchParams.has("autoload"),
+    false,
+  );
+});
+
+test("URL auto-load continues capped batches without enabling ordinary visits", async () => {
+  const first = keyfirePage(
+    { pages: giveawayPages(1, 125) },
+    {
+      pathname: `${automaticListPath}&autoload=1`,
+      stored: new Map([
+        ["gr_keyfire_enabled", "1"],
+        ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+      ]),
+    },
+  );
+  await first.advanceAsync(4500);
+  await closeBatch(first, 100);
+  assert.equal(first.navigations.length, 1);
+  assert.equal(new URL(first.navigations[0]).searchParams.get("autoload"), "1");
+  assert.equal(first.localStorage.getItem("gr_auto_open_all"), null);
+  const browsing = createPage({
+    pathname: automaticListPath,
+    stored: first.stored,
+    sessionStored: new Map(first.sessionStored),
+    listing: { pages: [[999]] },
+  });
+  await browsing.advanceAsync(2500);
+  assert.equal(browsing.openedTabs.length, 0);
+  const second = createPage({
+    href: first.navigations[0],
+    stored: first.stored,
+    sessionStored: first.sessionStored,
+    listing: { pages: giveawayPages(101, 25) },
+  });
+  await second.advanceAsync(2500);
+  await closeBatch(second, 25);
+  assert.equal(second.openedTabs.length, 25);
+  assert.equal(second.navigations.length, 0);
+  assert.equal(second.localStorage.getItem("gr_auto_open_all"), null);
+});
+
+test("a daily setup check takes precedence over an autoload URL", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}&autoload=1#grDailyToken=${"d".repeat(64)}`,
+    dailyMode: "verify",
+  });
+  await page.advanceAsync(12000);
+  assert.equal(page.openedTabs.length, 0);
+  assert.deepEqual(
+    page.dailyRequests.map((r) => r.state),
+    ["ready", "verified"],
+  );
+  assert.equal(page.localStorage.getItem("gr_auto_open_all"), null);
+});
+
 for (const pathname of [
   "/giveaway",
   "/giveaway?sort=ending_soon",

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.22
+// @version      4.23
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -72,6 +72,7 @@
   const GIVEAWAY_LOAD_TIMEOUT_MS = 30000;
   const AUTO_OPEN_LIST_URL =
     "https://www.goodreads.com/giveaway?sort=ending_soon&format=print";
+  const AUTO_OPEN_URL_PARAM = "autoload";
   const GIVEAWAY_TAB_LOAD_TIMEOUT_MS = 5000;
   const MAX_GIVEAWAY_RELOADS = 3;
   const GIVEAWAY_RELOAD_PARAM = "grGiveawayReload";
@@ -145,7 +146,8 @@
   let filteringEnabled = loadFilterEnabled();
   let BLOCKED = new Set(loadBlockedGenres().map((g) => g.toLowerCase()));
   let maxOpenTabs = loadMaxOpenTabs();
-  let autoOpenAllEnabled = localStorage.getItem(LS_AUTO_OPEN_ALL) === "1";
+  let autoOpenAllEnabled =
+    localStorage.getItem(LS_AUTO_OPEN_ALL) === "1" || isUrlAutoOpenRequested();
   let keyfireSettings = loadKeyfireSettings();
   // Keep the user's choice separate from setup readiness. Entry tabs must not
   // turn a requested keyboard workflow into background-only tab opening.
@@ -236,6 +238,22 @@
       url.searchParams.getAll("format").length === 1 &&
       url.searchParams.get("format") === "print"
     );
+  }
+
+  function isUrlAutoOpenRequested() {
+    const url = new URL(window.location.href);
+    return (
+      isAutoOpenPage() &&
+      url.searchParams.getAll(AUTO_OPEN_URL_PARAM).length === 1 &&
+      url.searchParams.get(AUTO_OPEN_URL_PARAM) === "1"
+    );
+  }
+
+  function clearUrlAutoOpenRequest() {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has(AUTO_OPEN_URL_PARAM)) return;
+    url.searchParams.delete(AUTO_OPEN_URL_PARAM);
+    window.history.replaceState(window.history.state, "", url.href);
   }
 
   function dailyProgress() {
@@ -1663,7 +1681,9 @@
 
     const autoOpenLabel = document.createElement("label");
     autoOpenLabel.id = "gr-auto-open-label";
-    autoOpenLabel.title = `Automatically open all filtered giveaways only on ${AUTO_OPEN_LIST_URL}. Uncheck to stop loading and opening more giveaways.`;
+    autoOpenLabel.title = isUrlAutoOpenRequested()
+      ? "Enabled for this URL only. Your saved preference is unchanged. Uncheck to stop and remove autoload=1 from this URL."
+      : `Automatically open all filtered giveaways only on ${AUTO_OPEN_LIST_URL}. Uncheck to stop loading and opening more giveaways.`;
     const autoOpenCheckbox = document.createElement("input");
     autoOpenCheckbox.id = "gr-auto-open-all";
     autoOpenCheckbox.type = "checkbox";
@@ -1683,6 +1703,7 @@
         restartAutoOpen = false;
         sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
         giveawayRunController?.abort();
+        clearUrlAutoOpenRequest();
       }
     });
     const autoOpenText = document.createElement("span");

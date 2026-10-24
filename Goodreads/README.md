@@ -1,7 +1,7 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.22 adds automatic userscript updates from this GitHub repository.
-The daily Edge profile runner, completion reports, and recovery remain available.
+Version 4.23 adds `autoload=1` to start a run from a bookmark without saving
+Auto on load as enabled. Automatic GitHub updates and the daily runner remain available.
 No pairing code or special paired userscript is required. Lists still run in
 batches of up to 100 rows with a main-page refresh between batches. Automatic
 startup remains limited to ending-soon print giveaways.
@@ -37,9 +37,24 @@ See [Tampermonkey's update documentation](https://www.tampermonkey.net/documenta
 
 ## Giveaway workflow
 
+For automatic loading on one visit, use
+[the ending-soon print URL with autoload=1](https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1).
+The `&autoload=1` option enables **Auto on load** for that URL without changing
+its saved preference. Leave the saved checkbox off to browse normally at the
+same URL without `autoload=1`. The existing genre filters and Keyfire selection
+still apply. This URL option requires version **4.23 or later** and works only
+on the ending-soon print list. Other values or repeated `autoload` parameters
+do not enable it.
+
+The flag stays on the listing URL through batch refreshes. Unchecking **Auto on
+load** cancels the run and removes the flag, preserving the other URL parameters
+and fragment, so refreshing after cancellation does not start it again. Already
+opened giveaway tabs remain open. The daily Windows task still starts its runs
+independently of this flag and the saved Auto on load preference.
+
 **Auto on load**, beside **Open all giveaways**, saves your choice. It runs only
 on [ending-soon print giveaways](https://www.goodreads.com/giveaway?sort=ending_soon&format=print).
-Checking it there starts immediately and starts again on future visits to that
+Manually checking it there starts immediately and starts again on future visits to that
 page. The checkbox is disabled on other giveaway pages, which never start a batch
 automatically. Reordering the two query parameters or adding a fragment does not
 change the allowed page. **Open all giveaways** remains available manually on
