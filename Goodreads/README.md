@@ -285,9 +285,12 @@ For Dalton (`Default`), Profile 2, and Profile 3, install the daily Windows task
 powershell -NoProfile -File Goodreads/Install-DailyGiveaways.ps1
 ```
 
-The task **Goodreads daily profiles** starts at **4:00 a.m. Eastern** every day.
-It targets Dalton at 4:00, Profile 2 at 4:30, and Profile 3 at 5:00. If a previous
-account is still running, the next waits until it finishes. Only one daily runner
+The task **Goodreads daily profiles** wakes at **4:00 a.m. Eastern** every day.
+Each profile gets a fresh random delay of **0-5 minutes**, chosen once for that
+day's run, with second precision. Dalton targets **4:00-4:05**, Profile 2
+**4:30-4:35**, and Profile 3 **5:00-5:05**. Task Scheduler still shows the 4:00
+coordinator start; the runner chooses the individual browser start times.
+If a previous account is still running, the next waits until it finishes. Only one daily runner
 and one macro workflow run at a time. There is no automatic log-in or unlocking;
 Windows must stay signed in and unlocked. The monitor can be off. The task asks
 Windows to wake the PC, subject to the computer's power settings. A missed run
@@ -295,8 +298,11 @@ does not launch later in the day. No power, sign-in, or security settings change
 
 The installer checks the Eastern Windows time zone and the actual profile folders
 before saving the task. It never creates browser profiles or copies cookies.
-For other setups, pass `-At '04:00'`, `-SpacingMinutes 30`, `-ProfileNames`, and
-`-ProfileDirectories`. Use `edge://version` in each profile to find its actual
+For other setups, pass `-At '04:00'`, `-SpacingMinutes 30`, `-StartJitterMinutes 5`,
+`-ProfileNames`, and `-ProfileDirectories`. Use `-StartJitterMinutes 0` for fixed
+times. The maximum random delay must be smaller than the spacing between
+profiles. Settings files without `startJitterMinutes` keep fixed times until
+updated by the installer. Use `edge://version` in each profile to find its actual
 profile folder; its display name can differ. `-MacroName` and `-MacroProfile`
 validate the expected saved Keyfire macro. Runtime uses each profile's saved macro.
 
@@ -329,6 +335,8 @@ token in its URL fragment. It accepts only the active token and expected origins
 
 Read `%LOCALAPPDATA%\GoodreadsKeyfireCompanion\daily-last-run.json` for the last
 run, `daily-verification.json` for setup checks, and `daily.log` for diagnostics.
+The report's `plannedStarts` records that run's selected times and random delays.
+`--now` runs and setup-only verification bypass the random delays.
 **Finished** means the opened tab queue closed. It does not confirm Goodreads
 accepted every entry. Settings are saved beside the reports in `daily-settings.json`.
 Disable **Goodreads daily profiles** in Task Scheduler to stop future daily runs.

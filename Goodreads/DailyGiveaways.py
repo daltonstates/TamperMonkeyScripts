@@ -31,6 +31,9 @@ def read_settings(path):
     if not isinstance(profiles, list) or not 1 <= len(profiles) <= 20:
         raise ValueError("Choose between 1 and 20 Edge profiles")
     datetime.strptime(value["startAt"], "%H:%M")
+    jitter = value.get("startJitterMinutes", 0)
+    if type(jitter) is not int or not 0 <= jitter <= 15:
+        raise ValueError("Random start delay must be a whole number from 0 to 15 minutes")
     root = Path(value["userDataDirectory"])
     if not Path(value["edgePath"]).is_file():
         raise ValueError("Microsoft Edge was not found at the configured path")
@@ -46,14 +49,22 @@ def read_settings(path):
             raise ValueError("Invalid, missing, duplicated, or out-of-order Edge profile")
         seen.add(directory.casefold())
         previous_offset = offset
+    offsets = [profile["offsetMinutes"] for profile in profiles]
+    if len(offsets) > 1 and jitter >= min(b - a for a, b in zip(offsets, offsets[1:])):
+        raise ValueError("Random start delay must be smaller than the spacing between profiles")
     read_workflow(Path(value["keyfireConfig"]), Settings(value["macroName"], value.get("macroProfile", "")))
     return value
 
 
-def planned_starts(settings, now, immediate=False):
+def planned_starts(settings, now, immediate=False, *, randbelow=None):
+    if immediate:
+        return [now] * len(settings["profiles"])
     hour, minute = map(int, settings["startAt"].split(":"))
     base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return [now if immediate else base + timedelta(minutes=p["offsetMinutes"])
+    jitter_seconds = settings.get("startJitterMinutes", 0) * 60
+    choose = randbelow if randbelow is not None else secrets.randbelow
+    return [base + timedelta(minutes=p["offsetMinutes"],
+                             seconds=choose(jitter_seconds + 1) if jitter_seconds else 0)
             for p in settings["profiles"]]
 
 
@@ -211,16 +222,25 @@ def save_report(path, report):
 
 
 def run_queue(settings, output, *, verify=False, immediate=False):
-    report = {"startedAt": datetime.now().astimezone().isoformat(), "verificationOnly": verify,
-              "profiles": [], "note": "Finished means the tab queue closed; it does not prove Goodreads accepted every entry."}
+    run_started = datetime.now()
+    base_starts = planned_starts(settings, run_started, immediate, randbelow=lambda _: 0)
+    starts = planned_starts(settings, run_started, immediate)
+    plan = [{"name": profile["name"], "plannedAt": start.isoformat(),
+             "delaySeconds": int((start - base).total_seconds())}
+            for profile, start, base in zip(settings["profiles"], starts, base_starts)]
+    report = {"startedAt": run_started.astimezone().isoformat(), "verificationOnly": verify,
+              "plannedStarts": plan, "profiles": [],
+              "note": "Finished means the tab queue closed; it does not prove Goodreads accepted every entry."}
     output.mkdir(parents=True, exist_ok=True)
     report_path = output / ("daily-verification.json" if verify else "daily-last-run.json")
     save_report(report_path, report)
+    for item in plan:
+        logging.info("Planned %s at %s (random delay %s seconds)",
+                     item["name"], item["plannedAt"], item["delaySeconds"])
     server = Server(("127.0.0.1", PORT), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        starts = planned_starts(settings, datetime.now(), immediate)
         for profile, start in zip(settings["profiles"], starts):
             while datetime.now() < start:
                 time.sleep(max(0, min(5, (start - datetime.now()).total_seconds())))
@@ -231,7 +251,7 @@ def run_queue(settings, output, *, verify=False, immediate=False):
                 item.update(state="failed", reason="Windows is locked or has no interactive desktop.")
                 save_report(report_path, report)
                 break
-            if not immediate and datetime.now() > starts[0] + timedelta(hours=3):
+            if not immediate and datetime.now() > base_starts[0] + timedelta(hours=3):
                 item.update(state="failed", reason="Outside the three-hour morning run window.")
                 save_report(report_path, report)
                 break
@@ -281,12 +301,17 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--verify-only", action="store_true", help="Check each profile without opening entry tabs or sending keys")
-    parser.add_argument("--now", action="store_true", help="Ignore the planned start times")
+    parser.add_argument("--now", action="store_true", help="Ignore the planned start times and random delays")
     args = parser.parse_args()
     settings = read_settings(args.config)
     if args.check:
-        for profile, start in zip(settings["profiles"], planned_starts(settings, datetime.now())):
-            print(f'{profile["name"]}: {start:%H:%M}, Edge {profile["directory"]}')
+        jitter = settings.get("startJitterMinutes", 0)
+        for profile, start in zip(settings["profiles"], planned_starts(settings, datetime.now(), randbelow=lambda _: 0)):
+            end = start + timedelta(minutes=jitter)
+            window = f"{start:%H:%M}-{end:%H:%M}" if jitter else f"{start:%H:%M}"
+            print(f'{profile["name"]}: {window}, Edge {profile["directory"]}')
+        if jitter:
+            print("A fresh random start time is chosen for each profile on each scheduled run.")
         print("Saved macro is valid. Browser sign-ins and installed userscripts still require verification.")
         return 0
     output = args.config.parent

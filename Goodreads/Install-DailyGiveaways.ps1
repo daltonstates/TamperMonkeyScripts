@@ -1,6 +1,8 @@
 param(
     [string]$At = '04:00',
     [int]$SpacingMinutes = 30,
+    [ValidateRange(0, 15)]
+    [int]$StartJitterMinutes = 5,
     [string[]]$ProfileNames = @('Dalton', 'Profile 2', 'Profile 3'),
     [string[]]$ProfileDirectories = @('Default', 'Profile 2', 'Profile 3'),
     [string]$MacroName = 'Goodreads Giveaway - no refresh',
@@ -30,6 +32,7 @@ $profiles = @(for ($i = 0; $i -lt $ProfileNames.Count; $i++) {
 })
 $settings = @{
     startAt = $At
+    startJitterMinutes = $StartJitterMinutes
     edgePath = $edgePath
     userDataDirectory = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'
     keyfireConfig = Join-Path $env:APPDATA 'com.nodescaffold.trigr\keyforge-config.json'
@@ -70,7 +73,7 @@ $taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances Ignor
 $scheduleText = (@(for ($i = 0; $i -lt $ProfileNames.Count; $i++) {
     $ProfileNames[$i] + ' ' + $parsedTime.AddMinutes($i * $SpacingMinutes).ToString('HH:mm')
 }) -join ', ')
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description ("Goodreads daily: $scheduleText Eastern. Wait for each account and stop on failure.") -Force | Out-Null
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description ("Goodreads daily: $scheduleText Eastern, each delayed randomly by 0-$StartJitterMinutes minutes. Wait for each account and stop on failure.") -Force | Out-Null
 Write-Output "Installed: $taskName. Windows must remain signed in and unlocked."
 Write-Output "Settings: $settingsPath"
 Write-Output "Results: $(Join-Path $outputPath 'daily-last-run.json')"

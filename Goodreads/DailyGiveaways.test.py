@@ -17,6 +17,58 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(daily.planned_starts(settings, now), [now + timedelta(minutes=n) for n in (0, 30, 60)])
         self.assertEqual(daily.planned_starts(settings, now, True), [now] * 3)
 
+    def test_each_profile_gets_an_independent_delay_including_both_limits(self):
+        settings = {"startAt": "04:00", "startJitterMinutes": 5,
+                    "profiles": [{"offsetMinutes": n} for n in (0, 30, 60)]}
+        now = datetime(2026, 10, 25, 4)
+        choose = MagicMock(side_effect=[0, 300, 127])
+        self.assertEqual(daily.planned_starts(settings, now, randbelow=choose), [
+            now, now + timedelta(minutes=35), now + timedelta(hours=1, seconds=127),
+        ])
+        self.assertEqual([call.args for call in choose.call_args_list], [(301,)] * 3)
+
+    def test_delays_are_drawn_again_for_each_daily_plan(self):
+        settings = {"startAt": "04:00", "startJitterMinutes": 5,
+                    "profiles": [{"offsetMinutes": n} for n in (0, 30, 60)]}
+        now = datetime(2026, 10, 25, 4)
+        choose = MagicMock(side_effect=[0, 60, 120, 180, 240, 300])
+        first = daily.planned_starts(settings, now, randbelow=choose)
+        second = daily.planned_starts(settings, now + timedelta(days=1), randbelow=choose)
+        self.assertEqual(choose.call_count, 6)
+        self.assertEqual(second, [start + timedelta(days=1, minutes=3) for start in first])
+
+    def test_fixed_and_immediate_runs_do_not_draw_random_delays(self):
+        settings = {"startAt": "04:00", "startJitterMinutes": 5,
+                    "profiles": [{"offsetMinutes": n} for n in (0, 30, 60)]}
+        now = datetime(2026, 10, 25, 12)
+        choose = MagicMock(side_effect=AssertionError("Unexpected random delay"))
+        self.assertEqual(daily.planned_starts(settings, now, True, randbelow=choose), [now] * 3)
+        settings["startJitterMinutes"] = 0
+        self.assertEqual(daily.planned_starts(settings, now, randbelow=choose), [
+            now.replace(hour=4) + timedelta(minutes=n) for n in (0, 30, 60)
+        ])
+        choose.assert_not_called()
+
+    def test_invalid_delays_and_delays_that_could_reverse_profiles_are_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for directory in ("Default", "Profile 2"):
+                (root / directory).mkdir()
+            edge = root / "edge.exe"
+            edge.touch()
+            config = root / "daily.json"
+            base = {"startAt": "04:00", "edgePath": str(edge), "userDataDirectory": str(root),
+                    "keyfireConfig": "unused.json", "macroName": "Test",
+                    "profiles": [{"name": directory, "directory": directory, "offsetMinutes": n}
+                                 for directory, n in (("Default", 0), ("Profile 2", 5))]}
+            for jitter in (-1, 16, 1.5, "5", True, 5):
+                config.write_text(json.dumps({**base, "startJitterMinutes": jitter}))
+                with self.subTest(jitter=jitter), self.assertRaises(ValueError):
+                    daily.read_settings(config)
+            config.write_text(json.dumps({**base, "startJitterMinutes": 4}))
+            with patch.object(daily, "read_workflow"):
+                self.assertEqual(daily.read_settings(config)["startJitterMinutes"], 4)
+
     def test_validation_rejects_missing_duplicate_and_traversal_profiles(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -111,6 +163,57 @@ class HttpTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_queue_waits_for_drawn_times_and_does_not_overlap_a_long_account(self):
+        with tempfile.TemporaryDirectory() as folder:
+            now = [datetime(2026, 10, 25, 4)]
+            launches = []
+            server = MagicMock()
+            class Clock(datetime):
+                @classmethod
+                def now(cls):
+                    return now[0]
+
+            def launch(arguments):
+                launches.append(now[0])
+                server.session.event({"token": server.session.token, "state": "finished"})
+                if len(launches) == 1:
+                    now[0] += timedelta(minutes=35)
+
+            settings = {"startAt": "04:00", "startJitterMinutes": 5,
+                        "edgePath": "edge.exe", "userDataDirectory": folder,
+                        "profiles": [{"name": str(i), "directory": f"Profile {i}", "offsetMinutes": i * 30}
+                                     for i in range(3)]}
+            with patch.object(daily, "datetime", Clock), patch.object(daily, "Server", return_value=server), \
+                 patch.object(daily, "desktop_available", return_value=True), \
+                 patch.object(daily.secrets, "randbelow", side_effect=[300, 0, 137]) as choose, \
+                 patch.object(daily.subprocess, "Popen", side_effect=launch), \
+                 patch.object(daily.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + timedelta(seconds=seconds))):
+                self.assertEqual(daily.run_queue(settings, Path(folder)), 0)
+            self.assertEqual(launches, [datetime(2026, 10, 25, 4, 5),
+                                        datetime(2026, 10, 25, 4, 40),
+                                        datetime(2026, 10, 25, 5, 2, 17)])
+            self.assertEqual(choose.call_count, 3)
+            report = json.loads((Path(folder) / "daily-last-run.json").read_text())
+            self.assertEqual([plan["delaySeconds"] for plan in report["plannedStarts"]], [300, 0, 137])
+            self.assertEqual([p["state"] for p in report["profiles"]], ["finished"] * 3)
+
+    def test_random_delay_does_not_extend_the_morning_run_window(self):
+        class Clock(datetime):
+            @classmethod
+            def now(cls):
+                return datetime(2026, 10, 25, 7, 1)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(daily, "datetime", Clock), \
+             patch.object(daily, "Server"), patch.object(daily, "desktop_available", return_value=True), \
+             patch.object(daily.secrets, "randbelow", return_value=300), \
+             patch.object(daily.subprocess, "Popen") as launch:
+            settings = {"startAt": "04:00", "startJitterMinutes": 5,
+                        "profiles": [{"name": "Dalton", "directory": "Default", "offsetMinutes": 0}]}
+            self.assertEqual(daily.run_queue(settings, Path(folder)), 1)
+            launch.assert_not_called()
+            report = json.loads((Path(folder) / "daily-last-run.json").read_text())
+            self.assertIn("Outside the three-hour", report["profiles"][0]["reason"])
+
     def test_long_account_delays_next_profile_and_failure_stops_the_queue(self):
         for fail in (False, True):
             with self.subTest(fail=fail), tempfile.TemporaryDirectory() as folder:
