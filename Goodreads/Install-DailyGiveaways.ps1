@@ -33,6 +33,7 @@ $profiles = @(for ($i = 0; $i -lt $ProfileNames.Count; $i++) {
 $settings = @{
     startAt = $At
     startJitterMinutes = $StartJitterMinutes
+    closeCompletedListings = $true
     edgePath = $edgePath
     userDataDirectory = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'
     keyfireConfig = Join-Path $env:APPDATA 'com.nodescaffold.trigr\keyforge-config.json'

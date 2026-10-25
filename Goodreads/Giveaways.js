@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.23
+// @version      4.24
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -287,6 +287,8 @@
           data: JSON.stringify({
             token,
             state,
+            closeListingSupported: Boolean(dailyRun?.windowTag),
+            windowTag: dailyRun?.windowTag,
             reason: reason.slice(0, 300),
             progress: dailyProgress(),
           }),
@@ -337,8 +339,14 @@
 
   async function startDailyGiveaways(token, continuation) {
     if (!/^[a-f0-9]{64}$/.test(token)) return;
+    const tag = new URLSearchParams(window.location.hash.slice(1)).get(
+      "grDailyWindow",
+    );
+    const windowTag = /^[a-f0-9]{32}$/.test(tag ?? "") ? tag : null;
+    if (windowTag) document.title = `[GR Daily ${windowTag}] ${document.title}`;
     dailyRun = {
       token,
+      windowTag,
       stopped: false,
       timer: null,
       baseOpened: continuation?.openedIds.length ?? 0,
@@ -353,11 +361,10 @@
         const controller = new AbortController();
         const workflow = await startKeyfireRun(controller.signal);
         workflow.stop();
-        await dailyRequest(token, "verified");
-        dailyRun.stopped = true;
-        dailyRun.message =
-          "Daily setup verified. No giveaway tabs were opened.";
-        refreshWorkflowStatus();
+        await completeDailyRun(
+          "verified",
+          "Daily setup verified. No giveaway tabs were opened.",
+        );
         return;
       }
       if (response.mode !== "run")
@@ -384,14 +391,26 @@
       await openAllGiveaways(continuation);
       if (dailyRun.stopped || refreshingGiveaways || leavingPage) return;
       clearInterval(dailyRun.timer);
-      await dailyRequest(token, "finished");
-      dailyRun.stopped = true;
-      dailyRun.message =
-        "Daily run finished. All opened giveaway tabs have closed.";
-      refreshWorkflowStatus();
+      await completeDailyRun(
+        "finished",
+        "Daily run finished. All opened giveaway tabs have closed.",
+      );
     } catch (error) {
       giveawayError(error.message);
     }
+  }
+
+  async function completeDailyRun(state, message) {
+    const response = await dailyRequest(dailyRun.token, state);
+    dailyRun.message = message;
+    refreshWorkflowStatus();
+    if (response.closeListing) {
+      if (!dailyRun.windowTag)
+        throw new Error("The daily listing has no cleanup identifier.");
+      // Close only this scheduled listing. Keep profile sign-ins and other windows.
+      window.close();
+    }
+    dailyRun.stopped = true;
   }
 
   function giveawayListPageKey() {

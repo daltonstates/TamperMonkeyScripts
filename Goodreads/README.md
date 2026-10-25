@@ -273,7 +273,7 @@ line contains `Goodreads\KeyfireGiveaways.py` in Task Manager.
 
 ## Daily Edge profiles
 
-Install the current **4.22 or later** userscript in every profile. Each profile must have
+Install the current **4.24 or later** userscript in every profile. Each profile must have
 its own signed-in Goodreads session, saved **Keyfire setup**, and **Use Keyfire
 workflow** enabled. **Auto on load** can remain off: an authenticated request from
 the scheduled runner starts that visit explicitly. Existing filters still apply.
@@ -323,6 +323,25 @@ Verification opens the ordinary giveaway list, where older versions do not
 auto-start, and checks the companion connection and saved macro in each profile.
 It does not prove successful Goodreads entries or persistent sign-in. Confirm the
 intended account is signed in in each profile before leaving the daily task on.
+
+New installations enable `closeCompletedListings`. Each scheduled account opens a
+fresh Edge window. After every giveaway tab closes, the userscript closes its own
+listing, and the runner verifies that window has gone before starting the next
+account. This preserves profile sign-ins and leaves other browser windows alone.
+Setup verification also checks this closure without submitting entries. Older
+settings without this option retain their existing behavior until reinstalled.
+
+If a managed listing fails, stalls, or cannot close, `daily-incomplete.json` blocks
+later automatic runs, including after a restart. Inspect and close the unfinished
+giveaway tabs, fix the recorded problem, then explicitly clear the marker:
+
+```powershell
+python Goodreads/DailyGiveaways.py --config "$env:LOCALAPPDATA\GoodreadsKeyfireCompanion\daily-settings.json" --clear-pending
+```
+
+Clearing the marker does not open or close a browser. Verify the profiles again
+before resuming unattended runs. Reports from completed attempts are also kept in
+the `history` folder beside the current report.
 
 The runner stops the remaining accounts if a userscript does not connect within
 two minutes, contact is lost for two minutes, progress stalls for three minutes,

@@ -56,6 +56,7 @@ function createPage({
   startTime = 0,
   dailyMode = "run",
   dailyFailure = null,
+  dailyCloseListing = false,
 } = {}) {
   let now = startTime;
   let nextTimerId = 0;
@@ -293,6 +294,8 @@ function createPage({
             responseText: JSON.stringify({
               protocol: 1,
               mode: dailyMode,
+              closeListing:
+                dailyCloseListing && ["finished", "verified"].includes(value.state),
               cancel: dailyFailure === "cancel" && value.state === "running",
             }),
           });
@@ -1974,6 +1977,55 @@ test("daily completion waits for the final Keyfire tab to close", async () => {
   );
 });
 
+test("managed runs close only the listing after the last entry tab closes", async () => {
+  const tag = "a".repeat(32);
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${tag}`,
+    dailyCloseListing: true,
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.closeCount, 0);
+  assert.equal(page.dailyRequests[0].closeListingSupported, true);
+  assert.equal(page.dailyRequests[0].windowTag, tag);
+  assert.match(page.document.title, /^\[GR Daily /);
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.closeCount, 0);
+  page.openedTabs[1].close();
+  await page.advanceAsync(0);
+  assert.equal(page.closeCount, 1);
+  assert.equal(page.dailyRequests.at(-1).state, "finished");
+});
+
+test("managed verification exercises listing closure without opening entries", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com/giveaway#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    dailyMode: "verify",
+    dailyCloseListing: true,
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.closeCount, 1);
+});
+
+test("failed managed runs preserve the listing and unfinished entry", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    dailyCloseListing: true,
+    dailyFailure: "cancel",
+  });
+  await page.advanceAsync(5500);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.openedTabs[0].closed, false);
+  assert.equal(page.closeCount, 0);
+});
+
+test("unmanaged daily runs leave their listing open", async () => {
+  const page = dailyPage({ dailyMode: "verify" });
+  await page.advanceAsync(1500);
+  assert.equal(page.closeCount, 0);
+});
+
 test("an unreachable daily runner never falls back to saved automatic claiming", async () => {
   const page = dailyPage({ dailyFailure: "offline" });
   await page.advanceAsync(10000);
@@ -2026,6 +2078,8 @@ test("a scheduled request cannot start claiming on another giveaway list", async
 
 test("capped daily batches refresh with their token without reporting completion early", async () => {
   const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    dailyCloseListing: true,
     listing: { pages: [Array.from({ length: 100 }, (_, i) => i + 1)] },
   });
   await page.advanceAsync(1500);
@@ -2036,12 +2090,15 @@ test("capped daily batches refresh with their token without reporting completion
   }
   assert.equal(page.navigations.length, 1);
   assert.ok(page.navigations[0].includes("grDailyToken="));
+  assert.ok(page.navigations[0].includes("grDailyWindow="));
+  assert.equal(page.closeCount, 0);
   assert.equal(
     page.dailyRequests.some((r) => r.state === "finished"),
     false,
   );
   const resumed = dailyPage({
     href: page.navigations[0],
+    dailyCloseListing: true,
     stored: page.stored,
     sessionStored: page.sessionStored,
     listing: { pages: [[101]] },
@@ -2051,6 +2108,7 @@ test("capped daily batches refresh with their token without reporting completion
   resumed.openedTabs[0].close();
   await resumed.advanceAsync(0);
   assert.equal(resumed.dailyRequests.at(-1).state, "finished");
+  assert.equal(resumed.closeCount, 1);
 });
 
 test("a saved macro connects automatically without a browser pairing key", async () => {

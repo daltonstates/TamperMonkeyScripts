@@ -163,6 +163,127 @@ class HttpTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_cleanup_is_confirmed_before_success_and_failure_is_preserved(self):
+        for verify in (False, True):
+            for closed in (False, True):
+                with self.subTest(verify=verify, closed=closed):
+                    now = [0]
+                    listing = MagicMock()
+                    listing.closed.return_value = closed
+                    session = daily.Session({"name": "A"}, verify, clock=lambda: now[0],
+                                            listing=listing, window_tag="a" * 32)
+                    def event(state, **value):
+                        return session.event({"token": session.token, "state": state, **value})
+                    event("ready", closeListingSupported=True, windowTag="a" * 32)
+                    self.assertTrue(event("verified" if verify else "finished")["closeListing"])
+                    self.assertEqual(session.state, "closing")
+                    # A late heartbeat must not resurrect the completed queue.
+                    if not verify:
+                        event("running")
+                    now[0] = 16
+                    session.check_deadlines()
+                    self.assertEqual(session.state, ("verified" if verify else "finished") if closed else "failed")
+
+    def test_old_userscript_is_rejected_before_entries_start(self):
+        session = daily.Session({"name": "A"}, listing=MagicMock(), window_tag="a" * 32)
+        reply = session.event({"token": session.token, "state": "ready"})
+        self.assertTrue(reply["cancel"])
+        self.assertEqual(session.state, "failed")
+        session.listing.bind.assert_not_called()
+
+    def test_incomplete_work_blocks_later_runs_and_preserves_the_failure_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            (output / "daily-incomplete.json").write_text('{"profile":"A"}')
+            (output / "daily-last-run.json").write_text('{"state":"failed"}')
+            with patch.object(daily.subprocess, "Popen") as launch, patch.object(daily, "Server") as server:
+                settings = {"startAt": "04:00", "closeCompletedListings": True,
+                            "profiles": [{"name": "A", "offsetMinutes": 0}]}
+                self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
+                self.assertEqual((output / "daily-last-run.json").read_text(), '{"state":"failed"}')
+                launch.assert_not_called()
+                server.assert_not_called()
+
+    def test_managed_queue_closes_every_window_and_next_run_gets_fresh_urls(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            launches = []
+            server = MagicMock()
+            listing = MagicMock()
+            listing.closed.return_value = True
+            settings = {"startAt": "04:00", "edgePath": "edge.exe", "userDataDirectory": folder,
+                        "closeCompletedListings": True,
+                        "profiles": [{"name": name, "directory": directory, "offsetMinutes": i * 30}
+                                     for i, (name, directory) in enumerate((("Dalton", "Default"), ("Profile 2", "Profile 2")))]}
+            def launch(arguments):
+                launches.append(arguments)
+                session = server.session
+                session.event({"token": session.token, "state": "ready",
+                               "closeListingSupported": True, "windowTag": session.window_tag})
+                session.event({"token": session.token, "state": "finished"})
+            with patch.object(daily, "Server", return_value=server), \
+                 patch.object(daily, "ListingWindow", return_value=listing), \
+                 patch.object(daily, "desktop_available", return_value=True), \
+                 patch.object(daily.subprocess, "Popen", side_effect=launch), patch.object(daily.time, "sleep"):
+                for _ in range(2):
+                    self.assertEqual(daily.run_queue(settings, output, immediate=True), 0)
+                    self.assertFalse((output / "daily-incomplete.json").exists())
+            self.assertEqual(len({args[-1] for args in launches}), 4)
+            self.assertTrue(all("--new-window" in args and "grDailyWindow=" in args[-1] for args in launches))
+            report = json.loads((output / "daily-last-run.json").read_text())
+            self.assertTrue(all(profile["listingClosed"] for profile in report["profiles"]))
+            self.assertEqual(len(list((output / "history").glob("*.json"))), 2)
+
+    def test_stuck_cleanup_preserves_tabs_and_blocks_all_later_launches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            server = MagicMock()
+            listing = MagicMock()
+            listing.closed.return_value = False
+            settings = {"startAt": "04:00", "edgePath": "edge.exe", "userDataDirectory": folder,
+                        "closeCompletedListings": True,
+                        "profiles": [{"name": str(i), "directory": f"Profile {i}", "offsetMinutes": i * 30}
+                                     for i in range(3)]}
+            def launch(arguments):
+                session = server.session
+                session.event({"token": session.token, "state": "ready",
+                               "closeListingSupported": True, "windowTag": session.window_tag})
+                session.event({"token": session.token, "state": "finished"})
+                session.clock = lambda: session.closing_started + 16
+            with patch.object(daily, "Server", return_value=server), \
+                 patch.object(daily, "ListingWindow", return_value=listing), \
+                 patch.object(daily, "desktop_available", return_value=True), \
+                 patch.object(daily.subprocess, "Popen", side_effect=launch) as opened, patch.object(daily.time, "sleep"):
+                self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
+                self.assertTrue((output / "daily-incomplete.json").exists())
+                self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
+                self.assertEqual(opened.call_count, 1)
+            report = json.loads((output / "daily-last-run.json").read_text())
+            self.assertEqual([p["state"] for p in report["profiles"]], ["failed", "skipped", "skipped"])
+            self.assertIn("did not close", report["profiles"][0]["reason"])
+
+    def test_an_old_run_resumed_the_next_day_stops_before_more_keys_or_profiles(self):
+        with tempfile.TemporaryDirectory() as folder:
+            now = [datetime(2026, 10, 25, 4)]
+            server = MagicMock()
+            class Clock(datetime):
+                @classmethod
+                def now(cls):
+                    return now[0]
+            def launch(arguments):
+                session = server.session
+                session.event({"token": session.token, "state": "running"})
+                now[0] += timedelta(days=1)
+            settings = {"startAt": "04:00", "edgePath": "edge.exe", "userDataDirectory": folder,
+                        "profiles": [{"name": str(i), "directory": f"Profile {i}", "offsetMinutes": i * 30}
+                                     for i in range(2)]}
+            with patch.object(daily, "datetime", Clock), patch.object(daily, "Server", return_value=server), \
+                 patch.object(daily, "desktop_available", return_value=True), \
+                 patch.object(daily.subprocess, "Popen", side_effect=launch) as opened, patch.object(daily.time, "sleep"):
+                self.assertEqual(daily.run_queue(settings, Path(folder)), 1)
+                self.assertEqual(opened.call_count, 1)
+                self.assertEqual(server.session.event({"token": server.session.token, "state": "running"})["cancel"], True)
+
     def test_queue_waits_for_drawn_times_and_does_not_overlap_a_long_account(self):
         with tempfile.TemporaryDirectory() as folder:
             now = [datetime(2026, 10, 25, 4)]

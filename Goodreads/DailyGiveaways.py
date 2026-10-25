@@ -34,6 +34,8 @@ def read_settings(path):
     jitter = value.get("startJitterMinutes", 0)
     if type(jitter) is not int or not 0 <= jitter <= 15:
         raise ValueError("Random start delay must be a whole number from 0 to 15 minutes")
+    if type(value.get("closeCompletedListings", False)) is not bool:
+        raise ValueError("closeCompletedListings must be true or false")
     root = Path(value["userDataDirectory"])
     if not Path(value["edgePath"]).is_file():
         raise ValueError("Microsoft Edge was not found at the configured path")
@@ -92,8 +94,74 @@ def desktop_available():
         user32.CloseDesktop(desktop)
 
 
+class ListingWindow:
+    """Observe our new Edge window closing; never close or terminate a process."""
+
+    def __init__(self, tag, edge_path):
+        self.prefix = f"[GR Daily {tag}] "
+        self.edge_path = os.path.normcase(os.path.abspath(edge_path))
+        self.handle = self.pid = None
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        self.user32.EnumWindows.argtypes = [self.callback_type, wintypes.LPARAM]
+        self.user32.EnumWindows.restype = wintypes.BOOL
+        self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        self.user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        self.user32.IsWindow.argtypes = [wintypes.HWND]
+        self.user32.IsWindow.restype = wintypes.BOOL
+        self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.kernel32.OpenProcess.restype = wintypes.HANDLE
+        self.kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        ]
+        self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    def window_pid(self, handle):
+        pid = wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+        return pid.value
+
+    def bind(self):
+        matches = []
+
+        @self.callback_type
+        def visit(handle, _):
+            title = ctypes.create_unicode_buffer(1024)
+            self.user32.GetWindowTextW(handle, title, len(title))
+            if not title.value.startswith(self.prefix):
+                return True
+            pid = self.window_pid(handle)
+            process = self.kernel32.OpenProcess(0x1000, False, pid)
+            if process:
+                try:
+                    path = ctypes.create_unicode_buffer(32768)
+                    length = wintypes.DWORD(len(path))
+                    if (self.kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length))
+                            and os.path.normcase(os.path.abspath(path.value)) == self.edge_path):
+                        matches.append((handle, pid))
+                finally:
+                    self.kernel32.CloseHandle(process)
+            return True
+
+        # Chromium may publish the document title just after the ready request.
+        for _ in range(20):
+            matches.clear()
+            if not self.user32.EnumWindows(visit, 0):
+                raise OSError("Could not inspect the scheduled Edge window")
+            if len(matches) == 1:
+                self.handle, self.pid = matches[0]
+                return True
+            time.sleep(0.1)
+        return False
+
+    def closed(self):
+        return self.handle is not None and (
+            not self.user32.IsWindow(self.handle) or self.window_pid(self.handle) != self.pid)
+
+
 class Session:
-    def __init__(self, profile, verify=False, clock=time.monotonic):
+    def __init__(self, profile, verify=False, clock=time.monotonic, *, listing=None, window_tag=None):
         self.profile = profile
         self.verify = verify
         self.clock = clock
@@ -103,6 +171,10 @@ class Session:
         self.progress = None
         self.started = self.last_seen = self.last_progress = clock()
         self.lock = threading.Lock()
+        self.listing = listing
+        self.window_tag = window_tag
+        self.completed_state = None
+        self.closing_started = None
 
     def event(self, value):
         with self.lock:
@@ -124,6 +196,22 @@ class Session:
             reason = value.get("reason", "")
             if not isinstance(reason, str) or len(reason) > 300:
                 raise ValueError("Invalid run message")
+            if self.listing and state == "ready" and (
+                    value.get("closeListingSupported") is not True
+                    or value.get("windowTag") != self.window_tag
+                    or not self.listing.bind()):
+                self.state, self.reason = "failed", "Update Giveaways.js to 4.24 or later; the scheduled Edge window could not be verified for cleanup."
+                return {"protocol": 1, "cancel": True, "error": self.reason}
+            if self.listing and state in {"finished", "verified"}:
+                if self.state not in {"ready", "running", "closing"}:
+                    raise ValueError("The listing has not connected")
+                self.completed_state = state
+                if self.closing_started is None:
+                    self.closing_started = self.clock()
+                self.state = "closing"
+                return {"protocol": 1, "cancel": False, "closeListing": True}
+            if self.state == "closing" and state not in {"failed", "cancelled"}:
+                return {"protocol": 1, "cancel": False}
             now = self.clock()
             self.last_seen = now
             if progress is not None and progress != self.progress:
@@ -136,6 +224,12 @@ class Session:
             if self.state in TERMINAL:
                 return
             now = self.clock()
+            if self.state == "closing":
+                if self.listing.closed():
+                    self.state = self.completed_state
+                elif now - self.closing_started > 15:
+                    self.state, self.reason = "failed", "The completed listing window did not close; automatic runs are paused."
+                return
             if self.state == "waiting" and now - self.started > 120:
                 self.state, self.reason = "failed", "Userscript did not connect; check its installation and Goodreads sign-in."
             elif now - self.last_seen > 120:
@@ -232,6 +326,10 @@ def run_queue(settings, output, *, verify=False, immediate=False):
               "plannedStarts": plan, "profiles": [],
               "note": "Finished means the tab queue closed; it does not prove Goodreads accepted every entry."}
     output.mkdir(parents=True, exist_ok=True)
+    pending_path = output / "daily-incomplete.json"
+    if settings.get("closeCompletedListings") and pending_path.exists():
+        logging.error("Unfinished scheduled work exists. Inspect the tabs, then use --clear-pending to resume.")
+        return 1
     report_path = output / ("daily-verification.json" if verify else "daily-last-run.json")
     save_report(report_path, report)
     for item in plan:
@@ -255,23 +353,35 @@ def run_queue(settings, output, *, verify=False, immediate=False):
                 item.update(state="failed", reason="Outside the three-hour morning run window.")
                 save_report(report_path, report)
                 break
-            session = Session(profile, verify)
+            tag = secrets.token_hex(16) if settings.get("closeCompletedListings") else None
+            listing = ListingWindow(tag, settings["edgePath"]) if tag else None
+            session = Session(profile, verify, listing=listing, window_tag=tag)
             server.session = session
+            if listing:
+                save_report(pending_path, {"startedAt": report["startedAt"], "profile": profile["name"],
+                                           "reason": "The scheduled window has not been confirmed closed."})
             logging.info("Starting %s (%s)", profile["name"], profile["directory"])
             subprocess.Popen([settings["edgePath"], f'--user-data-dir={settings["userDataDirectory"]}',
                               f'--profile-directory={profile["directory"]}', "--new-window",
                               ("https://www.goodreads.com/giveaway" if verify else LIST_URL)
-                              + "#grDailyToken=" + session.token])
+                              + "#grDailyToken=" + session.token
+                              + ("&grDailyWindow=" + tag if tag else "")])
             item["startedAt"] = datetime.now().astimezone().isoformat()
             save_report(report_path, report)
             while session.state not in TERMINAL:
                 session.check_deadlines()
-                if not desktop_available():
+                if session.state not in TERMINAL and not immediate and datetime.now() > base_starts[0] + timedelta(hours=3):
+                    with session.lock:
+                        session.state, session.reason = "failed", "The morning run window ended; automatic runs are paused."
+                if session.state not in TERMINAL and not desktop_available():
                     with session.lock:
                         session.state, session.reason = "failed", "Windows was locked during the run."
                 time.sleep(1)
             item.update(state=session.state, reason=session.reason, progress=session.progress,
                         endedAt=datetime.now().astimezone().isoformat())
+            if listing and session.state in {"finished", "verified"}:
+                item["listingClosed"] = True
+                pending_path.unlink()
             save_report(report_path, report)
             logging.info("%s: %s %s", profile["name"], session.state, session.reason)
             if session.state not in {"finished", "verified"}:
@@ -292,6 +402,9 @@ def run_queue(settings, output, *, verify=False, immediate=False):
                                        "reason": "An earlier account did not finish."})
         report["endedAt"] = datetime.now().astimezone().isoformat()
         save_report(report_path, report)
+        history = output / "history"
+        history.mkdir(exist_ok=True)
+        save_report(history / (run_started.strftime("%Y%m%d-%H%M%S-%f") + ".json"), report)
         server.shutdown()
         server.server_close()
 
@@ -302,6 +415,7 @@ def main():
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--verify-only", action="store_true", help="Check each profile without opening entry tabs or sending keys")
     parser.add_argument("--now", action="store_true", help="Ignore the planned start times and random delays")
+    parser.add_argument("--clear-pending", action="store_true", help="After inspecting and closing unfinished giveaway tabs, allow future scheduled runs")
     args = parser.parse_args()
     settings = read_settings(args.config)
     if args.check:
@@ -331,6 +445,10 @@ def main():
         lock.close()
         raise RuntimeError("Another daily runner is active, or this is not Windows")
     try:
+        if args.clear_pending:
+            (output / "daily-incomplete.json").unlink(missing_ok=True)
+            print("Unfinished-work marker cleared. No browser was opened or closed.")
+            return 0
         # The companion's own lock prevents competing copies.
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
