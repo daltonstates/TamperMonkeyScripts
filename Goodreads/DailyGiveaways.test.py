@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timedelta
 from http.client import HTTPConnection
 from pathlib import Path
@@ -163,6 +164,43 @@ class HttpTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_browser_refusing_script_close_gets_one_owned_window_close_request(self):
+        now = [0]
+        listing = MagicMock()
+        listing.closed.return_value = False
+        session = daily.Session({"name": "A"}, verify=True, clock=lambda: now[0], listing=listing, window_tag="a" * 32)
+        session.event({"token": session.token, "state": "ready", "closeListingSupported": True, "windowTag": session.window_tag})
+        session.event({"token": session.token, "state": "verified"})
+        now[0] = 3
+        session.check_deadlines()
+        session.check_deadlines()
+        listing.request_close.assert_called_once()
+        self.assertEqual(session.state, "closing")
+        listing.closed.return_value = True
+        session.check_deadlines()
+        self.assertEqual(session.state, "verified")
+
+    def test_native_cleanup_rechecks_title_process_and_window_identity(self):
+        for title_matches, process_matches, same_pid in ((True, True, True), (False, True, True),
+                                                        (True, False, True), (True, True, False)):
+            with self.subTest(title=title_matches, process=process_matches, pid=same_pid):
+                window = daily.ListingWindow.__new__(daily.ListingWindow)
+                window.handle, window.pid, window.prefix = 123, 7, "[GR Daily test] "
+                window.edge_path = os.path.normcase(os.path.abspath("edge.exe"))
+                window.user32, window.kernel32 = MagicMock(), MagicMock()
+                window.user32.IsWindow.return_value = True
+                window.user32.IsWindowVisible.return_value = True
+                window.window_pid = MagicMock(return_value=7 if same_pid else 8)
+                def title(_, buffer, length):
+                    buffer.value = window.prefix + "Goodreads" if title_matches else "Other work"
+                def image_path(_, flags, buffer, length):
+                    buffer.value = window.edge_path if process_matches else os.path.abspath("other.exe")
+                    return True
+                window.user32.GetWindowTextW.side_effect = title
+                window.kernel32.QueryFullProcessImageNameW.side_effect = image_path
+                window.request_close()
+                self.assertEqual(window.user32.PostMessageW.call_count, int(title_matches and process_matches and same_pid))
+
     def test_verification_uses_ending_soon_print_autoload_and_keeps_verification_mode(self):
         with tempfile.TemporaryDirectory() as folder:
             server = MagicMock()

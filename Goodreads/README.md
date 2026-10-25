@@ -336,8 +336,10 @@ intended account is signed in in each profile before leaving the daily task on.
 
 New installations enable `closeCompletedListings`. Each scheduled account opens a
 fresh Edge window. After every giveaway tab closes, the userscript closes its own
-listing, and the runner verifies that window has gone before starting the next
-account. This preserves profile sign-ins and leaves other browser windows alone.
+listing. If Edge refuses that script close, the runner requests a normal close
+of that run's window after rechecking its identifier, process, and executable.
+It verifies the window has closed before starting the next account. Keep other
+work in separate windows. Profile sign-ins and other browser windows are preserved.
 Setup verification also checks this closure without submitting entries. Older
 settings without this option retain their existing behavior until reinstalled.
 

@@ -95,7 +95,7 @@ def desktop_available():
 
 
 class ListingWindow:
-    """Observe our new Edge window closing; never close or terminate a process."""
+    """Track and close only the authenticated Edge window created for this run."""
 
     def __init__(self, tag, edge_path):
         self.prefix = f"[GR Daily {tag}] "
@@ -110,6 +110,10 @@ class ListingWindow:
         self.user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         self.user32.IsWindow.argtypes = [wintypes.HWND]
         self.user32.IsWindow.restype = wintypes.BOOL
+        self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        self.user32.IsWindowVisible.restype = wintypes.BOOL
+        self.user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        self.user32.PostMessageW.restype = wintypes.BOOL
         self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         self.kernel32.OpenProcess.restype = wintypes.HANDLE
         self.kernel32.QueryFullProcessImageNameW.argtypes = [
@@ -157,7 +161,30 @@ class ListingWindow:
 
     def closed(self):
         return self.handle is not None and (
-            not self.user32.IsWindow(self.handle) or self.window_pid(self.handle) != self.pid)
+            not self.user32.IsWindow(self.handle) or self.window_pid(self.handle) != self.pid
+            or not self.user32.IsWindowVisible(self.handle))
+
+    def request_close(self):
+        """Ask only the nonce-bound completed window to close; never kill Edge."""
+        if self.closed():
+            return True
+        title = ctypes.create_unicode_buffer(1024)
+        self.user32.GetWindowTextW(self.handle, title, len(title))
+        if not title.value.startswith(self.prefix):
+            return False
+        process = self.kernel32.OpenProcess(0x1000, False, self.pid)
+        if not process:
+            return False
+        try:
+            path = ctypes.create_unicode_buffer(32768)
+            length = wintypes.DWORD(len(path))
+            if (not self.kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length))
+                    or os.path.normcase(os.path.abspath(path.value)) != self.edge_path):
+                return False
+        finally:
+            self.kernel32.CloseHandle(process)
+        # WM_CLOSE follows the browser's normal close path, including unload prompts.
+        return bool(self.user32.PostMessageW(self.handle, 0x0010, 0, 0))
 
 
 class Session:
@@ -175,6 +202,7 @@ class Session:
         self.window_tag = window_tag
         self.completed_state = None
         self.closing_started = None
+        self.close_requested = False
 
     def event(self, value):
         with self.lock:
@@ -234,6 +262,10 @@ class Session:
                     self.state = self.completed_state
                 elif now - self.closing_started > 15:
                     self.state, self.reason = "failed", "The completed listing window did not close; automatic runs are paused."
+                elif now - self.closing_started >= 2 and not self.close_requested:
+                    self.close_requested = True
+                    if not self.listing.request_close():
+                        self.state, self.reason = "failed", "The completed window changed identity or Windows refused cleanup; automatic runs are paused."
                 return
             if self.state == "waiting" and now - self.started > 120:
                 self.state, self.reason = "failed", "Userscript did not connect; check its installation and Goodreads sign-in."
