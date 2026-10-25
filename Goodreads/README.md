@@ -280,6 +280,11 @@ the scheduled runner starts that visit explicitly. Existing filters still apply.
 Use **4.25 or later** when Goodreads cleans the URL during page load: this version
 captures the launch flags immediately and retains the scheduled run identifier
 and `autoload=1` through that initial URL change.
+Use **4.26 or later** for scheduled window cleanup; it also retains the listing's
+title marker if Goodreads replaces the title during rendering. In Chromium Edge,
+set Tampermonkey's **Config mode** to **Advanced**, then **Content Script API** to
+**UserScripts API Dynamic**, in each profile. Tampermonkey documents that this
+mode supports actual document-start execution, which the launch capture needs.
 The setup field named **Profile** refers to a Keyfire profile, not an Edge profile.
 
 For Dalton (`Default`), Profile 2, and Profile 3, install the daily Windows task:

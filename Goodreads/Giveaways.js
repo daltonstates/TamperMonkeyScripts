@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.25
+// @version      4.26
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -364,6 +364,7 @@
     dailyRun.stopped = true;
     dailyRun.message = `Daily run stopped: ${message}`;
     clearInterval(dailyRun.timer);
+    clearInterval(dailyRun.titleTimer);
     giveawayRunController?.abort();
     sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
     void dailyRequest(dailyRun.token, "failed", message).catch(() => {});
@@ -375,14 +376,27 @@
     if (!/^[a-f0-9]{64}$/.test(token)) return;
     const tag = launchHash.get("grDailyWindow");
     const windowTag = /^[a-f0-9]{32}$/.test(tag ?? "") ? tag : null;
-    if (windowTag) document.title = `[GR Daily ${windowTag}] ${document.title}`;
     dailyRun = {
       token,
       windowTag,
       stopped: false,
       timer: null,
+      titleTimer: null,
       baseOpened: continuation?.openedIds.length ?? 0,
     };
+    if (windowTag) {
+      const prefix = `[GR Daily ${windowTag}] `;
+      const retainTitle = () => {
+        if (dailyRun.stopped || leavingPage) {
+          clearInterval(dailyRun.titleTimer);
+          return;
+        }
+        if (!document.title.startsWith(prefix))
+          document.title = prefix + document.title.replace(/^\[GR Daily [a-f0-9]{32}\] /, "");
+      };
+      retainTitle();
+      dailyRun.titleTimer = setInterval(retainTitle, 250);
+    }
     try {
       const response = await dailyRequest(token, "ready");
       if (!keyfireEnabled || !isKeyfireConfigured(keyfireSettings))
@@ -443,6 +457,7 @@
       window.close();
     }
     dailyRun.stopped = true;
+    clearInterval(dailyRun.titleTimer);
   }
 
   function giveawayListPageKey() {

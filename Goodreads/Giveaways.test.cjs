@@ -2061,6 +2061,24 @@ test("managed verification exercises listing closure without opening entries", a
   assert.equal(page.closeCount, 1);
 });
 
+test("a page title replacement keeps the cleanup marker until verification stops", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com/giveaway#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    dailyMode: "verify",
+    helperDelay: 2000,
+  });
+  await page.advanceAsync(0);
+  page.document.title = "Giveaways | Goodreads";
+  await page.advanceAsync(250);
+  assert.match(page.document.title, /^\[GR Daily /);
+  assert.equal(page.openedTabs.length, 0);
+  await page.advanceAsync(2000);
+  assert.equal(page.dailyRequests.at(-1).state, "verified");
+  page.document.title = "A later title";
+  await page.advanceAsync(1000);
+  assert.equal(page.document.title, "A later title");
+});
+
 test("failed managed runs preserve the listing and unfinished entry", async () => {
   const page = dailyPage({
     href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,

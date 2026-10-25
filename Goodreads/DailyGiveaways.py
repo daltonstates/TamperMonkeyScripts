@@ -196,12 +196,17 @@ class Session:
             reason = value.get("reason", "")
             if not isinstance(reason, str) or len(reason) > 300:
                 raise ValueError("Invalid run message")
-            if self.listing and state == "ready" and (
-                    value.get("closeListingSupported") is not True
-                    or value.get("windowTag") != self.window_tag
-                    or not self.listing.bind()):
-                self.state, self.reason = "failed", "Update Giveaways.js to 4.24 or later; the scheduled Edge window could not be verified for cleanup."
-                return {"protocol": 1, "cancel": True, "error": self.reason}
+            if self.listing and state == "ready":
+                failure = None
+                if value.get("closeListingSupported") is not True:
+                    failure = "The connected userscript lacks its cleanup identifier; update enabled copies of Giveaways.js and check for duplicates."
+                elif value.get("windowTag") != self.window_tag:
+                    failure = "The userscript's cleanup identifier does not match this scheduled window."
+                elif not self.listing.bind():
+                    failure = "The scheduled Edge title marker could not be found; update Giveaways.js to 4.26 or later."
+                if failure:
+                    self.state, self.reason = "failed", failure
+                    return {"protocol": 1, "cancel": True, "error": self.reason}
             if self.listing and state in {"finished", "verified"}:
                 if self.state not in {"ready", "running", "closing"}:
                     raise ValueError("The listing has not connected")
