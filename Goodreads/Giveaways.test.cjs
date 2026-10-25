@@ -897,6 +897,59 @@ test("a daily setup check takes precedence over an autoload URL", async () => {
   assert.equal(page.localStorage.getItem("gr_auto_open_all"), null);
 });
 
+test("verification retains its launch identity when Goodreads cleans the URL before the DOM is ready", async () => {
+  const token = "d".repeat(64);
+  const tag = "a".repeat(32);
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}&autoload=1#grDailyToken=${token}&grDailyWindow=${tag}`,
+    loading: true,
+    dailyMode: "verify",
+    dailyCloseListing: true,
+  });
+  page.window.history.replaceState({}, "", `https://www.goodreads.com${automaticListPath}`);
+  page.finishLoading();
+  await page.advanceAsync(1500);
+  assert.deepEqual(page.dailyRequests.map((r) => r.state), ["ready", "verified"]);
+  assert.equal(page.dailyRequests[0].windowTag, tag);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.closeCount, 1);
+  assert.equal(page.window.location.searchParams.get("autoload"), "1");
+  assert.equal(new URLSearchParams(page.window.location.hash.slice(1)).get("grDailyToken"), token);
+});
+
+test("a cleaned autoload URL starts once without changing the saved preference and remains cancellable", async () => {
+  const page = createPage({
+    href: `https://www.goodreads.com${automaticListPath}&autoload=1`,
+    loading: true,
+    listing: { pages: [[123, 456, 789, 999, 1000]] },
+  });
+  page.window.history.replaceState({}, "", `https://www.goodreads.com${automaticListPath}`);
+  page.finishLoading();
+  await page.advanceAsync(1500);
+  assert.equal(page.window.location.searchParams.get("autoload"), "1");
+  assert.equal(page.localStorage.getItem("gr_auto_open_all"), null);
+  page.setAutoOpen(false);
+  assert.equal(page.window.location.searchParams.get("autoload"), null);
+  const opened = page.openedTabs.length;
+  for (const tab of page.openedTabs) tab.close();
+  await page.advanceAsync(2000);
+  assert.equal(page.openedTabs.length, opened);
+  assert.equal(page.window.location.searchParams.get("autoload"), null);
+});
+
+test("a launch flag is not restored after navigation to another giveaway filter", async () => {
+  const page = createPage({
+    href: `https://www.goodreads.com${automaticListPath}&autoload=1`,
+    loading: true,
+    listing: { pages: [[123]] },
+  });
+  page.window.history.replaceState({}, "", "https://www.goodreads.com/giveaway?sort=recently_listed&format=print");
+  page.finishLoading();
+  await page.advanceAsync(1500);
+  assert.equal(page.window.location.searchParams.get("autoload"), null);
+  assert.equal(page.openedTabs.length, 0);
+});
+
 for (const pathname of [
   "/giveaway",
   "/giveaway?sort=ending_soon",

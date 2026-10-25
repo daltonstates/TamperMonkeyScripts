@@ -277,6 +277,9 @@ Install the current **4.24 or later** userscript in every profile. Each profile 
 its own signed-in Goodreads session, saved **Keyfire setup**, and **Use Keyfire
 workflow** enabled. **Auto on load** can remain off: an authenticated request from
 the scheduled runner starts that visit explicitly. Existing filters still apply.
+Use **4.25 or later** when Goodreads cleans the URL during page load: this version
+captures the launch flags immediately and retains the scheduled run identifier
+and `autoload=1` through that initial URL change.
 The setup field named **Profile** refers to a Keyfire profile, not an Edge profile.
 
 For Dalton (`Default`), Profile 2, and Profile 3, install the daily Windows task:

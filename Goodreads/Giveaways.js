@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.24
+// @version      4.25
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -37,6 +37,10 @@
 
 (function () {
   "use strict";
+
+  // Goodreads can replace the URL before DOMContentLoaded, dropping launch flags.
+  const launchUrl = new URL(window.location.href);
+  const launchHash = new URLSearchParams(launchUrl.hash.slice(1));
 
   /* ------------------------------------------------------------
    *  CONSTANTS & STORAGE KEYS
@@ -256,6 +260,36 @@
     window.history.replaceState(window.history.state, "", url.href);
   }
 
+  function restoreLaunchRequest() {
+    const current = new URL(window.location.href);
+    if (current.origin !== launchUrl.origin || current.pathname !== launchUrl.pathname)
+      return;
+    let changed = false;
+    if (
+      isAutoOpenPage() &&
+      launchUrl.searchParams.getAll(AUTO_OPEN_URL_PARAM).length === 1 &&
+      launchUrl.searchParams.get(AUTO_OPEN_URL_PARAM) === "1" &&
+      !current.searchParams.has(AUTO_OPEN_URL_PARAM)
+    ) {
+      current.searchParams.set(AUTO_OPEN_URL_PARAM, "1");
+      changed = true;
+    }
+    const token = launchHash.get("grDailyToken");
+    if (/^[a-f0-9]{64}$/.test(token ?? "")) {
+      const hash = new URLSearchParams(current.hash.slice(1));
+      for (const name of ["grDailyToken", "grDailyWindow"]) {
+        const value = launchHash.get(name);
+        if (value && !hash.has(name)) {
+          hash.set(name, value);
+          changed = true;
+        }
+      }
+      current.hash = hash.toString();
+    }
+    if (changed)
+      window.history.replaceState(window.history.state, "", current.href);
+  }
+
   function dailyProgress() {
     return `${dailyRun?.baseOpened + giveawayBatchOpened || 0}/${giveawayBatchTotal};${trackedGiveawayTabs.size} open;${loadingGiveaways ? "loading" : "claiming"}`;
   }
@@ -339,9 +373,7 @@
 
   async function startDailyGiveaways(token, continuation) {
     if (!/^[a-f0-9]{64}$/.test(token)) return;
-    const tag = new URLSearchParams(window.location.hash.slice(1)).get(
-      "grDailyWindow",
-    );
+    const tag = launchHash.get("grDailyWindow");
     const windowTag = /^[a-f0-9]{32}$/.test(tag ?? "") ? tag : null;
     if (windowTag) document.title = `[GR Daily ${windowTag}] ${document.title}`;
     dailyRun = {
@@ -2110,6 +2142,7 @@
     handleAutoClose();
   } else if (url.includes("/giveaway")) {
     whenDocumentReady(() => {
+      restoreLaunchRequest();
       injectStyles();
       createOpenButtons();
       createSettingsPanel();
@@ -2127,9 +2160,7 @@
         giveawayRunController?.abort();
       });
       const continuation = takeGiveawayContinuation();
-      const dailyToken = new URLSearchParams(window.location.hash.slice(1)).get(
-        "grDailyToken",
-      );
+      const dailyToken = launchHash.get("grDailyToken");
       if (dailyToken !== null) {
         void startDailyGiveaways(dailyToken, continuation);
       } else if (continuation || (autoOpenAllEnabled && isAutoOpenPage())) {
