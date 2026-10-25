@@ -21,7 +21,7 @@ import time
 from KeyfireGiveaways import Settings, read_workflow
 
 PORT = 17385
-LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print"
+LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 
 
@@ -363,8 +363,7 @@ def run_queue(settings, output, *, verify=False, immediate=False):
             logging.info("Starting %s (%s)", profile["name"], profile["directory"])
             subprocess.Popen([settings["edgePath"], f'--user-data-dir={settings["userDataDirectory"]}',
                               f'--profile-directory={profile["directory"]}', "--new-window",
-                              ("https://www.goodreads.com/giveaway" if verify else LIST_URL)
-                              + "#grDailyToken=" + session.token
+                              LIST_URL + "#grDailyToken=" + session.token
                               + ("&grDailyWindow=" + tag if tag else "")])
             item["startedAt"] = datetime.now().astimezone().isoformat()
             save_report(report_path, report)

@@ -163,6 +163,28 @@ class HttpTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_verification_uses_ending_soon_print_autoload_and_keeps_verification_mode(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server = MagicMock()
+            listing = MagicMock()
+            listing.closed.return_value = True
+            settings = {"startAt": "04:00", "closeCompletedListings": True,
+                        "edgePath": "edge.exe", "userDataDirectory": folder,
+                        "profiles": [{"name": "Profile 1", "directory": "Default", "offsetMinutes": 0}]}
+            def launch(arguments):
+                self.assertTrue(arguments[-1].startswith(
+                    "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1#grDailyToken="))
+                session = server.session
+                self.assertTrue(session.verify)
+                session.event({"token": session.token, "state": "ready",
+                               "closeListingSupported": True, "windowTag": session.window_tag})
+                session.event({"token": session.token, "state": "verified"})
+            with patch.object(daily, "Server", return_value=server), \
+                 patch.object(daily, "ListingWindow", return_value=listing), \
+                 patch.object(daily, "desktop_available", return_value=True), \
+                 patch.object(daily.subprocess, "Popen", side_effect=launch), patch.object(daily.time, "sleep"):
+                self.assertEqual(daily.run_queue(settings, Path(folder), verify=True, immediate=True), 0)
+
     def test_cleanup_is_confirmed_before_success_and_failure_is_preserved(self):
         for verify in (False, True):
             for closed in (False, True):

@@ -319,8 +319,10 @@ opening giveaway entry tabs or sending keys:
 powershell -NoProfile -File Goodreads/Install-DailyGiveaways.ps1 -VerifyOnly
 ```
 
-Verification opens the ordinary giveaway list, where older versions do not
-auto-start, and checks the companion connection and saved macro in each profile.
+Verification opens the same ending-soon print URL with `autoload=1` as a real run,
+and checks the companion connection and saved macro in each profile. Install the
+current userscript first: its scheduled verification mode takes precedence over
+`autoload=1`, so it checks setup without opening entry tabs or sending keys.
 It does not prove successful Goodreads entries or persistent sign-in. Confirm the
 intended account is signed in in each profile before leaving the daily task on.
 
