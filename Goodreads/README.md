@@ -1,6 +1,7 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.23 adds `autoload=1` to start a run from a bookmark without saving
+Version 4.29 supports scheduled window cleanup and recognizes Goodreads' explicit
+empty-results page. `autoload=1` starts a run from a bookmark without saving
 Auto on load as enabled. Automatic GitHub updates and the daily runner remain available.
 No pairing code or special paired userscript is required. Lists still run in
 batches of up to 100 rows with a main-page refresh between batches. Automatic
@@ -10,7 +11,7 @@ required when using a Keyfire macro; ordinary tab opening works without it.
 
 ## Automatic GitHub updates
 
-Update the existing Tampermonkey script to **4.22** once in each Edge profile.
+Update the existing Tampermonkey script to the current version in each Edge profile.
 Keep automatic userscript update checks enabled in each profile's Tampermonkey
 installation. Future updates can then download automatically from the
 [published script](https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js).
@@ -271,9 +272,21 @@ To remove automatic startup, open `shell:startup` and delete **Goodreads Keyfire
 helper**. To stop the current helper, end the `pythonw.exe` process whose command
 line contains `Goodreads\KeyfireGiveaways.py` in Task Manager.
 
+## Optional Hyper-V workflow
+
+The separate [VM guide and scripts](VM/README.md) run the daily workflow inside
+a dedicated Windows guest while the physical PC is locked or signed out. The
+VM boots each morning and shuts down after a successful run. VM setup is an
+explicit, separate installation; the ordinary userscript and companion setup
+do not enable Hyper-V or install a VM task.
+
+Only reusable source and example configuration live in `VM/`. Keep VM disks,
+Windows installation media, private settings, browser sessions, credentials,
+and logs outside the repository.
+
 ## Daily Edge profiles
 
-Install the current **4.24 or later** userscript in every profile. Each profile must have
+Install the current **4.29 or later** userscript in every profile. Each profile must have
 its own signed-in Goodreads session, saved **Keyfire setup**, and **Use Keyfire
 workflow** enabled. **Auto on load** can remain off: an authenticated request from
 the scheduled runner starts that visit explicitly. Existing filters still apply.

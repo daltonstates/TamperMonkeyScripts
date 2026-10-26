@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "vmName": "GoodreadsGiveaways",
+  "vmId": "",
+  "storageRoot": "C:\\HyperV\\GoodreadsGiveaways",
+  "diskPath": "C:\\HyperV\\GoodreadsGiveaways\\Windows.vhdx",
+  "memoryGB": 4,
+  "processors": 2,
+  "diskGB": 80,
+  "hostStartAt": "03:55",
+  "maximumRuntimeMinutes": 195,
+  "reportDirectory": "C:\\ProgramData\\GoodreadsGiveawaysVM\\reports"
+}
