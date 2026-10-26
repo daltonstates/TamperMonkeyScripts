@@ -147,9 +147,9 @@ class HttpTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
-    def request(self, origin="https://www.goodreads.com", token=None):
+    def request(self, origin="https://www.goodreads.com", token=None, **value):
         connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
-        connection.request("POST", "/v1/daily", json.dumps({"token": token or self.server.session.token, "state": "ready"}),
+        connection.request("POST", "/v1/daily", json.dumps({"token": token or self.server.session.token, "state": "ready", **value}),
                            {"Origin": origin, "Content-Type": "application/json", "X-Goodreads-Companion": "daily"})
         response = connection.getresponse()
         status, body = response.status, json.loads(response.read())
@@ -162,8 +162,122 @@ class HttpTests(unittest.TestCase):
         status, body = self.request()
         self.assertEqual((status, body["mode"]), (200, "verify"))
 
+    def test_waiting_for_a_native_window_uses_short_authenticated_requests(self):
+        listing = MagicMock()
+        listing.bind.side_effect = [False, True]
+        listing.diagnostics = {"matchingEdgeWindows": 0}
+        self.server.session = daily.Session({"name": "A"}, verify=True, listing=listing, window_tag="a" * 32)
+        value = {"closeListingSupported": True, "windowTag": "a" * 32, "windowWaitSupported": True}
+        self.assertEqual(self.request(**value)[1]["mode"], "wait")
+        self.assertEqual(self.request(**value)[1]["mode"], "verify")
+        self.assertTrue(self.server.session.window_binding["retrySupported"])
+
 
 class QueueTests(unittest.TestCase):
+    def test_native_window_probe_rejects_hidden_windows_and_wrong_executables(self):
+        window = daily.ListingWindow.__new__(daily.ListingWindow)
+        window.handle = window.pid = None
+        window.prefix = "[GR Daily " + "a" * 32 + "] "
+        window.edge_path = os.path.normcase(os.path.abspath("edge.exe"))
+        window.callback_type = lambda callback: callback
+        window.user32, window.kernel32 = MagicMock(), MagicMock()
+        window.user32.IsWindowVisible.side_effect = lambda handle: handle != 4
+        window.window_pid = lambda handle: handle
+        window.kernel32.OpenProcess.side_effect = lambda flags, inherit, pid: pid
+        def title(handle, buffer, length):
+            buffer.value = "Other work" if handle == 2 else window.prefix + "Goodreads"
+        def image(process, flags, buffer, length):
+            buffer.value = os.path.abspath("other.exe") if process == 3 else window.edge_path
+            return True
+        def enumerate_windows(callback, _):
+            for handle in (1, 2, 3, 4):
+                callback(handle, 0)
+            return True
+        window.user32.GetWindowTextW.side_effect = title
+        window.kernel32.QueryFullProcessImageNameW.side_effect = image
+        window.user32.EnumWindows.side_effect = enumerate_windows
+        self.assertTrue(window.bind())
+        self.assertEqual((window.handle, window.pid), (1, 1))
+        self.assertEqual(window.diagnostics, {"visibleEdgeWindows": 2, "markerWindows": 2,
+                                              "matchingEdgeWindows": 1, "rejectedMarkerWindows": 1})
+        self.assertNotIn("a" * 32, json.dumps(window.diagnostics))
+        window.user32.PostMessageW.assert_not_called()
+
+    def test_native_probe_errors_stop_before_authorizing_entries(self):
+        listing = MagicMock()
+        listing.bind.side_effect = OSError("Enumeration failed")
+        session = daily.Session({"name": "A"}, listing=listing, window_tag="a" * 32)
+        reply = session.event({"token": session.token, "state": "ready", "windowTag": session.window_tag,
+                               "closeListingSupported": True, "windowWaitSupported": True})
+        self.assertTrue(reply["cancel"])
+        self.assertEqual(session.state, "failed")
+        self.assertEqual(session.window_binding["diagnostics"]["inspectionError"], "Enumeration failed")
+        listing.request_close.assert_not_called()
+
+    def test_window_title_can_appear_after_the_old_two_second_limit(self):
+        now = [0]
+        listing = MagicMock()
+        listing.bind.side_effect = [False, False, True]
+        listing.diagnostics = {"visibleEdgeWindows": 1, "matchingEdgeWindows": 0}
+        session = daily.Session({"name": "A"}, clock=lambda: now[0], listing=listing, window_tag="a" * 32)
+        value = {"token": session.token, "state": "ready", "windowTag": session.window_tag,
+                 "closeListingSupported": True, "windowWaitSupported": True}
+        for tick in (0, 4):
+            now[0] = tick
+            self.assertEqual(session.event(value)["mode"], "wait")
+            self.assertEqual(session.state, "waiting")
+            with self.assertRaisesRegex(ValueError, "not been identified"):
+                session.event({**value, "state": "running"})
+            with self.assertRaises(ValueError):
+                session.event({**value, "state": "finished"})
+        now[0] = 8
+        self.assertEqual(session.event(value)["mode"], "run")
+        self.assertEqual(session.state, "ready")
+        self.assertEqual(session.window_binding["attempts"], 3)
+        self.assertEqual(session.window_binding["waitedSeconds"], 8)
+        listing.request_close.assert_not_called()
+
+    def test_window_wait_is_bounded_even_if_the_client_stops_retrying(self):
+        for client_retries in (False, True):
+            with self.subTest(client_retries=client_retries):
+                now = [0]
+                listing = MagicMock()
+                listing.bind.return_value = False
+                listing.diagnostics = {"visibleEdgeWindows": 1, "matchingEdgeWindows": 0}
+                session = daily.Session({"name": "A"}, clock=lambda: now[0], listing=listing, window_tag="a" * 32)
+                value = {"token": session.token, "state": "ready", "windowTag": session.window_tag,
+                         "closeListingSupported": True, "windowWaitSupported": True}
+                self.assertEqual(session.event(value)["mode"], "wait")
+                now[0] = 30
+                if client_retries:
+                    self.assertTrue(session.event(value)["cancel"])
+                else:
+                    session.check_deadlines()
+                self.assertEqual(session.state, "failed")
+                self.assertIn("30 seconds", session.reason)
+                self.assertNotIn("update", session.reason.lower())
+                listing.bind.assert_called_once()
+                listing.request_close.assert_not_called()
+
+    def test_ambiguous_window_matches_fail_without_retry_or_cleanup(self):
+        listing = MagicMock()
+        listing.bind.return_value = False
+        listing.diagnostics = {"matchingEdgeWindows": 2}
+        session = daily.Session({"name": "A"}, listing=listing, window_tag="a" * 32)
+        reply = session.event({"token": session.token, "state": "ready", "windowTag": session.window_tag,
+                               "closeListingSupported": True, "windowWaitSupported": True})
+        self.assertTrue(reply["cancel"])
+        self.assertIn("More than one", session.reason)
+        listing.request_close.assert_not_called()
+
+    def test_window_wait_still_requires_the_exact_authenticated_tag(self):
+        listing = MagicMock()
+        session = daily.Session({"name": "A"}, listing=listing, window_tag="a" * 32)
+        reply = session.event({"token": session.token, "state": "ready", "windowTag": "b" * 32,
+                               "closeListingSupported": True, "windowWaitSupported": True})
+        self.assertTrue(reply["cancel"])
+        listing.bind.assert_not_called()
+
     def test_completed_listing_keeps_final_progress_instead_of_last_heartbeat(self):
         for verify in (False, True):
             with self.subTest(verify=verify):

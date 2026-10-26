@@ -23,6 +23,8 @@ from KeyfireGiveaways import Settings, read_workflow
 PORT = 17385
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
+WINDOW_BIND_SECONDS = 30
+WINDOW_BIND_TIMEOUT = "The scheduled Edge window was not identified within 30 seconds; see windowBinding in the daily report."
 
 
 def read_settings(path):
@@ -128,36 +130,47 @@ class ListingWindow:
 
     def bind(self):
         matches = []
+        counts = {"visibleEdgeWindows": 0, "markerWindows": 0,
+                  "matchingEdgeWindows": 0, "rejectedMarkerWindows": 0}
 
         @self.callback_type
         def visit(handle, _):
+            if not self.user32.IsWindowVisible(handle):
+                return True
             title = ctypes.create_unicode_buffer(1024)
             self.user32.GetWindowTextW(handle, title, len(title))
-            if not title.value.startswith(self.prefix):
-                return True
+            marked = title.value.startswith(self.prefix)
+            if marked:
+                counts["markerWindows"] += 1
             pid = self.window_pid(handle)
             process = self.kernel32.OpenProcess(0x1000, False, pid)
+            is_edge = False
             if process:
                 try:
                     path = ctypes.create_unicode_buffer(32768)
                     length = wintypes.DWORD(len(path))
-                    if (self.kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length))
-                            and os.path.normcase(os.path.abspath(path.value)) == self.edge_path):
-                        matches.append((handle, pid))
+                    is_edge = bool(self.kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length))
+                                   and os.path.normcase(os.path.abspath(path.value)) == self.edge_path)
                 finally:
                     self.kernel32.CloseHandle(process)
+            if is_edge:
+                counts["visibleEdgeWindows"] += 1
+                if marked:
+                    matches.append((handle, pid))
+            elif marked:
+                counts["rejectedMarkerWindows"] += 1
             return True
 
-        # Chromium may publish the document title just after the ready request.
-        for _ in range(20):
-            matches.clear()
-            if not self.user32.EnumWindows(visit, 0):
-                raise OSError("Could not inspect the scheduled Edge window")
-            if len(matches) == 1:
-                self.handle, self.pid = matches[0]
-                return True
-            time.sleep(0.1)
-        return False
+        # One quick probe per ready request; never block the browser's five-second
+        # HTTP deadline or the coordinator's lock/cancellation checks.
+        if not self.user32.EnumWindows(visit, 0):
+            raise OSError("Could not inspect the scheduled Edge window")
+        counts["matchingEdgeWindows"] = len(matches)
+        self.diagnostics = counts
+        if len(matches) != 1:
+            return False
+        self.handle, self.pid = matches[0]
+        return True
 
     def closed(self):
         return self.handle is not None and (
@@ -203,6 +216,7 @@ class Session:
         self.completed_state = None
         self.closing_started = None
         self.close_requested = False
+        self.window_binding = None
 
     def event(self, value):
         with self.lock:
@@ -230,11 +244,44 @@ class Session:
                     failure = "The connected userscript lacks its cleanup identifier; update enabled copies of Giveaways.js and check for duplicates."
                 elif value.get("windowTag") != self.window_tag:
                     failure = "The userscript's cleanup identifier does not match this scheduled window."
-                elif not self.listing.bind():
-                    failure = "The scheduled Edge title marker could not be found; update Giveaways.js to 4.26 or later."
+                elif self.state == "waiting":
+                    now = self.clock()
+                    if self.window_binding is None:
+                        self.window_binding = {"started": now, "attempts": 0,
+                                               "retrySupported": value.get("windowWaitSupported") is True}
+                    binding = self.window_binding
+                    binding["waitedSeconds"] = round(now - binding["started"], 3)
+                    if now - binding["started"] >= WINDOW_BIND_SECONDS:
+                        self.state, self.reason = "failed", WINDOW_BIND_TIMEOUT
+                        return {"protocol": 1, "cancel": True, "error": self.reason}
+                    binding["attempts"] += 1
+                    try:
+                        bound = self.listing.bind()
+                    except OSError as error:
+                        binding["diagnostics"] = {"inspectionError": str(error)}
+                        self.state, self.reason = "failed", "Windows could not inspect the scheduled Edge window; see windowBinding in the daily report."
+                        logging.warning("Scheduled window inspection failed: %s", error)
+                        return {"protocol": 1, "cancel": True, "error": self.reason}
+                    binding["diagnostics"] = dict(self.listing.diagnostics)
+                    logging.info("Scheduled window probe %d after %.3fs: %s; identified=%s",
+                                 binding["attempts"], binding["waitedSeconds"], binding["diagnostics"], bound)
+                    if not bound:
+                        if binding["diagnostics"].get("matchingEdgeWindows", 0) > 1:
+                            failure = "More than one Edge window has this scheduled run's marker; automatic runs are paused."
+                        elif value.get("windowWaitSupported") is True and binding["waitedSeconds"] < WINDOW_BIND_SECONDS:
+                            self.last_seen = now
+                            return {"protocol": 1, "mode": "wait", "cancel": False}
+                        else:
+                            failure = ("The scheduled Edge window could not be uniquely identified. "
+                                       f"Waited {binding['waitedSeconds']:g}s across {binding['attempts']} probes. "
+                                       "See windowBinding in the daily report."
+                                       + (" Update Giveaways.js to 4.30 or later for startup retries."
+                                          if value.get("windowWaitSupported") is not True else ""))
                 if failure:
                     self.state, self.reason = "failed", failure
                     return {"protocol": 1, "cancel": True, "error": self.reason}
+            if self.listing and state == "running" and self.state == "waiting":
+                raise ValueError("The scheduled Edge window has not been identified")
             if self.listing and state in {"finished", "verified"}:
                 if self.state not in {"ready", "running", "closing"}:
                     raise ValueError("The listing has not connected")
@@ -260,6 +307,11 @@ class Session:
             if self.state in TERMINAL:
                 return
             now = self.clock()
+            if (self.state == "waiting" and self.window_binding is not None
+                    and now - self.window_binding["started"] >= WINDOW_BIND_SECONDS):
+                self.window_binding["waitedSeconds"] = round(now - self.window_binding["started"], 3)
+                self.state, self.reason = "failed", WINDOW_BIND_TIMEOUT
+                return
             if self.state == "closing":
                 if self.listing.closed():
                     self.state = self.completed_state
@@ -418,6 +470,8 @@ def run_queue(settings, output, *, verify=False, immediate=False):
                 time.sleep(1)
             item.update(state=session.state, reason=session.reason, progress=session.progress,
                         endedAt=datetime.now().astimezone().isoformat())
+            if session.window_binding is not None:
+                item["windowBinding"] = {k: v for k, v in session.window_binding.items() if k != "started"}
             if listing and session.state in {"finished", "verified"}:
                 item["listingClosed"] = True
                 pending_path.unlink()

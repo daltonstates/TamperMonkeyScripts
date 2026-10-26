@@ -128,8 +128,9 @@ Copy-VMFile -VMName 'GoodreadsGiveaways' -SourcePath $zip -DestinationPath 'C:\U
 Extract the package inside the guest. In every guest Edge profile:
 
 1. Sign into the intended Goodreads account.
-2. Install the current `Goodreads/Giveaways.js`, **4.29 or later**, in
-   Tampermonkey. Avoid duplicate enabled copies.
+2. Install the current `Goodreads/Giveaways.js`, **4.30 or later**, in
+   Tampermonkey, with the current Python runner for bounded startup-window
+   retries. Avoid duplicate enabled copies.
 3. In Tampermonkey Settings, select Advanced configuration and set Content
    Script API to **UserScripts API Dynamic**.
 4. Save the intended genre filters and Keyfire macro selection, and enable

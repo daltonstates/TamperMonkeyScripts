@@ -1,7 +1,9 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.29 supports scheduled window cleanup and recognizes Goodreads' explicit
-empty-results page. `autoload=1` starts a run from a bookmark without saving
+Version 4.30 lets scheduled windows retry identification for up to 30 seconds
+before entry processing starts. It also supports scheduled window cleanup and
+recognizes Goodreads' explicit empty-results page. `autoload=1` starts a run
+from a bookmark without saving
 Auto on load as enabled. Automatic GitHub updates and the daily runner remain available.
 No pairing code or special paired userscript is required. Lists still run in
 batches of up to 100 rows with a main-page refresh between batches. Automatic
@@ -286,7 +288,7 @@ and logs outside the repository.
 
 ## Daily Edge profiles
 
-Install the current **4.29 or later** userscript in every profile. Each profile must have
+Install the current **4.30 or later** userscript in every profile. Each profile must have
 its own signed-in Goodreads session, saved **Keyfire setup**, and **Use Keyfire
 workflow** enabled. **Auto on load** can remain off: an authenticated request from
 the scheduled runner starts that visit explicitly. Existing filters still apply.
@@ -299,6 +301,14 @@ set Tampermonkey's **Config mode** to **Advanced**, then **Content Script API** 
 **UserScripts API Dynamic**, in each profile. Tampermonkey documents that this
 mode supports actual document-start execution, which the launch capture needs.
 The setup field named **Profile** refers to a Keyfire profile, not an Edge profile.
+
+Version **4.30** and the current Python runner wait for a uniquely identified
+Edge window before starting entry processing. A delayed native title can retry
+for up to 30 seconds without holding a long HTTP request open. The runner keeps
+the exact identifier, process, and executable checks; ambiguous windows stop the
+run. The daily report's `windowBinding` records probe counts, elapsed time, and
+window-match counts without saving run tokens or other browser titles. Update
+the Python runner as well as the userscript to enable this behavior.
 
 For Dalton (`Default`), Profile 2, and Profile 3, install the daily Windows task:
 

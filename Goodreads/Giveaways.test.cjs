@@ -57,6 +57,7 @@ function createPage({
   dailyMode = "run",
   dailyFailure = null,
   dailyCloseListing = false,
+  dailyWindowWait = 0,
 } = {}) {
   let now = startTime;
   let nextTimerId = 0;
@@ -310,7 +311,8 @@ function createPage({
             status: 200,
             responseText: JSON.stringify({
               protocol: 1,
-              mode: dailyMode,
+              mode: value.state === "ready" && now < startTime + dailyWindowWait
+                ? "wait" : dailyMode,
               closeListing:
                 dailyCloseListing && ["finished", "verified"].includes(value.state),
               cancel: dailyFailure === "cancel" && value.state === "running",
@@ -2048,6 +2050,54 @@ function dailyPage(options = {}) {
     ...options,
   });
 }
+
+test("a delayed scheduled window waits without requesting a macro or opening tabs", async () => {
+  const page = dailyPage({ dailyWindowWait: 8000, dailyMode: "verify" });
+  await page.advanceAsync(7000);
+  page.document.querySelector("#gr-open-all-btn").click();
+  page.document.querySelector("#gr-open-btn").click();
+  await page.advanceAsync(0);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.helperRequests.length, 0);
+  assert.ok(page.dailyRequests.filter((r) => r.state === "ready").length > 2);
+  assert.equal(page.dailyRequests[0].windowWaitSupported, true);
+  await page.advanceAsync(2500);
+  assert.equal(page.dailyRequests.at(-1).state, "verified");
+  assert.equal(page.helperRequests.length, 1);
+});
+
+test("a window that never appears stops after bounded retries without entry keys", async () => {
+  const page = dailyPage({ dailyWindowWait: Infinity });
+  await page.advanceAsync(36000);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.helperRequests.length, 0);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+  assert.match(page.dailyRequests.at(-1).reason, /35 seconds/);
+  const count = page.dailyRequests.length;
+  await page.advanceAsync(10000);
+  assert.equal(page.dailyRequests.length, count);
+});
+
+test("leaving the listing while its window is pending cannot start claiming", async () => {
+  const page = dailyPage({ dailyWindowWait: 8000 });
+  await page.advanceAsync(1000);
+  page.window.emit("pagehide");
+  await page.advanceAsync(10000);
+  assert.equal(page.helperRequests.length, 0);
+  assert.equal(page.openedTabs.length, 0);
+});
+
+test("turning off auto load cancels pending scheduled window retries", async () => {
+  const page = dailyPage({ dailyWindowWait: 8000 });
+  await page.advanceAsync(1000);
+  const checkbox = page.document.querySelector("#gr-auto-open-all");
+  checkbox.checked = false;
+  checkbox.emit("change");
+  await page.advanceAsync(10000);
+  assert.equal(page.helperRequests.length, 0);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+});
 
 test("daily verification checks the macro without entry tabs even with saved auto-on-load", async () => {
   const page = dailyPage({

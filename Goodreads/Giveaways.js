@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.29
+// @version      4.30
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -322,6 +322,7 @@
             token,
             state,
             closeListingSupported: Boolean(dailyRun?.windowTag),
+            windowWaitSupported: true,
             windowTag: dailyRun?.windowTag,
             reason: reason.slice(0, 300),
             progress: dailyProgress(),
@@ -362,6 +363,7 @@
     }
     if (dailyRun.stopped) return;
     dailyRun.stopped = true;
+    dailyRun.waitingForWindow = false;
     dailyRun.message = `Daily run stopped: ${message}`;
     clearInterval(dailyRun.timer);
     clearInterval(dailyRun.titleTimer);
@@ -380,6 +382,7 @@
       token,
       windowTag,
       stopped: false,
+      waitingForWindow: true,
       timer: null,
       titleTimer: null,
       baseOpened: continuation?.openedIds.length ?? 0,
@@ -398,7 +401,20 @@
       dailyRun.titleTimer = setInterval(retainTitle, 250);
     }
     try {
-      const response = await dailyRequest(token, "ready");
+      let response;
+      const readyDeadline = Date.now() + 35000;
+      while (true) {
+        if (dailyRun.stopped || leavingPage) return;
+        response = await dailyRequest(token, "ready");
+        if (dailyRun.stopped || leavingPage) return;
+        if (response.mode !== "wait") break;
+        if (Date.now() >= readyDeadline)
+          throw new Error("The scheduled Edge window was not identified within 35 seconds.");
+        if (!keyfireEnabled || !isKeyfireConfigured(keyfireSettings))
+          throw new Error("Save Keyfire setup and enable Use Keyfire workflow in this Edge profile.");
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      dailyRun.waitingForWindow = false;
       if (!keyfireEnabled || !isKeyfireConfigured(keyfireSettings))
         throw new Error(
           "Save Keyfire setup and enable Use Keyfire workflow in this Edge profile.",
@@ -745,6 +761,7 @@
   }
 
   async function openAllGiveaways(continuation = null) {
+    if (dailyRun?.waitingForWindow) return;
     if (loadingGiveaways || openingGiveaways || refreshingGiveaways) return;
     if (!keyfireReadyToStart()) return;
 
@@ -1016,6 +1033,7 @@
   }
 
   async function openVisibleGiveaways(controller = null, options = {}) {
+    if (dailyRun?.waitingForWindow) return;
     if (openingGiveaways || loadingGiveaways) return;
     if (!keyfireReadyToStart()) return;
 
@@ -1789,6 +1807,8 @@
         void openAllGiveaways();
       } else {
         restartAutoOpen = false;
+        if (dailyRun?.waitingForWindow)
+          giveawayError("The daily startup was cancelled.");
         sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
         giveawayRunController?.abort();
         clearUrlAutoOpenRequest();
