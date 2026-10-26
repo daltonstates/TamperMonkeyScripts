@@ -1221,7 +1221,7 @@ test("a scheduled empty Goodreads list finishes with zero entries and closes", a
     listing: {
       pages: [[]],
       emptyMessage:
-        "We're sorry, no results were found. Please adjust your filters to try again, or clear all filters.",
+        "We're sorry, no results were found. Please adjust your filters to try again, or clear all filters .",
     },
   });
   await page.advanceAsync(2000);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.28
+// @version      4.29
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -707,7 +707,7 @@
         count === 0 &&
         !button &&
         !status &&
-        /we['’]re sorry, no results were found\. please adjust your filters to try again, or clear all filters\./i.test(
+        /\bno results were found\b/i.test(
           (document.body?.innerText ?? document.body?.textContent ?? "")
             .replace(/\s+/g, " ")
             .trim(),
