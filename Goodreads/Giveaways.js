@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.27
+// @version      4.28
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -702,7 +702,18 @@
       if (totalText) pagination.total = Number(totalText.replace(/,/g, ""));
       refreshOpenButton();
 
-      const initialPageReady = count > 0 || button || status;
+      const emptyList =
+        previousCount === null &&
+        count === 0 &&
+        !button &&
+        !status &&
+        /we['’]re sorry, no results were found\. please adjust your filters to try again, or clear all filters\./i.test(
+          (document.body?.innerText ?? document.body?.textContent ?? "")
+            .replace(/\s+/g, " ")
+            .trim(),
+        );
+      const initialPageReady = count > 0 || button || status || emptyList;
+      if (!initialPageReady) noButtonSince = null;
       if (
         initialPageReady &&
         (previousCount === null || count > previousCount)
@@ -719,7 +730,7 @@
         } else if (pagination.total === null || count >= pagination.total) {
           // Allow the page to finish rendering its next pagination control.
           noButtonSince ??= Date.now();
-          const settleTime = pagination.total === null ? 5000 : 1000;
+          const settleTime = emptyList || pagination.total !== null ? 1000 : 5000;
           if (Date.now() - noButtonSince >= settleTime) return null;
         }
       }

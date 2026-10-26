@@ -366,6 +366,7 @@ token in its URL fragment. It accepts only the active token and expected origins
 
 Read `%LOCALAPPDATA%\GoodreadsKeyfireCompanion\daily-last-run.json` for the last
 run, `daily-verification.json` for setup checks, and `daily.log` for diagnostics.
+Goodreads' explicit no-results page finishes with zero entries, allowing the next account to run.
 The report's `plannedStarts` records that run's selected times and random delays.
 `--now` runs and setup-only verification bypass the random delays.
 **Finished** means the opened tab queue closed. It does not confirm Goodreads

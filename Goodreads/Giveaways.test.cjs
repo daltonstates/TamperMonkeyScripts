@@ -256,7 +256,11 @@ function createPage({
       if (initialized) return;
       initialized = true;
       addGiveaways(listing.pages[0]);
-      controls.set('[data-testid="paginationStatus"]', status);
+      if (listing.emptyMessage) {
+        document.body.textContent = listing.emptyMessage;
+      } else {
+        controls.set('[data-testid="paginationStatus"]', status);
+      }
       updatePagination();
     };
     const main = element("main");
@@ -1208,6 +1212,36 @@ test("automatic loading reveals a deferred list and each pagination control", as
   assert.equal(page.openedTabs.length, 3);
   assert.equal(page.paginationClicks, 2);
   assert.deepEqual(page.alerts, []);
+});
+
+test("a scheduled empty Goodreads list finishes with zero entries and closes", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    dailyCloseListing: true,
+    listing: {
+      pages: [[]],
+      emptyMessage:
+        "We're sorry, no results were found. Please adjust your filters to try again, or clear all filters.",
+    },
+  });
+  await page.advanceAsync(2000);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.dailyRequests.at(-1).state, "finished");
+  assert.equal(page.dailyRequests.at(-1).progress, "0/0;0 open;claiming");
+  assert.equal(page.closeCount, 1);
+  assert.deepEqual(page.alerts, []);
+});
+
+test("an empty unrecognized or still-loading page cannot report success", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    dailyCloseListing: true,
+    listing: { pages: [[]], emptyMessage: "Loading giveaways..." },
+  });
+  await page.advanceAsync(31000);
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+  assert.equal(page.closeCount, 0);
 });
 
 test("stalled automatic pagination times out once and can be cancelled or retried", async () => {
