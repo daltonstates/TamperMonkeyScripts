@@ -215,9 +215,7 @@ function createPage({
     }
   }
   if (listing) {
-    addGiveaways(listing.pages[0]);
     const status = element();
-    controls.set('[data-testid="paginationStatus"]', status);
     const total = listing.pages.flat().length;
     let pageIndex = 0;
     const updatePagination = () => {
@@ -230,7 +228,11 @@ function createPage({
       pagination = element("button");
       pagination.textContent = "Show more giveaways";
       pagination.closest = () => pagination;
+      pagination.scrollIntoView = () => {
+        pagination.inView = true;
+      };
       pagination.onclick = () => {
+        if (listing.requireVisiblePagination && !pagination.inView) return;
         paginationClicks++;
         pagination.disabled = true;
         if (listing.stalled) return;
@@ -249,7 +251,18 @@ function createPage({
         }, listing.delay ?? 500);
       };
     };
-    updatePagination();
+    let initialized = false;
+    const initialize = () => {
+      if (initialized) return;
+      initialized = true;
+      addGiveaways(listing.pages[0]);
+      controls.set('[data-testid="paginationStatus"]', status);
+      updatePagination();
+    };
+    const main = element("main");
+    main.scrollIntoView = initialize;
+    controls.set(".GiveawayIndexPage__content--main", main);
+    if (!listing.lazyStart) initialize();
   }
   const addControl = (selector) => {
     const control = element("input");
@@ -1179,6 +1192,22 @@ test("manual Open all giveaways still works after cancellation and avoids duplic
     page.advanceAsync(1250),
   ]);
   assert.equal(page.openedTabs.length, 3);
+});
+
+test("automatic loading reveals a deferred list and each pagination control", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"]]),
+    listing: {
+      pages: [[1], [2], [3]],
+      lazyStart: true,
+      requireVisiblePagination: true,
+    },
+  });
+  await page.advanceAsync(5000);
+  assert.equal(page.openedTabs.length, 3);
+  assert.equal(page.paginationClicks, 2);
+  assert.deepEqual(page.alerts, []);
 });
 
 test("stalled automatic pagination times out once and can be cancelled or retried", async () => {

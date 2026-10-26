@@ -238,6 +238,9 @@ class Session:
             if self.listing and state in {"finished", "verified"}:
                 if self.state not in {"ready", "running", "closing"}:
                     raise ValueError("The listing has not connected")
+                self.last_seen = self.clock()
+                if progress is not None and progress != self.progress:
+                    self.last_progress, self.progress = self.last_seen, progress
                 self.completed_state = state
                 if self.closing_started is None:
                     self.closing_started = self.clock()

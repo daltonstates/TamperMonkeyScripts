@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.26
+// @version      4.27
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -677,6 +677,7 @@
     const deadline = Date.now() + GIVEAWAY_LOAD_TIMEOUT_MS;
     let noButtonSince = null;
     let lastCount = null;
+    let revealedControl = null;
 
     while (Date.now() < deadline) {
       signal.throwIfAborted();
@@ -687,6 +688,16 @@
       }
       const button = findShowMoreGiveawaysButton();
       const status = document.querySelector('[data-testid="paginationStatus"]');
+      // Goodreads can defer fetching the list until it enters the viewport.
+      // This also keeps each new pagination control visible on a small display.
+      const reveal =
+        button ||
+        status ||
+        document.querySelector(".GiveawayIndexPage__content--main");
+      if (reveal && reveal !== revealedControl) {
+        revealedControl = reveal;
+        reveal.scrollIntoView?.({ block: "end", behavior: "instant" });
+      }
       const totalText = status?.textContent.match(/\bof\s+([\d,]+)/i)?.[1];
       if (totalText) pagination.total = Number(totalText.replace(/,/g, ""));
       refreshOpenButton();

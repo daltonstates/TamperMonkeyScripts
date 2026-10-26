@@ -164,6 +164,27 @@ class HttpTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_completed_listing_keeps_final_progress_instead_of_last_heartbeat(self):
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                listing = MagicMock()
+                listing.closed.return_value = False
+                session = daily.Session({"name": "A"}, verify=verify, listing=listing, window_tag="a" * 32)
+                session.event({"token": session.token, "state": "ready", "closeListingSupported": True,
+                               "windowTag": session.window_tag, "progress": "0/0;0 open;claiming"})
+                if not verify:
+                    session.event({"token": session.token, "state": "running", "progress": "2/3;1 open;claiming"})
+                final = "0/0;0 open;claiming" if verify else "3/3;0 open;claiming"
+                session.event({"token": session.token, "state": "verified" if verify else "finished", "progress": final})
+                self.assertEqual(session.progress, final)
+                if not verify:
+                    session.event({"token": session.token, "state": "running", "progress": "2/3;1 open;claiming"})
+                    self.assertEqual(session.progress, final)
+                listing.closed.return_value = True
+                session.check_deadlines()
+                self.assertEqual(session.state, "verified" if verify else "finished")
+                self.assertEqual(session.progress, final)
+
     def test_browser_refusing_script_close_gets_one_owned_window_close_request(self):
         now = [0]
         listing = MagicMock()
