@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.31
+// @version      4.32
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -327,6 +327,8 @@
             state,
             closeListingSupported: Boolean(dailyRun?.windowTag),
             windowWaitSupported: true,
+            userscriptVersion:
+              typeof GM_info === "undefined" ? null : GM_info.script.version,
             addressSubmitRetrySupported: true,
             failureCleanupSupported: true,
             windowTag: dailyRun?.windowTag,

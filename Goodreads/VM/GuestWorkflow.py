@@ -12,6 +12,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
+import secrets
+from urllib.parse import quote
 
 
 def is_hyperv_guest():
@@ -135,6 +138,35 @@ def recover_previous_day(output, daily_settings, command):
     return True
 
 
+def warmup_userscript_updates(daily_settings, wait_seconds=45):
+    """Let each VM profile's native Tampermonkey updater run before entry tabs."""
+    if not is_hyperv_guest():
+        raise RuntimeError("Userscript update preflight is limited to the dedicated Hyper-V guest")
+    from DailyGiveaways import ListingWindow
+    windows = []
+    for profile in daily_settings["profiles"]:
+        tag = secrets.token_hex(16)
+        title = f"[GR Daily {tag}] Goodreads userscript update preflight"
+        url = "data:text/html," + quote(f"<title>{title}</title><p>Checking automatic userscript updates.</p>")
+        window = ListingWindow(tag, daily_settings["edgePath"])
+        windows.append(window)
+        subprocess.Popen([daily_settings["edgePath"], f'--user-data-dir={daily_settings["userDataDirectory"]}',
+                          f'--profile-directory={profile["directory"]}', "--new-window", url],
+                         creationflags=subprocess.CREATE_NO_WINDOW)
+    time.sleep(wait_seconds)
+    for window in windows:
+        if not window.bind():
+            raise RuntimeError("Could not identify an update preflight window")
+        deadline = time.monotonic() + 15
+        while not window.closed() and time.monotonic() < deadline:
+            if not window.request_close():
+                raise RuntimeError("An update preflight window changed identity")
+            time.sleep(0.25)
+        if not window.closed():
+            raise RuntimeError("An update preflight window did not close")
+    return {"profiles": [p["name"] for p in daily_settings["profiles"]], "waitSeconds": wait_seconds}
+
+
 def run(settings, *, verify_only=False, keep_running=False):
     # The VM workflow must never run browser automation on the physical host.
     if not is_hyperv_guest():
@@ -168,6 +200,8 @@ def run(settings, *, verify_only=False, keep_running=False):
         if not ctypes.windll.kernel32.SetThreadExecutionState(0x80000001):
             raise RuntimeError("Could not keep the guest awake during the run")
         power_set = True
+        if settings.get("preflightUserScriptUpdates") is True:
+            report["updatesPreflight"] = warmup_userscript_updates(daily_settings)
         command = [sys.executable, settings["dailyRunner"], "--config", str(config)]
         if settings.get("recoverFailedProfiles") is True:
             command.append("--vm-recover-failures")

@@ -225,6 +225,23 @@ merely to retry an unexplained failure. These scripts do not disable encryption.
 
 ## Updates and security
 
+The dedicated guest uses hourly Tampermonkey update checks, automatic
+installation, and silent installation of ordinary updates in every configured
+profile. `Configure-TampermonkeyUpdates.cjs` applies those settings through
+LevelDB only while guest Edge processes are stopped. It backs up each extension
+database, preserves script UUIDs, source, stored values and unrelated settings,
+and enables updates for the existing Goodreads script. Its maintenance bundle
+contains Node and `classic-level`; generated dependencies stay outside Git.
+`Continue-VMWorkflowRepair.ps1` runs the repair through PowerShell Direct and
+records the settings readback and verification results without dashboard clicks.
+
+With `preflightUserScriptUpdates` enabled, the guest opens owned blank windows
+for its configured profiles for 45 seconds before the queue. Tampermonkey can
+update in that interval. These windows are closed by their random identities
+before any giveaway entry opens. Verification records the installed userscript
+version as well as the protocol capabilities. Userscript updates cover the
+JavaScript only; Python and host tooling still require a validated deployment.
+
 `Update-VMWorkflow.ps1` stages a repair using PowerShell Direct and one guest
 password kept only in memory. Pass `-GuestUserName`, `-PythonRuntimePath`,
 `-ReportPackagesPath`, and `-StateDirectory` from an elevated host shell. It

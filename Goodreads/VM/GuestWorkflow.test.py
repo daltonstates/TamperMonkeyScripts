@@ -16,6 +16,23 @@ spec.loader.exec_module(guest)
 
 
 class GuestWorkflowTests(unittest.TestCase):
+    def test_update_preflight_opens_only_owned_blank_vm_windows_and_closes_them(self):
+        settings={"edgePath":"edge.exe","userDataDirectory":"C:/profiles",
+                  "profiles":[{"name":str(i),"directory":str(i)} for i in range(3)]}
+        window=MagicMock()
+        window.closed.side_effect=[False,True,True]*3
+        with patch.object(guest,"is_hyperv_guest",return_value=True), \
+             patch("DailyGiveaways.ListingWindow",return_value=window), \
+             patch.object(guest.subprocess,"Popen") as launch, patch.object(guest.time,"sleep"):
+            result=guest.warmup_userscript_updates(settings)
+        self.assertEqual(len(launch.call_args_list),3)
+        self.assertEqual(result["profiles"],["0","1","2"])
+        self.assertTrue(all(call.args[0][-1].startswith("data:text/html,") for call in launch.call_args_list))
+        self.assertTrue(all("goodreads.com/giveaway" not in call.args[0][-1] for call in launch.call_args_list))
+        with patch.object(guest,"is_hyperv_guest",return_value=False), patch.object(guest.subprocess,"Popen") as launch:
+            with self.assertRaisesRegex(RuntimeError,"Hyper-V guest"):
+                guest.warmup_userscript_updates(settings)
+            launch.assert_not_called()
     def test_only_a_recent_locked_verification_without_any_launched_window_can_retry(self):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder)

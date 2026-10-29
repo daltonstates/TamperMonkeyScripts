@@ -222,6 +222,7 @@ class Session:
         self.cleanup_supported = False
         self.cleanup_ready = False
         self.capabilities = {}
+        self.userscript_version = None
 
     def event(self, value):
         with self.lock:
@@ -249,6 +250,9 @@ class Session:
             if not isinstance(reason, str) or len(reason) > 300:
                 raise ValueError("Invalid run message")
             if self.listing and state == "ready":
+                version = value.get("userscriptVersion")
+                if isinstance(version, str) and len(version) <= 40:
+                    self.userscript_version = version
                 self.cleanup_supported = value.get("failureCleanupSupported") is True
                 self.capabilities = {key: value.get(key) is True for key in (
                     "addressSubmitRetrySupported", "failureCleanupSupported")}
@@ -492,6 +496,7 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
             if session.window_binding is not None:
                 item["windowBinding"] = {k: v for k, v in session.window_binding.items() if k != "started"}
             item["capabilities"] = session.capabilities
+            item["userscriptVersion"] = session.userscript_version
             if (recover_failures and listing and session.state == "failed" and session.cleanup_supported
                     and listing.handle is not None):
                 # The authenticated listing closes only the tabs it opened when
