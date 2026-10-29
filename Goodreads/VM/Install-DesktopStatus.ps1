@@ -28,7 +28,7 @@ if(-not $DesktopProcess){
     $id=[guid]::NewGuid().ToString('N')
     $stage=Join-Path $dataHome ('install-'+$id)
     New-Item -ItemType Directory -Path $stage -Force|Out-Null
-    foreach($name in @('Install-DesktopStatus.ps1','DesktopStatusShortcut.cs','DesktopStatus.py','Show-DesktopStatus.ps1')){
+    foreach($name in @('Install-DesktopStatus.ps1','DesktopStatusShortcut.cs','DesktopReportActivator.cpp','DesktopStatus.py','Show-DesktopStatus.ps1')){
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stage $name)
     }
     $ReceiptPath=Join-Path $stage 'result.json'
@@ -91,17 +91,38 @@ try{
     if(Test-Path -LiteralPath $configPath){$config.monitorFrom=(Get-Content -LiteralPath $configPath -Raw|ConvertFrom-Json).monitorFrom}
     [IO.File]::WriteAllText($configPath,($config|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
     $script=Join-Path $root 'DesktopStatus.py'
-    $appKey='HKCU:\Software\Classes\AppUserModelId\GoodreadsGiveaways.DesktopStatus'
+    $appId='GoodreadsGiveaways.RunReport'
+    $appKey='HKCU:\Software\Classes\AppUserModelId\'+$appId
     New-Item -Path $appKey -Force|Out-Null
     New-ItemProperty -LiteralPath $appKey -Name DisplayName -Value 'Goodreads run report' -PropertyType String -Force|Out-Null
-    $activator='{94d7df21-d89d-45c3-b00b-c105c9190ec7}'
+    $activator='{17b923a4-29d3-4eaa-8c55-fbd7009e6103}'
+    $activationSource=Join-Path $PSScriptRoot 'DesktopReportActivator.cpp'
+    $activationHash=(Get-FileHash -LiteralPath $activationSource).Hash.Substring(0,12)
+    $activationExe=Join-Path $root ('DesktopReportActivator-'+$activationHash+'.exe')
+    if(-not(Test-Path -LiteralPath $activationExe)){
+        $vswhere=Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if(-not(Test-Path -LiteralPath $vswhere)){throw 'Visual Studio C++ Build Tools and the Windows SDK are required to build the desktop notification handler.'}
+        $visualStudio=& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if(-not $visualStudio){throw 'Install the Visual Studio C++ tools and Windows SDK before building the notification handler.'}
+        $dev=Join-Path $visualStudio 'Common7\Tools\VsDevCmd.bat'
+        $object=Join-Path $PSScriptRoot 'DesktopReportActivator.obj'
+        $build='call "'+$dev+'" -no_logo -arch=x64 -host_arch=x64 >nul && cl.exe /nologo /EHsc /std:c++17 /MT /DUNICODE /D_UNICODE "'+$activationSource+'" /Fo"'+$object+'" /Fe"'+$activationExe+'" /link /SUBSYSTEM:WINDOWS ole32.lib shell32.lib runtimeobject.lib user32.lib'
+        $buildOutput=& $env:ComSpec /d /s /c $build 2>&1
+        [IO.File]::WriteAllText((Join-Path $root 'activation-build.log'),($buildOutput|Out-String),[Text.UTF8Encoding]::new($false))
+        if($LASTEXITCODE -ne 0){throw 'Could not build the Windows notification click handler.'}
+    }
+    $serverKey='HKCU:\Software\Classes\CLSID\'+$activator+'\LocalServer32'
+    New-Item -Path $serverKey -Force|Out-Null
+    Set-Item -LiteralPath $serverKey -Value ('"'+$activationExe+'" --toast-server')
+    New-ItemProperty -LiteralPath $serverKey -Name ServerExecutable -Value $activationExe -PropertyType String -Force|Out-Null
+    [IO.File]::WriteAllText((Join-Path $root 'activation-settings.json'),(@{exe=$activationExe;classId=$activator;appId=$appId}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
     New-ItemProperty -LiteralPath $appKey -Name CustomActivator -Value $activator -PropertyType String -Force|Out-Null
     $protocol='HKCU:\Software\Classes\goodreads-status'
     New-Item -Path "$protocol\shell\open\command" -Force|Out-Null
     Set-Item -LiteralPath $protocol -Value 'URL:Goodreads run report'
     New-ItemProperty -LiteralPath $protocol -Name 'URL Protocol' -Value '' -PropertyType String -Force|Out-Null
     # Only this fixed command is registered. URI arguments are never executed.
-    $openCommand='"'+$PythonPath+'" "'+$script+'" --config "'+$configPath+'" --open-report'
+    $openCommand='"'+$activationExe+'" --open-report "%1"'
     Set-Item -LiteralPath "$protocol\shell\open\command" -Value $openCommand
     $command='"'+$PythonPath+'" "'+$script+'" --config "'+$configPath+'" --watch'
     New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name GoodreadsGiveawaysStatus -Value $command -PropertyType String -Force|Out-Null
@@ -112,14 +133,16 @@ try{
     foreach($directory in @([Environment]::GetFolderPath('Desktop'),[Environment]::GetFolderPath('Programs'))){
         $linkPath=Join-Path $directory 'Goodreads run report.lnk'
         $link=$shell.CreateShortcut($linkPath)
-        $link.TargetPath=$PythonPath
-        $link.Arguments='"'+$script+'" --config "'+$configPath+'" --open-report'
+        $link.TargetPath=$activationExe
+        $link.Arguments='--open-report'
         $link.Description='Latest account results, processed counts, and errors from the scheduled VM run.'
         $link.Save()
-        [GoodreadsStatusShortcut]::Register($linkPath,'GoodreadsGiveaways.DesktopStatus',$activator)
+        [GoodreadsStatusShortcut]::Register($linkPath,$appId,$activator)
     }
     if(-not $NoStart){Start-Process -FilePath $PythonPath -ArgumentList ('"'+$script+'" --config "'+$configPath+'" --watch') -WindowStyle Hidden}
     $latest=Join-Path $root 'latest-report.json'
+    [void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]
+    try{[Windows.UI.Notifications.ToastNotificationManager]::get_History().Clear('GoodreadsGiveaways.DesktopStatus')}catch{}
     $summary=Get-Content -LiteralPath $latest -Raw|ConvertFrom-Json
     if($summary.body){
         & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'Show-DesktopStatus.ps1') -SummaryPath $latest|Out-Null

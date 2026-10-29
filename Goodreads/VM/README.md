@@ -248,9 +248,26 @@ entry from the real desktop. Existing reports are migrated, the old reader is
 disabled, and the temporary setup task is removed. This addresses Windows'
 [AppData and Registry virtualization](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization).
 Both the notification body and its **Open report** button open the report;
-`report-open-status.json` records launch requests or errors. For a manual click
-test, `Show-DesktopStatus.ps1 -SummaryPath <latest-report.json> -Preview` shows
-one silent banner; automatic successes still have no banner.
+delivery and click handling use the native Windows API. The installed
+`DesktopReportActivator-<source hash>.exe` registers a real COM callback, so a
+click can launch the report after the notification sender has exited.
+`notification-activation.json` records actual `notification-click` callbacks;
+`notification-delivery.json` records submission. The earlier generic card and
+non-working protocol action are retired under a fresh sender identity.
+
+Building the native helper requires Visual Studio C++ Build Tools and a Windows
+SDK on the host. The installer finds them with `vswhere`, compiles with the
+static C runtime, and keeps generated binaries outside Git. An unchanged
+source hash reuses the compiled helper. No compiler is required for daily
+operation, and nothing is installed in the guest for desktop reporting.
+
+For a manual click test,
+`Show-DesktopStatus.ps1 -SummaryPath <latest-report.json> -Preview` shows one
+silent banner; automatic successes still have no banner. The executable's
+`--test-activation` mode exercises cold COM startup, callback, and report launch;
+`--test-rejection` verifies that unknown actions cannot open anything. Those
+tests do not replace a real notification click. The native callback follows
+Microsoft's [desktop toast activation sample](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/DesktopToasts/CPP).
 
 The notifier uses Windows' documented
 [SuppressPopup](https://learn.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotification.suppresspopup)
