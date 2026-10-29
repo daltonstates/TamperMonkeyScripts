@@ -194,7 +194,7 @@ def _warmup_profile_windows(daily_settings, wait_seconds, windows, tokens, windo
     return {"profiles": [p["name"] for p in daily_settings["profiles"]], "waitSeconds": wait_seconds}
 
 
-def run(settings, *, verify_only=False, keep_running=False):
+def run(settings, *, verify_only=False, keep_running=False, run_now=False):
     # The VM workflow must never run browser automation on the physical host.
     if not is_hyperv_guest():
         raise RuntimeError("This wrapper runs only inside a Microsoft Hyper-V guest")
@@ -206,7 +206,7 @@ def run(settings, *, verify_only=False, keep_running=False):
     daily_settings = json.loads(config.read_text(encoding="utf-8-sig"))
     success_path = output / "vm-last-success.json"
     today = datetime.now().date().isoformat()
-    if not verify_only:
+    if not verify_only and not run_now:
         reason = None
         if not in_run_window(daily_settings["startAt"], datetime.now()):
             reason = "Outside the morning window"
@@ -216,7 +216,7 @@ def run(settings, *, verify_only=False, keep_running=False):
             write_report(output / "vm-last-skip.json", {"state": "skipped", "at": datetime.now(timezone.utc).isoformat(), "reason": reason})
             return 0
     started = datetime.now(timezone.utc)
-    report = {"startedAt": started.isoformat(), "state": "starting", "verificationOnly": verify_only,
+    report = {"startedAt": started.isoformat(), "state": "starting", "verificationOnly": verify_only, "manualRun": run_now,
               "note": "Finished means the giveaway tab queue closed; entry acceptance is not independently verified."}
     report_path = output / "vm-last-run.json"
     child = None
@@ -230,6 +230,10 @@ def run(settings, *, verify_only=False, keep_running=False):
         if settings.get("preflightUserScriptUpdates") is True:
             report["updatesPreflight"] = warmup_userscript_updates(daily_settings)
         command = [sys.executable, settings["dailyRunner"], "--config", str(config)]
+        if run_now:
+            # Only an explicit manual invocation bypasses the clock and daily
+            # success marker. Existing locks and unfinished-work checks remain.
+            command.append("--now")
         if settings.get("recoverFailedProfiles") is True:
             command.append("--vm-recover-failures")
             if not verify_only:
@@ -298,7 +302,9 @@ def run(settings, *, verify_only=False, keep_running=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--settings", type=Path, required=True)
-    parser.add_argument("--verify-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--verify-only", action="store_true")
+    mode.add_argument("--run-now", action="store_true", help="Explicitly repeat all configured profiles now, even after today's success")
     parser.add_argument("--keep-running", action="store_true", help="Leave the guest running after a setup check")
     args = parser.parse_args()
     settings = json.loads(args.settings.read_text(encoding="utf-8-sig"))
@@ -316,7 +322,7 @@ def main():
             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             raise RuntimeError("Another VM workflow is already running") from None
-        return run(settings, verify_only=args.verify_only, keep_running=args.keep_running)
+        return run(settings, verify_only=args.verify_only, keep_running=args.keep_running, run_now=args.run_now)
 
 
 if __name__ == "__main__":

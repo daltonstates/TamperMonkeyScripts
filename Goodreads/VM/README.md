@@ -247,6 +247,18 @@ and [silent audio](https://learn.microsoft.com/en-us/uwp/schemas/tiles/toastsche
 options. Run the report, freshness, and duplicate-delivery checks with
 `python Goodreads/VM/DesktopStatus.test.py`.
 
+For an explicitly requested fresh run outside the morning window, launch
+`Run-VMNow.ps1` in an administrator PowerShell window with a new
+`-StateDirectory` under your local diagnostics folder. Enter the guest Windows
+password in that window; it is held only in memory. The VM must be off and
+free of unfinished work. This starts all configured profiles sequentially with
+the guest's `--run-now` option, then waits for shutdown and exports the fresh
+reports for the same desktop notifier. The regular schedule and its settings
+are left in place. Automatic logons still honor the morning window and the
+once-per-day success check; only this explicit manual option repeats a run.
+`Run-VMNow.ps1 -CheckOnly -StateDirectory <path>` checks its source paths and
+installed settings without starting a VM or asking for a password.
+
 Failures that cannot close their authenticated tabs preserve
 `daily-incomplete.json`. After a watchdog recovery cold boot, an ended
 previous-day failure can be archived and cleared only when no Edge windows

@@ -101,12 +101,16 @@ class GuestWorkflowTests(unittest.TestCase):
 
     def exercise(self, *, verify=False, keep_running=False, states=None, stale=False,
                  exit_code=0, timeout=False, shutdown_code=0, power_ok=True, outside_window=False,
-                 shutdown_after_success=False, recover=False):
+                 shutdown_after_success=False, recover=False, run_now=False, already_finished=False, pending=False):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder)
             config = output / "daily-settings.json"
             config.write_text(json.dumps({"startAt": "04:00", "closeCompletedListings": True,
                                           "profiles": [{"name": "A"}, {"name": "B"}]}))
+            if already_finished:
+                (output / "vm-last-success.json").write_text(json.dumps({"localDate": datetime.now().date().isoformat()}))
+            if pending:
+                (output / "daily-incomplete.json").write_text(json.dumps({"startedAt": datetime.now(timezone.utc).isoformat()}))
             started = datetime.now(timezone.utc) - timedelta(days=1 if stale else 0)
             report_name = "daily-verification.json" if verify else "daily-last-run.json"
             (output / report_name).write_text(json.dumps({
@@ -128,8 +132,8 @@ class GuestWorkflowTests(unittest.TestCase):
                  patch.object(guest.subprocess, "run", return_value=MagicMock(returncode=shutdown_code)) as shutdown:
                 code = guest.run({"enabled": True, "dailySettings": str(config), "dailyRunner": "DailyGiveaways.py",
                                   "shutdownAfterSuccess": shutdown_after_success, "recoverFailedProfiles": recover},
-                                 verify_only=verify, keep_running=keep_running)
-                report_path = output / ("vm-last-skip.json" if outside_window else "vm-last-run.json")
+                                 verify_only=verify, keep_running=keep_running, run_now=run_now)
+                report_path = output / ("vm-last-skip.json" if outside_window and not run_now else "vm-last-run.json")
                 return code, json.loads(report_path.read_text()), launch, shutdown, power
 
     def test_finished_queue_saves_report_and_leaves_vm_running(self):
@@ -238,6 +242,20 @@ class GuestWorkflowTests(unittest.TestCase):
     def test_outside_window_opens_no_browser(self):
         code, report, launch, shutdown, _ = self.exercise(outside_window=True)
         self.assertEqual((code, report["state"]), (0, "skipped"))
+        launch.assert_not_called()
+        shutdown.assert_not_called()
+
+    def test_explicit_manual_run_bypasses_clock_and_success_marker_without_changing_settings(self):
+        code, report, launch, shutdown, _ = self.exercise(
+            run_now=True, outside_window=True, already_finished=True, shutdown_after_success=True)
+        self.assertEqual((code, report["state"]), (0, "finished"))
+        self.assertTrue(report["manualRun"])
+        self.assertIn("--now", launch.call_args.args[0])
+        shutdown.assert_called_once()
+
+    def test_manual_run_preserves_same_day_unfinished_work(self):
+        code, report, launch, shutdown, _ = self.exercise(run_now=True, recover=True, pending=True)
+        self.assertEqual((code, report["state"]), (1, "failed"))
         launch.assert_not_called()
         shutdown.assert_not_called()
 
