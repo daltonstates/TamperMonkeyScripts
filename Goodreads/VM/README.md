@@ -210,6 +210,43 @@ when a diagnostic copy is needed without resuming the saved session.
 means the tab queue closed; it does not independently prove Goodreads accepted
 every entry. Expired sign-ins or changed site pages can still require attention.
 
+For one combined report on the physical desktop, run this as the normal
+signed-in host user; no elevation or guest password is needed:
+
+```powershell
+.\Goodreads\VM\Install-DesktopStatus.ps1
+```
+
+This adds **Goodreads run report** to the desktop and Start Menu. A hidden,
+per-user reader starts now and at sign-in and checks the exported host reports
+every 30 seconds. It has no VM or browser control. Success goes directly into
+Windows Notification Center without sound or a banner; errors use a short,
+silent banner. Clicking the notification opens the combined local report.
+Windows notification settings and Do Not Disturb remain in control.
+
+The report lists each configured account, processed queue counts, and error
+reasons. **Processed is not a count of independently confirmed accepted
+entries.** Account reports must match the host run's timestamps; stale exports
+are never substituted. A missing or unfinished morning report is flagged after
+07:30 Eastern, starting the day after installation. Notification IDs prevent
+repeat alerts for an unchanged run. If signed out when a run finishes, the
+latest report is collected at the next sign-in. Installation baselines existing
+reports so earlier maintenance tests do not appear as new failures.
+
+The reader and its reports live in
+`%LOCALAPPDATA%\GoodreadsGiveawaysDesktopStatus`; `watcher-health.json` records
+its last check, and `watcher-state.json` records delivery or a retry reason.
+No guest credentials or browser data are copied there. To stop the reader,
+set `enabled` to `false` in its `settings.json` and remove only the
+`GoodreadsGiveawaysStatus` value from the current user's Windows `Run` key.
+The reports and shortcuts can be kept.
+
+The notifier uses Windows' documented
+[SuppressPopup](https://learn.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotification.suppresspopup)
+and [silent audio](https://learn.microsoft.com/en-us/uwp/schemas/tiles/toastschema/element-audio)
+options. Run the report, freshness, and duplicate-delivery checks with
+`python Goodreads/VM/DesktopStatus.test.py`.
+
 Failures that cannot close their authenticated tabs preserve
 `daily-incomplete.json`. After a watchdog recovery cold boot, an ended
 previous-day failure can be archived and cleared only when no Edge windows
