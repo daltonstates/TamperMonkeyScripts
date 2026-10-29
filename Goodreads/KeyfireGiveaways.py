@@ -241,6 +241,16 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
         if (not self.allowed_client()
                 or self.headers.get("X-Goodreads-Companion") != "workflow"
                 or self.headers.get_content_type() != "application/json"):
+            # A Windows socket closed with unread request data can reset before
+            # its 403 reaches the client. Drain only a small, bounded body; never
+            # parse or authorize it and never wait indefinitely for an attacker.
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if 0 < length <= 4096:
+                    self.connection.settimeout(1)
+                    self.rfile.read(length)
+            except (OSError, ValueError):
+                pass
             self.reply(403, {"error": "This client is not allowed"})
             return
         if self.path != "/v1/workflow":
