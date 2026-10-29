@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$SummaryPath)
+param([Parameter(Mandatory=$true)][string]$SummaryPath,[switch]$Preview)
 $ErrorActionPreference='Stop'
 $summary=Get-Content -LiteralPath $SummaryPath -Raw -Encoding UTF8|ConvertFrom-Json
 $appId='GoodreadsGiveaways.DesktopStatus'
@@ -8,8 +8,9 @@ $appId='GoodreadsGiveaways.DesktopStatus'
 [void][Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime]
 $notifier=[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
 $xml=[Windows.Data.Xml.Dom.XmlDocument]::new()
-$xml.LoadXml('<toast activationType="protocol" launch="goodreads-status:report" duration="short"><visual><binding template="ToastGeneric"><text/><text/><text/></binding></visual><audio silent="true"/></toast>')
+$xml.LoadXml('<toast activationType="protocol" launch="goodreads-status:report" duration="short"><visual><binding template="ToastGeneric"><text/><text/><text/></binding></visual><actions><action content="Open report" activationType="protocol" arguments="goodreads-status:report"/></actions><audio silent="true"/></toast>')
 if($summary.endedAt){$xml.DocumentElement.SetAttribute('displayTimestamp',([DateTimeOffset]::Parse($summary.endedAt).ToString('o')))}
+if($Preview){$xml.DocumentElement.SetAttribute('duration','long')}
 $text=$xml.GetElementsByTagName('text')
 $text.Item(0).InnerText=[string]$summary.title
 $text.Item(1).InnerText=[string]$summary.body
@@ -17,7 +18,7 @@ $text.Item(2).InnerText=[string]$summary.detail
 $toast=[Windows.UI.Notifications.ToastNotification]::new($xml)
 $toast.Tag='latest'
 $toast.Group='daily'
-$toast.SuppressPopup=($summary.healthy -eq $true)
+$toast.SuppressPopup=($summary.healthy -eq $true -and -not $Preview)
 $toast.ExpirationTime=[DateTimeOffset]::Now.AddDays(7)
 $notifier.Show($toast)
 # Windows creates the publisher's notification settings on its first Show.

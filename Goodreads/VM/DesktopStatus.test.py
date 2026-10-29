@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("desktop_status", Path(__file__).with_name("DesktopStatus.py"))
 status = importlib.util.module_from_spec(spec)
@@ -23,6 +23,28 @@ def completed():
 
 
 class DesktopStatusTests(unittest.TestCase):
+    def test_report_open_uses_the_installed_directory_and_records_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root / "report.html").write_text("Report", encoding="utf-8")
+            with patch.object(status.os,"startfile") as launch:
+                status.open_report(root)
+            launch.assert_called_once_with(str((root / "report.html").resolve()))
+            self.assertEqual(status.read_json(root / "report-open-status.json")["state"],"launch-requested")
+
+    def test_missing_report_or_shell_failure_is_recorded_and_not_silenced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            with patch.object(status.os,"startfile") as launch:
+                with self.assertRaises(FileNotFoundError):
+                    status.open_report(root)
+                launch.assert_not_called()
+            (root / "report.html").write_text("Report", encoding="utf-8")
+            with patch.object(status.os,"startfile",side_effect=OSError("Association unavailable")):
+                with self.assertRaisesRegex(OSError,"Association unavailable"):
+                    status.open_report(root)
+            self.assertEqual(status.read_json(root / "report-open-status.json")["reason"],"Association unavailable")
+
     def test_success_uses_queue_counts_without_claiming_entry_acceptance(self):
         report = status.summarize(*completed())
         self.assertTrue(report["healthy"])

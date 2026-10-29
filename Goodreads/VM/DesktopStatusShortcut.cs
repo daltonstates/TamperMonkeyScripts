@@ -1,5 +1,7 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 
 // Only used by the per-user installer to identify its Start Menu shortcut.
 public static class GoodreadsStatusShortcut
@@ -30,6 +32,21 @@ public static class GoodreadsStatusShortcut
 
     [DllImport("ole32.dll")]
     private static extern int PropVariantClear(ref PropVariant value);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(IntPtr handle, StringBuilder path, uint length, uint flags);
+
+    public static string PhysicalPath(string path)
+    {
+        using (var file = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            var result = new StringBuilder(32768);
+            if (GetFinalPathNameByHandle(file.SafeFileHandle.DangerousGetHandle(), result, (uint)result.Capacity, 0) == 0)
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            string physical = result.ToString();
+            return physical.StartsWith(@"\\?\") ? physical.Substring(4) : physical;
+        }
+    }
 
     public static void Register(string shortcut, string appId, string activator)
     {

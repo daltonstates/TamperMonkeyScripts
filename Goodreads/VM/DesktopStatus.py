@@ -270,6 +270,21 @@ def watch(config_path):
         kernel.CloseHandle(lock)
 
 
+def open_report(root):
+    report = root / "report.html"
+    receipt = {"at": datetime.now().astimezone().isoformat(), "report": str(report)}
+    try:
+        if not report.is_file():
+            raise FileNotFoundError("The desktop report has not been created yet")
+        os.startfile(str(report.resolve()))
+        receipt["state"] = "launch-requested"
+    except Exception as error:
+        receipt.update(state="failed", reason=str(error))
+        raise
+    finally:
+        write_json(root / "report-open-status.json", receipt)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -283,7 +298,7 @@ def main():
     if args.initialize:
         initialize(config, root)
     elif args.open_report:
-        os.startfile(root / "report.html")
+        open_report(root)
     elif args.test_notification:
         print(json.dumps(notify(root, {"title": "Goodreads desktop reporting is ready", "healthy": True,
                                       "body": "Successful runs will appear quietly here after all profiles finish.",

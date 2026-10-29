@@ -234,12 +234,23 @@ latest report is collected at the next sign-in. Installation baselines existing
 reports so earlier maintenance tests do not appear as new failures.
 
 The reader and its reports live in
-`%LOCALAPPDATA%\GoodreadsGiveawaysDesktopStatus`; `watcher-health.json` records
+`%USERPROFILE%\.goodreads-giveaways\desktop`; `watcher-health.json` records
 its last check, and `watcher-state.json` records delivery or a retry reason.
 No guest credentials or browser data are copied there. To stop the reader,
 set `enabled` to `false` in its `settings.json` and remove only the
 `GoodreadsGiveawaysStatus` value from the current user's Windows `Run` key.
 The reports and shortcuts can be kept.
+
+Installation runs its final registration in a limited interactive Windows task
+and stages its files outside AppData. This prevents a packaged caller's private
+filesystem or Registry view from hiding the report, URL handler, or startup
+entry from the real desktop. Existing reports are migrated, the old reader is
+disabled, and the temporary setup task is removed. This addresses Windows'
+[AppData and Registry virtualization](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization).
+Both the notification body and its **Open report** button open the report;
+`report-open-status.json` records launch requests or errors. For a manual click
+test, `Show-DesktopStatus.ps1 -SummaryPath <latest-report.json> -Preview` shows
+one silent banner; automatic successes still have no banner.
 
 The notifier uses Windows' documented
 [SuppressPopup](https://learn.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotification.suppresspopup)
