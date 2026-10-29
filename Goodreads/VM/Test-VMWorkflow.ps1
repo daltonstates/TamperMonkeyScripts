@@ -62,6 +62,39 @@ try {
     Assert-Rejected { Start-GiveawaysMorningVM $settings } 'left alone'
     $script:fakeVM.State = 'Off'
     Assert-Check ((Get-OwnedGiveawaysVM $settings).Id -eq $settings.vmId) 'Owned VM was not selected.'
+    $originalDiskPath = $settings.diskPath
+    $originalReportDirectory = $settings.reportDirectory
+    $settings.diskPath = Join-Path $scratch 'failure.vhdx'
+    $script:fakeDisks = @([pscustomobject]@{ Path = $settings.diskPath })
+    [IO.File]::WriteAllText($settings.diskPath, 'unchanged disk sentinel')
+    $settings.reportDirectory = $scratch
+    $settings | Add-Member -Force NoteProperty recoverSavedFailures $true
+    $proofPath = Join-Path $scratch 'host-saved-failure.json'
+    $disk = Get-Item -LiteralPath $settings.diskPath
+    $proof = @{vmId=$settings.vmId;vmName=$settings.vmName;savedAt=[DateTimeOffset]::Now.AddDays(-1).ToString('o');diskLength=$disk.Length;diskLastWriteUtc=$disk.LastWriteTimeUtc.ToString('o')}
+    Write-VMJson $proofPath $proof
+    $script:fakeVM.State = 'Saved'
+    $proof.diskLength++
+    Write-VMJson $proofPath $proof
+    Assert-Rejected { Start-GiveawaysMorningVM $settings } 'unchanged previous-day'
+    $proof.diskLength--
+    $proof.savedAt = [DateTimeOffset]::Now.ToString('o')
+    Write-VMJson $proofPath $proof
+    Assert-Rejected { Start-GiveawaysMorningVM $settings } 'unchanged previous-day'
+    $proof.savedAt = [DateTimeOffset]::Now.AddDays(-1).ToString('o')
+    Write-VMJson $proofPath $proof
+    function Stop-VM { param($VM,[switch]$AsJob,[switch]$Save,[switch]$Confirm) $script:fakeVM.State = 'Off'; return [pscustomobject]@{Id=999} }
+    function Wait-Job { param($Job,$Timeout) return $Job }
+    function Receive-Job { [CmdletBinding()]param($Job) }
+    function Remove-Job { [CmdletBinding()]param($Job,[switch]$Force) }
+    $recovered = Start-GiveawaysMorningVM $settings
+    Assert-Check ($recovered.action -eq 'recovered-started') 'A proven previous-day failure did not cold-start.'
+    Assert-Check (-not (Test-Path -LiteralPath $proofPath)) 'Recovered proof must be archived.'
+    Get-ChildItem -LiteralPath (Join-Path $scratch 'history') -File | Remove-Item
+    [IO.Directory]::Delete((Join-Path $scratch 'history'))
+    $settings.diskPath = $originalDiskPath
+    $settings.reportDirectory = $originalReportDirectory
+    $script:fakeDisks = @([pscustomobject]@{ Path = $settings.diskPath })
     $script:fakeVM.Name = 'AnotherVM'
     Assert-Rejected { Get-OwnedGiveawaysVM $settings } 'ownership marker'
     $script:fakeVM.Name = $settings.vmName

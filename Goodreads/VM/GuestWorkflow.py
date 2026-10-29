@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -105,6 +106,35 @@ def verification_can_retry(output, edge_path=None):
         return False
 
 
+def recover_previous_day(output, daily_settings, command):
+    """Archive an ended old failure only after a fresh guest has no Edge windows."""
+    pending = output / "daily-incomplete.json"
+    if not pending.exists():
+        return False
+    marker = json.loads(pending.read_text(encoding="utf-8-sig"))
+    report = json.loads((output / "daily-last-run.json").read_text(encoding="utf-8-sig"))
+    began = datetime.fromisoformat(report["startedAt"])
+    expected = {(p["name"], p["directory"]) for p in daily_settings["profiles"]}
+    actual = {(p["name"], p["directory"]) for p in report["profiles"] if p.get("startedAt")}
+    if (not report.get("endedAt") or report.get("verificationOnly") is not False
+            or began.astimezone().date() >= datetime.now().date()
+            or abs((datetime.fromisoformat(marker["startedAt"]) - began).total_seconds()) > 5
+            or not report["profiles"] or not any(p.get("state") == "failed" for p in report["profiles"])
+            or not actual.issubset(expected)
+            or browser_window_open(daily_settings.get("edgePath"))):
+        raise RuntimeError("Unfinished work could not be safely retired after the guest restart")
+    archive = output / "history" / ("retired-" + began.strftime("%Y%m%d-%H%M%S"))
+    archive.mkdir(parents=True, exist_ok=True)
+    for name in ("daily-incomplete.json", "daily-last-run.json", "vm-last-run.json"):
+        source = output / name
+        if source.exists():
+            shutil.copyfile(source, archive / name)
+    subprocess.run(command + ["--clear-pending"], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   creationflags=subprocess.CREATE_NO_WINDOW)
+    return True
+
+
 def run(settings, *, verify_only=False, keep_running=False):
     # The VM workflow must never run browser automation on the physical host.
     if not is_hyperv_guest():
@@ -139,6 +169,10 @@ def run(settings, *, verify_only=False, keep_running=False):
             raise RuntimeError("Could not keep the guest awake during the run")
         power_set = True
         command = [sys.executable, settings["dailyRunner"], "--config", str(config)]
+        if settings.get("recoverFailedProfiles") is True:
+            command.append("--vm-recover-failures")
+            if not verify_only:
+                report["retiredPreviousFailure"] = recover_previous_day(output, daily_settings, command)
         if verify_only:
             if verification_can_retry(output, daily_settings.get("edgePath")):
                 # The runner takes daily.lock before clearing; never clear an active run.
@@ -165,9 +199,24 @@ def run(settings, *, verify_only=False, keep_running=False):
             write_report(success_path, {"localDate": today, "finishedAt": datetime.now(timezone.utc).isoformat()})
     except Exception as error:
         report.update(state="failed", reason=str(error))
+        # A failed account is still a failure, but a fully closed VM queue must
+        # not leave the machine saved and block every following morning.
+        if settings.get("recoverFailedProfiles") is True and child is not None and child.poll() is not None:
+            try:
+                failed_daily = json.loads((output / "daily-last-run.json").read_text(encoding="utf-8-sig"))
+                closed_profiles = failed_daily["profiles"]
+                if (not verify_only and len(closed_profiles) == len(daily_settings["profiles"])
+                        and failed_daily.get("endedAt")
+                        and datetime.fromisoformat(failed_daily["startedAt"]) >= started - timedelta(seconds=5)
+                        and all(p.get("listingClosed") is True and p.get("state") in {"finished", "failed"}
+                                for p in closed_profiles)
+                        and not (output / "daily-incomplete.json").exists()):
+                    report["state"] = "failed-cleaned"
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         # Leave the VM and its unfinished tabs available for inspection.
         pending = output / "daily-incomplete.json"
-        if not pending.exists():
+        if report["state"] != "failed-cleaned" and not pending.exists():
             write_report(pending, {"startedAt": started.isoformat(), "reason": str(error)})
     finally:
         if power_set:
@@ -175,7 +224,7 @@ def run(settings, *, verify_only=False, keep_running=False):
         report["endedAt"] = datetime.now(timezone.utc).isoformat()
         write_report(report_path, report)
     if (settings.get("shutdownAfterSuccess") is True and not keep_running
-            and report["state"] in {"finished", "verified"}):
+            and report["state"] in {"finished", "verified", "failed-cleaned"}):
         result = subprocess.run([str(Path(os.environ["SystemRoot"]) / "System32" / "shutdown.exe"),
                                  "/s", "/t", "0"], check=False,
                                 creationflags=subprocess.CREATE_NO_WINDOW)

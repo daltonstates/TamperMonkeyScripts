@@ -570,5 +570,69 @@ class QueueTests(unittest.TestCase):
             launch.assert_not_called()
 
 
+class FailureRecoveryTests(unittest.TestCase):
+    def test_vm_cleanup_requires_current_script_and_authenticated_child_close_ack(self):
+        listing = MagicMock()
+        session = daily.Session({}, listing=listing, window_tag="a" * 32, recover_failures=True)
+        old = session.event({"token": session.token, "state": "ready",
+                             "closeListingSupported": True, "windowTag": session.window_tag})
+        self.assertTrue(old["cancel"])
+        self.assertIn("4.31", old["error"])
+        listing.bind.assert_not_called()
+        session = daily.Session({}, listing=listing, window_tag="a" * 32, recover_failures=True)
+        session.event({"token": session.token, "state": "ready", "closeListingSupported": True,
+                       "windowTag": session.window_tag, "addressSubmitRetrySupported": True,
+                       "failureCleanupSupported": True})
+        session.state = "failed"
+        self.assertTrue(session.event({"token": session.token, "state": "running"})["closeRunTabs"])
+        self.assertFalse(session.cleanup_ready)
+        with self.assertRaises(ValueError):
+            session.event({"token": "b" * 64, "state": "cleanup-ready", "windowTag": session.window_tag})
+        self.assertTrue(session.event({"token": session.token, "state": "cleanup-ready",
+                                       "windowTag": session.window_tag})["closeListing"])
+        self.assertTrue(session.cleanup_ready)
+
+    def test_failed_vm_profile_can_continue_only_after_its_window_closes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            server, listing = MagicMock(), MagicMock()
+            listing.handle = 123
+            closed = [False]
+            listing.closed.side_effect = lambda: closed[0]
+            listing.request_close.side_effect = lambda: closed.__setitem__(0, True)
+            launches = []
+            settings = {"startAt": "04:00", "edgePath": "edge.exe", "userDataDirectory": folder,
+                        "closeCompletedListings": True,
+                        "profiles": [{"name": name, "directory": name, "offsetMinutes": i * 30}
+                                     for i, name in enumerate(("A", "B"))]}
+            def launch(arguments):
+                launches.append(arguments)
+                session = server.session
+                session.event({"token": session.token, "state": "ready", "closeListingSupported": True,
+                               "windowTag": session.window_tag, "addressSubmitRetrySupported": True,
+                               "failureCleanupSupported": True})
+                session.event({"token": session.token, "state": "failed" if len(launches) == 1 else "finished"})
+                if len(launches) == 2:
+                    closed[0] = True
+            def sleep(seconds):
+                session = server.session
+                if session.state == "failed":
+                    # No fallback WM_CLOSE until the browser confirms its child tabs closed.
+                    if not session.cleanup_ready:
+                        listing.request_close.assert_not_called()
+                    session.event({"token": session.token, "state": "cleanup-ready", "windowTag": session.window_tag})
+            with patch.object(daily, "Server", return_value=server), \
+                 patch.object(daily, "ListingWindow", return_value=listing), \
+                 patch.object(daily, "desktop_available", return_value=True), \
+                 patch.object(daily.subprocess, "Popen", side_effect=launch), \
+                 patch.object(daily.time, "sleep", side_effect=sleep):
+                self.assertEqual(daily.run_queue(settings, output, immediate=True, recover_failures=True), 1)
+            report = json.loads((output / "daily-last-run.json").read_text())
+            self.assertEqual([p["state"] for p in report["profiles"]], ["failed", "finished"])
+            self.assertTrue(report["profiles"][0]["failureRecovered"])
+            self.assertFalse((output / "daily-incomplete.json").exists())
+            self.assertEqual(len(launches), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

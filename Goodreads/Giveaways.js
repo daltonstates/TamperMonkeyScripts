@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.30
+// @version      4.31
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -171,6 +171,7 @@
 
   const openedGiveawayLinks = new Set();
   const trackedGiveawayTabs = new Set();
+  const giveawayTabClosers = new Map();
   const manualGiveawayTabs = new Map();
 
   const normalize = (s) => s.trim().toLowerCase();
@@ -262,7 +263,10 @@
 
   function restoreLaunchRequest() {
     const current = new URL(window.location.href);
-    if (current.origin !== launchUrl.origin || current.pathname !== launchUrl.pathname)
+    if (
+      current.origin !== launchUrl.origin ||
+      current.pathname !== launchUrl.pathname
+    )
       return;
     let changed = false;
     if (
@@ -323,6 +327,8 @@
             state,
             closeListingSupported: Boolean(dailyRun?.windowTag),
             windowWaitSupported: true,
+            addressSubmitRetrySupported: true,
+            failureCleanupSupported: true,
             windowTag: dailyRun?.windowTag,
             reason: reason.slice(0, 300),
             progress: dailyProgress(),
@@ -336,6 +342,24 @@
           onload: (response) => {
             try {
               const value = JSON.parse(response.responseText);
+              if (
+                response.status === 200 &&
+                value.protocol === 1 &&
+                value.cancel &&
+                value.closeRunTabs &&
+                dailyRun?.windowTag
+              ) {
+                giveawayRunController?.abort();
+                for (const close of giveawayTabClosers.values()) close();
+                // Only close this authenticated scheduled listing after its own
+                // child tabs really closed. A refused close preserves the run.
+                void Promise.all([...trackedGiveawayTabs])
+                  .then(async () => {
+                    await dailyRequest(dailyRun.token, "cleanup-ready");
+                    window.close();
+                  })
+                  .catch(() => {});
+              }
               if (
                 response.status !== 200 ||
                 value.protocol !== 1 ||
@@ -395,7 +419,8 @@
           return;
         }
         if (!document.title.startsWith(prefix))
-          document.title = prefix + document.title.replace(/^\[GR Daily [a-f0-9]{32}\] /, "");
+          document.title =
+            prefix + document.title.replace(/^\[GR Daily [a-f0-9]{32}\] /, "");
       };
       retainTitle();
       dailyRun.titleTimer = setInterval(retainTitle, 250);
@@ -409,9 +434,13 @@
         if (dailyRun.stopped || leavingPage) return;
         if (response.mode !== "wait") break;
         if (Date.now() >= readyDeadline)
-          throw new Error("The scheduled Edge window was not identified within 35 seconds.");
+          throw new Error(
+            "The scheduled Edge window was not identified within 35 seconds.",
+          );
         if (!keyfireEnabled || !isKeyfireConfigured(keyfireSettings))
-          throw new Error("Save Keyfire setup and enable Use Keyfire workflow in this Edge profile.");
+          throw new Error(
+            "Save Keyfire setup and enable Use Keyfire workflow in this Edge profile.",
+          );
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
       dailyRun.waitingForWindow = false;
@@ -746,7 +775,8 @@
         } else if (pagination.total === null || count >= pagination.total) {
           // Allow the page to finish rendering its next pagination control.
           noButtonSince ??= Date.now();
-          const settleTime = emptyList || pagination.total !== null ? 1000 : 5000;
+          const settleTime =
+            emptyList || pagination.total !== null ? 1000 : 5000;
           if (Date.now() - noButtonSince >= settleTime) return null;
         }
       }
@@ -889,6 +919,7 @@
     }
 
     let closedPromise;
+    let closeTrackedTab;
     closedPromise = new Promise((resolve) => {
       let settled = false;
       let pollId = null;
@@ -925,6 +956,7 @@
           settle();
         }
       };
+      closeTrackedTab = () => tab.close();
 
       recovery.controller.signal.addEventListener("abort", stopRecovery, {
         once: true,
@@ -1015,8 +1047,10 @@
     });
 
     trackedGiveawayTabs.add(closedPromise);
+    giveawayTabClosers.set(closedPromise, closeTrackedTab);
     if (!workflow) manualGiveawayTabs.set(closedPromise, link);
     closedPromise.then(() => {
+      giveawayTabClosers.delete(closedPromise);
       trackedGiveawayTabs.delete(closedPromise);
       manualGiveawayTabs.delete(closedPromise);
       refreshOpenButton();
@@ -1248,12 +1282,17 @@
     const cleanTitle = () =>
       document.title.replace(/^\[GR Keyfire [^\]]+\] /, "");
     let stopped = false;
+    let addressPendingUntil = 0;
+    let addressSubmissions = 0;
+    const pageHref = window.location.href;
     const refresh = () => {
       const expiresAt = Number(
         localStorage.getItem(LS_KEYFIRE_RUN_PREFIX + progress.keyfireRun),
       );
       const active =
         !stopped &&
+        window.location.href === pageHref &&
+        Date.now() >= addressPendingUntil &&
         localStorage.getItem(LS_KEYFIRE_ENABLED) === "1" &&
         document.hasFocus() &&
         document.visibilityState !== "hidden" &&
@@ -1278,8 +1317,25 @@
       document.removeEventListener("visibilitychange", refresh);
       document.removeEventListener("focusin", refresh);
       document.removeEventListener("focusout", refresh);
-      document.removeEventListener("submit", stop, true);
+      document.removeEventListener("submit", submitted, true);
+      document.removeEventListener("pointerdown", stop, true);
+      document.removeEventListener("keydown", interacted, true);
       refresh();
+    };
+    const submitted = () => {
+      if (stage !== "address" || ++addressSubmissions > MAX_GIVEAWAY_RELOADS) {
+        stop();
+        return;
+      }
+      // Goodreads can cancel an address form submission without navigating.
+      // Let the companion's bounded Enter retries recover that same address;
+      // final-entry submission must still stop permanently to avoid duplicates.
+      addressPendingUntil = Date.now() + 5000;
+      refresh();
+    };
+    const interacted = (event) => {
+      if (event.key !== "Enter" || !event.target?.matches("a.addressLink"))
+        stop();
     };
     window.addEventListener("storage", refresh);
     window.addEventListener("focus", refresh);
@@ -1288,7 +1344,11 @@
     document.addEventListener("focusin", refresh);
     document.addEventListener("focusout", refresh);
     window.addEventListener("pagehide", stop, { once: true });
-    document.addEventListener("submit", stop, true);
+    document.addEventListener("submit", submitted, true);
+    if (stage === "address") {
+      document.addEventListener("pointerdown", stop, true);
+      document.addEventListener("keydown", interacted, true);
+    }
   }
 
   /* ------------------------------------------------------------

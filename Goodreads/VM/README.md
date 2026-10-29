@@ -10,9 +10,13 @@ its own Windows console and runs its Edge profiles around **04:00, 04:30, and
 the next account starts. After success the guest shuts down, releasing its
 assigned memory and CPU. The physical PC can remain locked or signed out.
 
-A failed queue preserves its browser windows. At the 195-minute host limit,
-a stalled VM is saved to release memory. Saved or paused failures require
-inspection; the next scheduled run refuses to resume them automatically. An
+A VM account that fails closes only its authenticated run's tabs and listing
+before the next account starts. Its report still records the failure. After
+all windows close, even a partially failed queue shuts down so tomorrow can run.
+If cleanup cannot finish, the 195-minute host limit saves the VM. With
+`recoverSavedFailures` enabled, the next morning can retire an unchanged saved
+failure created by this watchdog, shut down the old guest, and cold boot again.
+Manually saved or paused sessions are left for inspection. An
 already-running VM is left alone, so a manually started automation session
 does not get shut down by this host task.
 
@@ -128,7 +132,7 @@ Copy-VMFile -VMName 'GoodreadsGiveaways' -SourcePath $zip -DestinationPath 'C:\U
 Extract the package inside the guest. In every guest Edge profile:
 
 1. Sign into the intended Goodreads account.
-2. Install the current `Goodreads/Giveaways.js`, **4.30 or later**, in
+2. Install the current `Goodreads/Giveaways.js`, **4.31 or later**, in
    Tampermonkey, with the current Python runner for bounded startup-window
    retries. Avoid duplicate enabled copies.
 3. In Tampermonkey Settings, select Advanced configuration and set Content
@@ -185,7 +189,12 @@ verification does not establish successful real entries.
 Host lifecycle reports are under
 `C:\ProgramData\GoodreadsGiveawaysVM\reports`. Guest reports are in
 `C:\GoodreadsVM\output`, with dated queue reports in `history`. The host exports
-reports only after the VM powers off, mounting only the owned disk read-only.
+reports only after the VM powers off. An optional protected embedded Python
+runtime under the host installation's `runtime/`, with `dissect.hypervisor`,
+`dissect.volume`, `dissect.ntfs`, and `dissect.fve` under `packages/`, reads the
+owned disk without mounting it. This also handles a BitLocker guest volume
+when it contains a clear key. Otherwise the unencrypted read-only mount
+exporter remains available.
 No guest password, host share, or internet-facing service is needed for routine
 runs. Report paths reject guest links/reparse points and oversized files.
 
@@ -201,9 +210,10 @@ when a diagnostic copy is needed without resuming the saved session.
 means the tab queue closed; it does not independently prove Goodreads accepted
 every entry. Expired sign-ins or changed site pages can still require attention.
 
-Failures preserve tabs and create `daily-incomplete.json`, blocking subsequent
-runs. Inspect and finish/cancel those tabs and correct the recorded problem.
-Then run inside the guest:
+Failures that cannot close their authenticated tabs preserve
+`daily-incomplete.json`. After a watchdog recovery cold boot, an ended
+previous-day failure can be archived and cleared only when no Edge windows
+remain. Manual recovery is still available inside the guest:
 
 ```powershell
 & 'C:\GoodreadsVM\Goodreads\VM\Install-VMGuest.ps1' -PackagePath 'C:\GoodreadsVM' -ClearPending -VerifyOnly
@@ -211,10 +221,21 @@ Then run inside the guest:
 
 After successful verification, repeat the guest enable step, shut down the VM,
 and repeat host enable. Do not discard saved state or clear the pending marker
-merely to retry an unexplained failure. Encrypted guest disks require a
-different report-export arrangement; these scripts do not disable encryption.
+merely to retry an unexplained failure. These scripts do not disable encryption.
 
 ## Updates and security
+
+`Update-VMWorkflow.ps1` stages a repair using PowerShell Direct and one guest
+password kept only in memory. Pass `-GuestUserName`, `-PythonRuntimePath`,
+`-ReportPackagesPath`, and `-StateDirectory` from an elevated host shell. It
+opens the three guest Tampermonkey dashboards, waits for a `verify` command in
+`update-command.json` (`id` must be unique), and requires every profile to prove
+the 4.31 address-retry and failure-cleanup protocol. A `smoke` command then
+tests a cold boot with an injected failure before any entry tabs open, verifies
+cleanup, shutdown and report export, and restores the normal enabled schedule.
+The receipt is `update-status.json`. This maintenance explicitly cancels the
+old failed VM browser run after archiving its reports; it never runs on the
+physical host's browsers.
 
 GitHub/Tampermonkey automatic updates cover `Giveaways.js` according to each
 profile's update interval. They do not update Python, the companion, VM tooling,
@@ -233,6 +254,7 @@ network-adapter, or sleep settings are changed by these scripts.
 ```powershell
 powershell -NoProfile -File Goodreads/VM/Test-VMWorkflow.ps1
 python Goodreads/VM/GuestWorkflow.test.py
+python Goodreads/VM/Read-GuestReports.test.py
 python Goodreads/DailyGiveaways.test.py
 python Goodreads/KeyfireGiveaways.test.py
 ```

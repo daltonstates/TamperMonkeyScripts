@@ -9,5 +9,6 @@
   "diskGB": 80,
   "hostStartAt": "03:55",
   "maximumRuntimeMinutes": 195,
+  "recoverSavedFailures": true,
   "reportDirectory": "C:\\ProgramData\\GoodreadsGiveawaysVM\\reports"
 }

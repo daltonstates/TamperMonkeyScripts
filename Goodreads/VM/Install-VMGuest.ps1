@@ -78,13 +78,14 @@ if ($ClearPending) {
 }
 $wrapper = Join-Path $root 'Goodreads\VM\GuestWorkflow.py'
 $guestSettings = Join-Path $root 'guest-settings.json'
-$settings = @{ enabled = $false; dailyRunner = $dailyRunner; dailySettings = $dailySettings; shutdownAfterSuccess = $true }
+$settings = @{ enabled = $false; dailyRunner = $dailyRunner; dailySettings = $dailySettings; shutdownAfterSuccess = $true; recoverFailedProfiles = $true }
 if ($Enable) {
     $verificationPath = Join-Path $output 'daily-verification.json'
     $verification = Get-Content -LiteralPath $verificationPath -Raw | ConvertFrom-Json
     if (-not $verification.endedAt -or -not $verification.verificationOnly -or
         @($verification.profiles).Count -ne @($template.profiles).Count -or
         @($verification.profiles | Where-Object { $_.state -ne 'verified' -or $_.listingClosed -ne $true }).Count -gt 0 -or
+        @($verification.profiles | Where-Object { $_.capabilities.addressSubmitRetrySupported -ne $true -or $_.capabilities.failureCleanupSupported -ne $true }).Count -gt 0 -or
         [DateTimeOffset]::Parse($verification.endedAt) -lt [DateTimeOffset]::Now.AddDays(-1)) {
         throw 'Verify every guest profile successfully before enabling the guest workflow.'
     }

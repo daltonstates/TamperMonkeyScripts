@@ -201,7 +201,8 @@ class ListingWindow:
 
 
 class Session:
-    def __init__(self, profile, verify=False, clock=time.monotonic, *, listing=None, window_tag=None):
+    def __init__(self, profile, verify=False, clock=time.monotonic, *, listing=None, window_tag=None,
+                 recover_failures=False):
         self.profile = profile
         self.verify = verify
         self.clock = clock
@@ -217,6 +218,10 @@ class Session:
         self.closing_started = None
         self.close_requested = False
         self.window_binding = None
+        self.recover_failures = recover_failures
+        self.cleanup_supported = False
+        self.cleanup_ready = False
+        self.capabilities = {}
 
     def event(self, value):
         with self.lock:
@@ -225,7 +230,12 @@ class Session:
                     or not secrets.compare_digest(token, self.token)):
                 raise ValueError("Unknown scheduled run")
             if self.state in TERMINAL:
-                return {"protocol": 1, "cancel": True}
+                if (self.state == "failed" and self.recover_failures and self.cleanup_supported
+                        and value.get("state") == "cleanup-ready" and value.get("windowTag") == self.window_tag):
+                    self.cleanup_ready = True
+                    return {"protocol": 1, "cancel": False, "closeListing": True}
+                return {"protocol": 1, "cancel": True,
+                        "closeRunTabs": self.state == "failed" and self.recover_failures and self.cleanup_supported}
             state = value.get("state")
             allowed = {"ready", "verified", "failed", "cancelled"} if self.verify else {
                 "ready", "running", "finished", "failed", "cancelled",
@@ -239,8 +249,13 @@ class Session:
             if not isinstance(reason, str) or len(reason) > 300:
                 raise ValueError("Invalid run message")
             if self.listing and state == "ready":
+                self.cleanup_supported = value.get("failureCleanupSupported") is True
+                self.capabilities = {key: value.get(key) is True for key in (
+                    "addressSubmitRetrySupported", "failureCleanupSupported")}
                 failure = None
-                if value.get("closeListingSupported") is not True:
+                if self.recover_failures and not all(self.capabilities.values()):
+                    failure = "Update Giveaways.js to 4.31 or later in this profile before enabling VM recovery."
+                elif value.get("closeListingSupported") is not True:
                     failure = "The connected userscript lacks its cleanup identifier; update enabled copies of Giveaways.js and check for duplicates."
                 elif value.get("windowTag") != self.window_tag:
                     failure = "The userscript's cleanup identifier does not match this scheduled window."
@@ -300,6 +315,8 @@ class Session:
             if progress is not None and progress != self.progress:
                 self.last_progress, self.progress = now, progress
             self.state, self.reason = state, reason
+            if state == "failed" and self.recover_failures and self.cleanup_supported:
+                return {"protocol": 1, "cancel": True, "closeRunTabs": True}
             return {"protocol": 1, "mode": "verify" if self.verify else "run", "cancel": False}
 
     def check_deadlines(self):
@@ -327,7 +344,8 @@ class Session:
             elif now - self.last_seen > 120:
                 self.state, self.reason = "failed", "Lost contact with the giveaway listing."
             elif now - self.last_progress > 180:
-                self.state, self.reason = "failed", "No giveaway progress for three minutes; the remaining profiles were stopped."
+                self.state, self.reason = "failed", ("No giveaway progress for three minutes."
+                    if self.recover_failures else "No giveaway progress for three minutes; the remaining profiles were stopped.")
             elif now - self.started > 45 * 60:
                 self.state, self.reason = "failed", "Account reached the 45-minute time limit."
 
@@ -407,7 +425,7 @@ def save_report(path, report):
     temporary.replace(path)
 
 
-def run_queue(settings, output, *, verify=False, immediate=False):
+def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False):
     run_started = datetime.now()
     base_starts = planned_starts(settings, run_started, immediate, randbelow=lambda _: 0)
     starts = planned_starts(settings, run_started, immediate)
@@ -447,7 +465,8 @@ def run_queue(settings, output, *, verify=False, immediate=False):
                 break
             tag = secrets.token_hex(16) if settings.get("closeCompletedListings") else None
             listing = ListingWindow(tag, settings["edgePath"]) if tag else None
-            session = Session(profile, verify, listing=listing, window_tag=tag)
+            session = Session(profile, verify, listing=listing, window_tag=tag,
+                              recover_failures=recover_failures)
             server.session = session
             if listing:
                 save_report(pending_path, {"startedAt": report["startedAt"], "profile": profile["name"],
@@ -472,12 +491,25 @@ def run_queue(settings, output, *, verify=False, immediate=False):
                         endedAt=datetime.now().astimezone().isoformat())
             if session.window_binding is not None:
                 item["windowBinding"] = {k: v for k, v in session.window_binding.items() if k != "started"}
+            item["capabilities"] = session.capabilities
+            if (recover_failures and listing and session.state == "failed" and session.cleanup_supported
+                    and listing.handle is not None):
+                # The authenticated listing closes only the tabs it opened when
+                # it receives closeRunTabs. Confirm closure before another account.
+                cleanup_deadline = time.monotonic() + 20
+                while not listing.closed() and time.monotonic() < cleanup_deadline:
+                    if session.cleanup_ready:
+                        listing.request_close()
+                    time.sleep(0.25)
+                if listing.closed():
+                    item.update(listingClosed=True, failureRecovered=True)
+                    pending_path.unlink(missing_ok=True)
             if listing and session.state in {"finished", "verified"}:
                 item["listingClosed"] = True
                 pending_path.unlink()
             save_report(report_path, report)
             logging.info("%s: %s %s", profile["name"], session.state, session.reason)
-            if session.state not in {"finished", "verified"}:
+            if session.state not in {"finished", "verified"} and not item.get("failureRecovered"):
                 # Keep cancellation available briefly, and never launch another profile.
                 time.sleep(5)
                 break
@@ -509,8 +541,14 @@ def main():
     parser.add_argument("--verify-only", action="store_true", help="Check each profile without opening entry tabs or sending keys")
     parser.add_argument("--now", action="store_true", help="Ignore the planned start times and random delays")
     parser.add_argument("--clear-pending", action="store_true", help="After inspecting and closing unfinished giveaway tabs, allow future scheduled runs")
+    parser.add_argument("--vm-recover-failures", action="store_true",
+                        help="In the dedicated VM, close authenticated failed runs before continuing later profiles")
     args = parser.parse_args()
     settings = read_settings(args.config)
+    if args.vm_recover_failures:
+        from VM.GuestWorkflow import is_hyperv_guest
+        if not is_hyperv_guest():
+            raise RuntimeError("Automatic failure cleanup is limited to the dedicated Hyper-V guest")
     if args.check:
         jitter = settings.get("startJitterMinutes", 0)
         for profile, start in zip(settings["profiles"], planned_starts(settings, datetime.now(), randbelow=lambda _: 0)):
@@ -546,7 +584,8 @@ def main():
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
                           "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
-        return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only)
+        return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
+                         recover_failures=args.vm_recover_failures)
     except Exception:
         logging.exception("Daily giveaway runner failed")
         raise

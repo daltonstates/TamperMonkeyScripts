@@ -311,11 +311,17 @@ function createPage({
             status: 200,
             responseText: JSON.stringify({
               protocol: 1,
-              mode: value.state === "ready" && now < startTime + dailyWindowWait
-                ? "wait" : dailyMode,
+              mode:
+                value.state === "ready" && now < startTime + dailyWindowWait
+                  ? "wait"
+                  : dailyMode,
               closeListing:
-                dailyCloseListing && ["finished", "verified"].includes(value.state),
-              cancel: dailyFailure === "cancel" && value.state === "running",
+                dailyCloseListing &&
+                ["finished", "verified"].includes(value.state),
+              cancel:
+                ["cancel", "cleanup"].includes(dailyFailure) &&
+                value.state === "running",
+              closeRunTabs: dailyFailure === "cleanup",
             }),
           });
         }, 0);
@@ -925,15 +931,25 @@ test("verification retains its launch identity when Goodreads cleans the URL bef
     dailyMode: "verify",
     dailyCloseListing: true,
   });
-  page.window.history.replaceState({}, "", `https://www.goodreads.com${automaticListPath}`);
+  page.window.history.replaceState(
+    {},
+    "",
+    `https://www.goodreads.com${automaticListPath}`,
+  );
   page.finishLoading();
   await page.advanceAsync(1500);
-  assert.deepEqual(page.dailyRequests.map((r) => r.state), ["ready", "verified"]);
+  assert.deepEqual(
+    page.dailyRequests.map((r) => r.state),
+    ["ready", "verified"],
+  );
   assert.equal(page.dailyRequests[0].windowTag, tag);
   assert.equal(page.openedTabs.length, 0);
   assert.equal(page.closeCount, 1);
   assert.equal(page.window.location.searchParams.get("autoload"), "1");
-  assert.equal(new URLSearchParams(page.window.location.hash.slice(1)).get("grDailyToken"), token);
+  assert.equal(
+    new URLSearchParams(page.window.location.hash.slice(1)).get("grDailyToken"),
+    token,
+  );
 });
 
 test("a cleaned autoload URL starts once without changing the saved preference and remains cancellable", async () => {
@@ -942,7 +958,11 @@ test("a cleaned autoload URL starts once without changing the saved preference a
     loading: true,
     listing: { pages: [[123, 456, 789, 999, 1000]] },
   });
-  page.window.history.replaceState({}, "", `https://www.goodreads.com${automaticListPath}`);
+  page.window.history.replaceState(
+    {},
+    "",
+    `https://www.goodreads.com${automaticListPath}`,
+  );
   page.finishLoading();
   await page.advanceAsync(1500);
   assert.equal(page.window.location.searchParams.get("autoload"), "1");
@@ -962,7 +982,11 @@ test("a launch flag is not restored after navigation to another giveaway filter"
     loading: true,
     listing: { pages: [[123]] },
   });
-  page.window.history.replaceState({}, "", "https://www.goodreads.com/giveaway?sort=recently_listed&format=print");
+  page.window.history.replaceState(
+    {},
+    "",
+    "https://www.goodreads.com/giveaway?sort=recently_listed&format=print",
+  );
   page.finishLoading();
   await page.advanceAsync(1500);
   assert.equal(page.window.location.searchParams.get("autoload"), null);
@@ -1933,6 +1957,58 @@ test("a lost parent heartbeat expires the helper marker", async () => {
   assert.equal(entry.document.title, "Giveaways | Goodreads");
 });
 
+test("a submitted address that stays on the page can retry after five seconds", async () => {
+  const page = keyfirePage();
+  await page.advanceAsync(1250);
+  const entry = createPage({
+    href: page.openedTabs[0].href,
+    stored: page.stored,
+    ready: true,
+  });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    assert.match(entry.document.title, /^\[GR Keyfire /);
+    entry.document.emit("submit");
+    assert.equal(entry.document.title, "Giveaways | Goodreads");
+    entry.advance(4750);
+    assert.equal(entry.document.title, "Giveaways | Goodreads");
+    entry.advance(250);
+  }
+  assert.match(entry.document.title, /^\[GR Keyfire /);
+  entry.document.emit("submit");
+  entry.advance(6000);
+  assert.equal(entry.document.title, "Giveaways | Goodreads");
+});
+
+for (const action of [
+  "pagehide",
+  "pointerdown",
+  "keydown",
+  "cancel",
+  "navigate",
+]) {
+  test(`address-submit recovery stops for ${action}`, async () => {
+    const page = keyfirePage();
+    await page.advanceAsync(1250);
+    const entry = createPage({
+      href: page.openedTabs[0].href,
+      stored: page.stored,
+      ready: true,
+    });
+    entry.document.emit("submit");
+    if (action === "pagehide") entry.window.emit("pagehide");
+    else if (action === "cancel") page.setAutoOpen(false);
+    else if (action === "navigate")
+      entry.window.location.pathname = "/giveaway";
+    else
+      entry.document.emit(action, {
+        key: "Tab",
+        target: entry.document.activeElement,
+      });
+    entry.advance(6000);
+    assert.equal(entry.document.title, "Giveaways | Goodreads");
+  });
+}
+
 test("per-tab Keyfire progress survives navigation to the entry form without the hash", async () => {
   const page = keyfirePage();
   await page.advanceAsync(1250);
@@ -2050,6 +2126,29 @@ function dailyPage(options = {}) {
     ...options,
   });
 }
+
+test("VM failure cleanup closes only its tracked tabs before closing its listing", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"e".repeat(32)}`,
+    dailyFailure: "cleanup",
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 1);
+  page.openedTabs[0].close = function () {};
+  await page.advanceAsync(4500);
+  assert.equal(page.closeCount, 0);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(
+    page.dailyRequests.some((r) => r.state === "cleanup-ready"),
+    false,
+  );
+  page.openedTabs[0].closed = true;
+  page.openedTabs[0].onclose();
+  await page.advanceAsync(500);
+  assert.equal(page.dailyRequests.at(-1).state, "cleanup-ready");
+  assert.equal(page.closeCount, 1);
+  assert.equal(page.openedTabs.length, 1);
+});
 
 test("a delayed scheduled window waits without requesting a macro or opening tabs", async () => {
   const page = dailyPage({ dailyWindowWait: 8000, dailyMode: "verify" });

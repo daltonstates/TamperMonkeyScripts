@@ -49,6 +49,9 @@ function Read-VMSettings($Path) {
     foreach ($field in @('memoryGB', 'processors', 'diskGB', 'maximumRuntimeMinutes')) {
         if ($settings.$field -isnot [int] -and $settings.$field -isnot [long]) { throw 'VM resource limits must be whole numbers.' }
     }
+    if ($settings.PSObject.Properties.Name -contains 'recoverSavedFailures' -and $settings.recoverSavedFailures -isnot [bool]) {
+        throw 'Saved failure recovery must be a boolean.'
+    }
     if ($settings.schema -ne 1 -or $settings.vmName -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,63}$' -or
         $settings.memoryGB -lt 4 -or $settings.memoryGB -gt 16 -or
         $settings.processors -lt 2 -or $settings.processors -gt 8 -or
@@ -88,15 +91,71 @@ function Start-GiveawaysMorningVM($Settings) {
     switch ($previousState) {
         'Running' { $action = 'already-running' }
         'Off' { Start-VM -VM $vm; $action = 'started' }
+        'Saved' {
+            Reset-GiveawaysSavedFailure $Settings
+            Start-VM -VM (Get-OwnedGiveawaysVM $Settings)
+            $action = 'recovered-started'
+        }
         default { throw "VM is $previousState; it was left alone. Inspect saved or paused unfinished work before resuming it manually." }
     }
     return [pscustomobject]@{ previousState = $previousState; action = $action }
+}
+
+function Save-GiveawaysFailure($Settings) {
+    $vm = Get-OwnedGiveawaysVM $Settings
+    if ([string]$vm.State -ne 'Running') { throw 'Only the owned running failure can be saved.' }
+    Stop-VM -VM $vm -Save -Confirm:$false
+    $disk = Get-Item -LiteralPath $Settings.diskPath
+    Write-VMJson (Join-Path $Settings.reportDirectory 'host-saved-failure.json') @{
+        vmId = $Settings.vmId; vmName = $Settings.vmName
+        savedAt = [DateTimeOffset]::Now.ToString('o')
+        diskLength = $disk.Length; diskLastWriteUtc = $disk.LastWriteTimeUtc.ToString('o')
+    }
+}
+
+function Reset-GiveawaysSavedFailure($Settings) {
+    $proofPath = Join-Path $Settings.reportDirectory 'host-saved-failure.json'
+    if ($Settings.recoverSavedFailures -ne $true -or -not (Test-Path -LiteralPath $proofPath)) {
+        throw 'VM is Saved; it was left alone. No matching unattended failure recovery is enabled.'
+    }
+    $proof = Get-Content -LiteralPath $proofPath -Raw | ConvertFrom-Json
+    $disk = Get-Item -LiteralPath $Settings.diskPath
+    if ($proof.vmId -ne $Settings.vmId -or $proof.vmName -ne $Settings.vmName -or
+        [DateTimeOffset]::Parse($proof.savedAt).LocalDateTime.Date -ge (Get-Date).Date -or
+        $proof.diskLength -ne $disk.Length -or $proof.diskLastWriteUtc -ne $disk.LastWriteTimeUtc.ToString('o')) {
+        throw 'The saved VM no longer matches an unchanged previous-day watchdog failure; it was left alone.'
+    }
+    $vm = Get-OwnedGiveawaysVM $Settings
+    if ([string]$vm.State -ne 'Saved') { throw 'The VM changed state before saved-failure recovery.' }
+    # Old run markers have expired. Resume only to request a normal guest
+    # shutdown, then start a fresh console instead of reusing yesterday's run.
+    Start-VM -VM $vm
+    $job = Stop-VM -VM (Get-OwnedGiveawaysVM $Settings) -AsJob -Confirm:$false
+    try {
+        if (-not (Wait-Job -Job $job -Timeout 60)) { throw 'The old guest did not shut down within 60 seconds.' }
+        Receive-Job -Job $job -ErrorAction Stop | Out-Null
+        if ([string](Get-OwnedGiveawaysVM $Settings).State -ne 'Off') { throw 'The old guest did not power off.' }
+        $history = Join-Path $Settings.reportDirectory 'history'
+        New-Item -ItemType Directory -Path $history -Force | Out-Null
+        Move-Item -LiteralPath $proofPath -Destination (Join-Path $history ('recovered-saved-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.json'))
+    } catch {
+        if ([string](Get-OwnedGiveawaysVM $Settings).State -eq 'Running') { Save-GiveawaysFailure $Settings }
+        throw
+    } finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
 }
 
 function Export-VMGuestReports($Settings) {
     $vm = Get-OwnedGiveawaysVM $Settings
     if ([string]$vm.State -ne 'Off') { throw 'Reports can be read only after the VM shuts down.' }
     if ((Get-VHD -Path $Settings.diskPath).Attached) { throw 'The VM disk is already attached; it was not changed.' }
+    $readerRoot = Split-Path -Parent $Settings.reportDirectory
+    $reader = Join-Path $readerRoot 'Read-GuestReports.py'
+    $python = Join-Path $readerRoot 'runtime\python.exe'
+    if ((Test-Path -LiteralPath $reader) -and (Test-Path -LiteralPath $python)) {
+        & $python $reader --disk $Settings.diskPath --output $Settings.reportDirectory
+        if ($LASTEXITCODE -ne 0) { throw 'The read-only guest report reader failed; see its diagnostic output.' }
+        return Get-Content -LiteralPath (Join-Path $Settings.reportDirectory 'vm-last-run.json') -Raw | ConvertFrom-Json
+    }
     $mountPath = Join-Path (Split-Path -Parent $Settings.reportDirectory) ('mount-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $mountPath -Force | Out-Null
     $partition = $null

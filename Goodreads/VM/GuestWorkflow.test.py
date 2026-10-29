@@ -74,7 +74,7 @@ class GuestWorkflowTests(unittest.TestCase):
 
     def exercise(self, *, verify=False, keep_running=False, states=None, stale=False,
                  exit_code=0, timeout=False, shutdown_code=0, power_ok=True, outside_window=False,
-                 shutdown_after_success=False):
+                 shutdown_after_success=False, recover=False):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder)
             config = output / "daily-settings.json"
@@ -100,7 +100,7 @@ class GuestWorkflowTests(unittest.TestCase):
                  patch.object(guest.subprocess, "Popen", return_value=child) as launch, \
                  patch.object(guest.subprocess, "run", return_value=MagicMock(returncode=shutdown_code)) as shutdown:
                 code = guest.run({"enabled": True, "dailySettings": str(config), "dailyRunner": "DailyGiveaways.py",
-                                  "shutdownAfterSuccess": shutdown_after_success},
+                                  "shutdownAfterSuccess": shutdown_after_success, "recoverFailedProfiles": recover},
                                  verify_only=verify, keep_running=keep_running)
                 report_path = output / ("vm-last-skip.json" if outside_window else "vm-last-run.json")
                 return code, json.loads(report_path.read_text()), launch, shutdown, power
@@ -141,6 +141,36 @@ class GuestWorkflowTests(unittest.TestCase):
         code, report, _, shutdown, _ = self.exercise(states=["finished", "failed"], exit_code=1)
         self.assertEqual((code, report["state"]), (1, "failed"))
         shutdown.assert_not_called()
+
+    def test_closed_failed_vm_queue_shuts_down_without_marking_success(self):
+        code, report, launch, shutdown, _ = self.exercise(
+            states=["finished", "failed"], exit_code=1, recover=True, shutdown_after_success=True)
+        self.assertEqual((code, report["state"]), (1, "failed-cleaned"))
+        self.assertIn("--vm-recover-failures", launch.call_args.args[0])
+        shutdown.assert_called_once()
+        code, report, _, shutdown, _ = self.exercise(
+            stale=True, recover=True, exit_code=1, shutdown_after_success=True)
+        self.assertEqual(report["state"], "failed")
+        shutdown.assert_not_called()
+
+    def test_previous_day_recovery_preserves_reports_and_refuses_open_windows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            started = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            pending = {"startedAt": started}
+            report = {"startedAt": started, "endedAt": started, "verificationOnly": False,
+                      "profiles": [{"name": "A", "directory": "Default", "startedAt": started, "state": "failed"}]}
+            (output / "daily-incomplete.json").write_text(json.dumps(pending))
+            (output / "daily-last-run.json").write_text(json.dumps(report))
+            settings = {"profiles": [{"name": "A", "directory": "Default"}], "edgePath": "edge.exe"}
+            with patch.object(guest, "browser_window_open", return_value=True), patch.object(guest.subprocess, "run") as clear:
+                with self.assertRaisesRegex(RuntimeError, "safely retired"):
+                    guest.recover_previous_day(output, settings, ["python", "daily.py"])
+                clear.assert_not_called()
+            with patch.object(guest, "browser_window_open", return_value=False), patch.object(guest.subprocess, "run") as clear:
+                self.assertTrue(guest.recover_previous_day(output, settings, ["python", "daily.py"]))
+                self.assertEqual(clear.call_args.args[0][-1], "--clear-pending")
+                self.assertEqual(len(list((output / "history").glob("*/daily-incomplete.json"))), 1)
 
     def test_incomplete_profile_report_is_failure(self):
         code, report, _, shutdown, _ = self.exercise(states=["finished"])

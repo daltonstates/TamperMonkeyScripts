@@ -22,7 +22,7 @@ foreach ($sidText in @('S-1-5-18', 'S-1-5-32-544')) {
 }
 $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($operator, 'ReadAndExecute', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
 Set-Acl -LiteralPath $runtime -AclObject $acl
-foreach ($name in @('VM.Common.ps1', 'Invoke-VMWorkflow.ps1', 'New-GiveawaysVM.ps1')) {
+foreach ($name in @('VM.Common.ps1', 'Invoke-VMWorkflow.ps1', 'New-GiveawaysVM.ps1', 'Read-GuestReports.py')) {
     $source = Join-Path $PSScriptRoot $name
     $target = Join-Path $runtime $name
     if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($target)) { Copy-Item -LiteralPath $source -Destination $target -Force }
