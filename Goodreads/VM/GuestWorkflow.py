@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import secrets
-from urllib.parse import quote
+import threading
 
 
 def is_hyperv_guest():
@@ -139,16 +139,43 @@ def recover_previous_day(output, daily_settings, command):
 
 
 def warmup_userscript_updates(daily_settings, wait_seconds=45):
-    """Let each VM profile's native Tampermonkey updater run before entry tabs."""
+    """Wake each profile's extension on a listing in verification-only mode."""
     if not is_hyperv_guest():
         raise RuntimeError("Userscript update preflight is limited to the dedicated Hyper-V guest")
-    from DailyGiveaways import ListingWindow
+    from DailyGiveaways import ListingWindow, Server, Handler, PORT
     windows = []
+    tokens = {}
+    ready_at = time.monotonic() + min(20, wait_seconds / 2)
+    class Preflight:
+        def event(self, value):
+            token = value.get("token")
+            if not isinstance(token, str) or token not in tokens or value.get("windowTag") != tokens[token]:
+                raise ValueError("Unknown update preflight")
+            return {"protocol": 1, "mode": "wait" if time.monotonic() < ready_at else "verify",
+                    "cancel": False, "closeListing": False}
+    server = Server(("127.0.0.1", PORT), Handler)
+    server.session = Preflight()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    helper = Path(__file__).resolve().parents[1] / "KeyfireGiveaways.py"
+    try:
+        subprocess.Popen([str(Path(sys.executable).with_name("pythonw.exe")), str(helper),
+                          "--config", daily_settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
+        return _warmup_profile_windows(daily_settings, wait_seconds, windows, tokens, ListingWindow)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _warmup_profile_windows(daily_settings, wait_seconds, windows, tokens, window_type):
     for profile in daily_settings["profiles"]:
         tag = secrets.token_hex(16)
-        title = f"[GR Daily {tag}] Goodreads userscript update preflight"
-        url = "data:text/html," + quote(f"<title>{title}</title><p>Checking automatic userscript updates.</p>")
-        window = ListingWindow(tag, daily_settings["edgePath"])
+        token = secrets.token_hex(32)
+        tokens[token] = tag
+        # This filter cannot auto-open entries. The temporary authenticated
+        # coordinator only returns verify/wait, never a run instruction.
+        url = ("https://www.goodreads.com/giveaway?sort=recently_listed&format=kindle"
+               f"#grDailyToken={token}&grDailyWindow={tag}")
+        window = window_type(tag, daily_settings["edgePath"])
         windows.append(window)
         subprocess.Popen([daily_settings["edgePath"], f'--user-data-dir={daily_settings["userDataDirectory"]}',
                           f'--profile-directory={profile["directory"]}', "--new-window", url],

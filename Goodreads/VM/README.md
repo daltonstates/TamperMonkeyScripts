@@ -235,9 +235,11 @@ contains Node and `classic-level`; generated dependencies stay outside Git.
 `Continue-VMWorkflowRepair.ps1` runs the repair through PowerShell Direct and
 records the settings readback and verification results without dashboard clicks.
 
-With `preflightUserScriptUpdates` enabled, the guest opens owned blank windows
-for its configured profiles for 45 seconds before the queue. Tampermonkey can
-update in that interval. These windows are closed by their random identities
+With `preflightUserScriptUpdates` enabled, the guest opens owned verification
+windows for its configured profiles for 45 seconds before the queue. A
+temporary coordinator only returns verification instructions on a listing
+whose filter cannot auto-open entries. This wakes Tampermonkey in every
+profile so it can update. The windows are closed by their random identities
 before any giveaway entry opens. Verification records the installed userscript
 version as well as the protocol capabilities. Userscript updates cover the
 JavaScript only; Python and host tooling still require a validated deployment.

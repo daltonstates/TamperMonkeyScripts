@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 
 spec = importlib.util.spec_from_file_location("vm_guest_workflow", Path(__file__).with_name("GuestWorkflow.py"))
 guest = importlib.util.module_from_spec(spec)
@@ -16,19 +18,27 @@ spec.loader.exec_module(guest)
 
 
 class GuestWorkflowTests(unittest.TestCase):
-    def test_update_preflight_opens_only_owned_blank_vm_windows_and_closes_them(self):
-        settings={"edgePath":"edge.exe","userDataDirectory":"C:/profiles",
+    def test_update_preflight_opens_only_owned_verification_windows_and_closes_them(self):
+        settings={"edgePath":"edge.exe","userDataDirectory":"C:/profiles","keyfireConfig":"macro.json",
                   "profiles":[{"name":str(i),"directory":str(i)} for i in range(3)]}
         window=MagicMock()
         window.closed.side_effect=[False,True,True]*3
         with patch.object(guest,"is_hyperv_guest",return_value=True), \
              patch("DailyGiveaways.ListingWindow",return_value=window), \
+             patch("DailyGiveaways.Server") as server, \
              patch.object(guest.subprocess,"Popen") as launch, patch.object(guest.time,"sleep"):
             result=guest.warmup_userscript_updates(settings)
-        self.assertEqual(len(launch.call_args_list),3)
+        self.assertEqual(len(launch.call_args_list),4)
         self.assertEqual(result["profiles"],["0","1","2"])
-        self.assertTrue(all(call.args[0][-1].startswith("data:text/html,") for call in launch.call_args_list))
-        self.assertTrue(all("goodreads.com/giveaway" not in call.args[0][-1] for call in launch.call_args_list))
+        urls=[call.args[0][-1] for call in launch.call_args_list[1:]]
+        self.assertTrue(all("sort=recently_listed&format=kindle" in url for url in urls))
+        self.assertTrue(all("enter_choose_address" not in url for url in urls))
+        from urllib.parse import urlsplit, parse_qs
+        metadata=parse_qs(urlsplit(urls[0]).fragment)
+        payload={"token":metadata['grDailyToken'][0],"windowTag":metadata['grDailyWindow'][0],"state":"ready"}
+        self.assertEqual(server.return_value.session.event(payload)['mode'],'wait')
+        with patch.object(guest.time,'monotonic',return_value=float('inf')):
+            self.assertEqual(server.return_value.session.event(payload)['mode'],'verify')
         with patch.object(guest,"is_hyperv_guest",return_value=False), patch.object(guest.subprocess,"Popen") as launch:
             with self.assertRaisesRegex(RuntimeError,"Hyper-V guest"):
                 guest.warmup_userscript_updates(settings)
