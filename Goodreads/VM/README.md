@@ -132,16 +132,18 @@ Copy-VMFile -VMName 'GoodreadsGiveaways' -SourcePath $zip -DestinationPath 'C:\U
 Extract the package inside the guest. In every guest Edge profile:
 
 1. Sign into the intended Goodreads account.
-2. Install the current `Goodreads/Giveaways.js`, **4.33 or later**, in
+2. Install the current `Goodreads/Giveaways.js`, **4.34 or later**, in
    Tampermonkey, with the current Python runner for bounded startup-window
    retries. Version 4.33 waits for result navigation after Submit instead of
    closing the entry tab while the request may still be pending. Avoid duplicate
    enabled copies.
 3. In Tampermonkey Settings, select Advanced configuration and set Content
    Script API to **UserScripts API Dynamic**.
-4. Save the intended genre filters and Keyfire macro selection, and enable
-   **Use Keyfire workflow**. The optional Keyfire profile is independent of the
-   Edge profile. Auto on load may stay off.
+4. Open the **Giveaway settings** gear in each guest profile. Save the intended
+   genre filters, pacing, and Keyfire macro selection, and enable **Use Keyfire
+   workflow**. The optional Keyfire profile is independent of the Edge profile.
+   Auto on load may stay off. Timing values belong to that browser profile and
+   do not modify the macro's own saved delays.
 
 Run the guest installer in elevated PowerShell **under the guest account that
 will run the workflow**, replacing the extracted-package path:

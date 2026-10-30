@@ -15,13 +15,34 @@ const exampleKeyfireSettings = {
   profile: "Books",
   browser: "edge",
 };
+const automationSettingsKey = "gr_automation_settings";
+const defaultAutomationSettings = Object.freeze({
+  giveawayDelaySeconds: 2,
+  resultCloseDelaySeconds: 1,
+  pageLoadTimeoutSeconds: 10,
+  maxReloads: 3,
+});
+// Older workflow scenarios explicitly retain their original timing fixtures.
+// New settings/default tests pass automationSettings: null for actual empty
+// storage, or provide their intended timing values; production defaults stay
+// entirely in the userscript and are tested separately below.
+const legacyAutomationSettings = Object.freeze({
+  giveawayDelaySeconds: 0,
+  resultCloseDelaySeconds: 0,
+  pageLoadTimeoutSeconds: 5,
+  maxReloads: 3,
+});
 
 function eventTarget() {
   const listeners = new Map();
   return {
     addEventListener(type, callback, options = {}) {
       const entries = listeners.get(type) || [];
-      entries.push({ callback, once: options.once });
+      entries.push({
+        callback,
+        once: options.once,
+        capture: options === true || Boolean(options.capture),
+      });
       listeners.set(type, entries);
     },
     removeEventListener(type, callback) {
@@ -33,10 +54,24 @@ function eventTarget() {
       );
     },
     emit(type, event = {}) {
-      for (const entry of [...(listeners.get(type) || [])]) {
+      event.type ??= type;
+      event.target ??= this;
+      event.defaultPrevented ??= false;
+      event.preventDefault ??= () => { event.defaultPrevented = true; };
+      event.stopPropagation ??= () => { event.propagationStopped = true; };
+      event.stopImmediatePropagation ??= () => {
+        event.propagationStopped = true;
+        event.immediatePropagationStopped = true;
+      };
+      const entries = [...(listeners.get(type) || [])].sort(
+        (a, b) => Number(b.capture) - Number(a.capture),
+      );
+      for (const entry of entries) {
+        if (event.immediatePropagationStopped) break;
         if (entry.once) this.removeEventListener(type, entry.callback);
         entry.callback(event);
       }
+      return event;
     },
   };
 }
@@ -58,7 +93,11 @@ function createPage({
   dailyFailure = null,
   dailyCloseListing = false,
   dailyWindowWait = 0,
+  automationSettings = legacyAutomationSettings,
 } = {}) {
+  if (automationSettings !== null && !stored.has(automationSettingsKey)) {
+    stored.set(automationSettingsKey, JSON.stringify(automationSettings));
+  }
   let now = startTime;
   let nextTimerId = 0;
   const timers = new Map();
@@ -108,12 +147,21 @@ function createPage({
       focusCount: 0,
       appendChild(child) {
         this.children.push(child);
+        child.parentElement = this;
+        child.parentNode = this;
+        return child;
       },
       setAttribute(name, value) {
         this[name] = value;
       },
       getAttribute(name) {
         return this[name] ?? null;
+      },
+      removeAttribute(name) {
+        delete this[name];
+      },
+      contains(child) {
+        return this === child || this.children.some((node) => node.contains?.(child));
       },
       querySelector() {
         return null;
@@ -362,9 +410,11 @@ function createPage({
       const tab = {
         href,
         options,
+        openedAt: now,
         closed: false,
         close() {
           this.closed = true;
+          this.closedAt = now;
           this.onclose?.();
         },
       };
@@ -653,8 +703,12 @@ test("the giveaway list waits for the DOM and initializes its controls", () => {
   assert.deepEqual(page.navigations, []);
 });
 
-test("completed giveaways still close immediately", () => {
-  const page = createPage({ pathname: "/giveaway/show/123", loading: true });
+test("a configured zero result delay still closes completed giveaways immediately", () => {
+  const page = createPage({
+    pathname: "/giveaway/show/123",
+    loading: true,
+    automationSettings: { ...defaultAutomationSettings, resultCloseDelaySeconds: 0 },
+  });
   assert.equal(page.closeCount, 1);
   page.advance(120000);
   assert.deepEqual(page.navigations, []);
@@ -2785,4 +2839,514 @@ test("custom macro, optional profile, and browser reach the authenticated batch"
     .update(`${hash.get("grKeyfireRun")}:${config}`)
     .digest("hex");
   assert.equal(hash.get("grKeyfireProof"), expected);
+});
+
+const timingInputIds = {
+  giveawayDelaySeconds: "gr-setting-giveaway-delay",
+  resultCloseDelaySeconds: "gr-setting-result-delay",
+  pageLoadTimeoutSeconds: "gr-setting-load-timeout",
+  maxReloads: "gr-setting-retry-limit",
+};
+
+function timingValues(page) {
+  return Object.fromEntries(
+    Object.entries(timingInputIds).map(([key, id]) => [
+      key,
+      Number(page.document.querySelector(`#${id}`).value),
+    ]),
+  );
+}
+
+function changeTiming(page, key, value) {
+  const input = page.document.querySelector(`#${timingInputIds[key]}`);
+  assert.ok(input, `Timing input ${key} must be available`);
+  input.value = String(value);
+  input.emit("change", { target: input });
+}
+
+async function advanceTo(page, timestamp) {
+  assert.ok(timestamp >= page.now, "Test cannot move its clock backwards");
+  await page.advanceAsync(timestamp - page.now);
+}
+
+test("empty storage uses the production timing defaults behind a closed gear panel", () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    automationSettings: null,
+  });
+  const toggle = page.document.querySelector("#gr-settings-toggle");
+  const panel = page.document.querySelector("#gr-settings");
+  assert.ok(toggle);
+  assert.equal(toggle.tagName, "button");
+  assert.ok(toggle.getAttribute("aria-label") || toggle.textContent.trim());
+  assert.equal(toggle.getAttribute("aria-controls"), "gr-settings");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(panel.hidden, true);
+  assert.deepEqual(timingValues(page), defaultAutomationSettings);
+  const status = page.document.querySelector("#gr-workflow-status");
+  assert.equal(panel.contains(status), false);
+  assert.equal(page.document.querySelector("#gr-controls").contains(status), true);
+  assert.equal(page.helperRequests.length, 0);
+});
+
+test("gear and close controls update visibility, accessible state, and keyboard focus", () => {
+  const page = createPage({ pathname: automaticListPath, automationSettings: null });
+  const toggle = page.document.querySelector("#gr-settings-toggle");
+  const close = page.document.querySelector("#gr-settings-close");
+  const panel = page.document.querySelector("#gr-settings");
+  toggle.click();
+  assert.equal(panel.hidden, false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(page.document.activeElement, close);
+  close.click();
+  assert.equal(panel.hidden, true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(page.document.activeElement, toggle);
+  toggle.click();
+  toggle.click();
+  assert.equal(panel.hidden, true);
+});
+
+test("Escape closes the settings panel without cancelling the JavaScript giveaway queue", async () => {
+  const page = keyfirePage(undefined, {
+    automationSettings: { ...defaultAutomationSettings, giveawayDelaySeconds: 0 },
+  });
+  await page.advanceAsync(1500);
+  const toggle = page.document.querySelector("#gr-settings-toggle");
+  const panel = page.document.querySelector("#gr-settings");
+  toggle.click();
+  let laterHandlerCalls = 0;
+  page.document.addEventListener("keydown", () => laterHandlerCalls++);
+  const event = page.document.emit("keydown", { key: "Escape", target: page.document.activeElement });
+  assert.equal(panel.hidden, true);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(laterHandlerCalls, 0);
+  assert.equal(page.document.activeElement, toggle);
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.localStorage.getItem("gr_keyfire_enabled"), "1");
+  // Once closed, Escape is not consumed by the panel. A native Windows helper
+  // hook is outside this DOM model and is not claimed to be suppressed here.
+  const closedEvent = page.document.emit("keydown", { key: "Escape" });
+  assert.equal(closedEvent.defaultPrevented, false);
+  assert.equal(laterHandlerCalls, 1);
+});
+
+test("an incomplete requested Keyfire setup opens the hidden panel at its macro field", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_keyfire_enabled", "1"]]),
+    listing: { pages: [[123]] },
+    automationSettings: null,
+  });
+  page.document.querySelector("#gr-open-all-btn").click();
+  await page.advanceAsync(1500);
+  assert.equal(page.document.querySelector("#gr-settings").hidden, false);
+  assert.equal(page.document.querySelector("#gr-keyfire-setup").open, true);
+  assert.equal(page.document.activeElement, page.document.querySelector("#gr-keyfire-macro"));
+  assert.equal(page.openedTabs.length, 0);
+  assert.equal(page.helperRequests.length, 0);
+});
+
+test("timing controls expose supported bounds and persist changes across page loads", () => {
+  const page = createPage({ pathname: automaticListPath, automationSettings: null });
+  const constraints = {
+    giveawayDelaySeconds: [0, 60, 0.5],
+    resultCloseDelaySeconds: [0, 30, 0.5],
+    pageLoadTimeoutSeconds: [1, 30, 1],
+    maxReloads: [0, 3, 1],
+  };
+  for (const [key, [min, max, step]] of Object.entries(constraints)) {
+    const input = page.document.querySelector(`#${timingInputIds[key]}`);
+    assert.equal(input.type, "number");
+    assert.equal(Number(input.min), min);
+    assert.equal(Number(input.max), max);
+    assert.equal(Number(input.step), step);
+  }
+  const values = {
+    giveawayDelaySeconds: 2.5,
+    resultCloseDelaySeconds: 4.5,
+    pageLoadTimeoutSeconds: 17,
+    maxReloads: 1,
+  };
+  for (const [key, value] of Object.entries(values)) changeTiming(page, key, value);
+  assert.deepEqual(JSON.parse(page.stored.get(automationSettingsKey)), values);
+  const next = createPage({ pathname: automaticListPath, stored: page.stored, automationSettings: null });
+  assert.deepEqual(timingValues(next), values);
+  assert.equal(next.document.querySelector("#gr-settings").hidden, true);
+});
+
+for (const value of ["not JSON", "null", "[]", "true", "42"]) {
+  test(`invalid saved automation settings ${value} fall back to defaults`, () => {
+    const page = createPage({
+      pathname: automaticListPath,
+      stored: new Map([[automationSettingsKey, value]]),
+      automationSettings: null,
+    });
+    assert.deepEqual(timingValues(page), defaultAutomationSettings);
+  });
+}
+
+test("saved timing values are bounded and invalid individual values use defaults", () => {
+  const cases = [
+    [{ giveawayDelaySeconds: -5, resultCloseDelaySeconds: 99, pageLoadTimeoutSeconds: 0, maxReloads: 100 },
+      { giveawayDelaySeconds: 0, resultCloseDelaySeconds: 30, pageLoadTimeoutSeconds: 1, maxReloads: 3 }],
+    [{ giveawayDelaySeconds: 60.5, resultCloseDelaySeconds: -1, pageLoadTimeoutSeconds: 500, maxReloads: -2 },
+      { giveawayDelaySeconds: 60, resultCloseDelaySeconds: 0, pageLoadTimeoutSeconds: 30, maxReloads: 0 }],
+    [{ giveawayDelaySeconds: "", resultCloseDelaySeconds: false, pageLoadTimeoutSeconds: "wrong", maxReloads: null },
+      defaultAutomationSettings],
+    [{ giveawayDelaySeconds: 2.5 }, { ...defaultAutomationSettings, giveawayDelaySeconds: 2.5 }],
+  ];
+  for (const [saved, expected] of cases) {
+    const page = createPage({
+      pathname: automaticListPath,
+      stored: new Map([[automationSettingsKey, JSON.stringify(saved)]]),
+      automationSettings: null,
+    });
+    assert.deepEqual(timingValues(page), expected);
+  }
+});
+
+test("resetting timing preserves filters, tab cap, and the user's macro selection", () => {
+  const unrelated = new Map([
+    ["gr_filter_enabled", "0"],
+    ["gr_blocked_genres", JSON.stringify(["Mystery"])],
+    ["gr_max_open_tabs", "3"],
+    ["gr_keyfire_enabled", "1"],
+    ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+  ]);
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map(unrelated),
+    automationSettings: { giveawayDelaySeconds: 11, resultCloseDelaySeconds: 7, pageLoadTimeoutSeconds: 3, maxReloads: 0 },
+  });
+  page.document.querySelector("#gr-settings-reset-timing").click();
+  assert.deepEqual(timingValues(page), defaultAutomationSettings);
+  assert.deepEqual(JSON.parse(page.stored.get(automationSettingsKey)), defaultAutomationSettings);
+  for (const [key, value] of unrelated) assert.equal(page.stored.get(key), value, key);
+  assert.equal(Number(page.document.querySelector("#gr-tab-limit-input").value), 3);
+  assert.equal(page.helperRequests.length, 0);
+});
+
+test("pure Tampermonkey openings use the default gap and keep the configured tab cap", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"], ["gr_max_open_tabs", "2"]]),
+    listing: { pages: [[123, 456, 789]] },
+    automationSettings: null,
+    helperFailure: "offline",
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 1);
+  const first = page.openedTabs[0];
+  assert.equal(first.options.active, false);
+  await advanceTo(page, first.openedAt + 1999);
+  assert.equal(page.openedTabs.length, 1);
+  await page.advanceAsync(1);
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.openedTabs[1].openedAt - first.openedAt, 2000);
+  await page.advanceAsync(5000);
+  assert.equal(page.openedTabs.length, 2, "A pacing gap must not bypass the tab cap");
+  first.close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 3);
+  assert.equal(page.openedTabs.filter((tab) => !tab.closed).length, 2);
+  assert.equal(page.helperRequests.length, 0);
+  assert.equal(page.dailyRequests.length, 0);
+});
+
+test("lowering the tab cap during a pacing wait blocks the queued tab until capacity is free", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"], ["gr_max_open_tabs", "3"]]),
+    listing: { pages: [[123, 456, 789]] },
+    automationSettings: null,
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 1);
+  const cap = page.document.querySelector("#gr-tab-limit-input");
+  cap.value = "1";
+  cap.emit("change");
+  await page.advanceAsync(5000);
+  assert.equal(page.openedTabs.length, 1);
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.openedTabs.filter((tab) => !tab.closed).length, 1);
+  assert.equal(page.stored.get("gr_max_open_tabs"), "1");
+});
+
+test("a blocked slot wait rechecks a lower tab cap after each tab closes", async () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_auto_open_all", "1"], ["gr_max_open_tabs", "2"]]),
+    listing: { pages: [[123, 456, 789]] },
+    automationSettings: { ...defaultAutomationSettings, giveawayDelaySeconds: 0 },
+  });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 2);
+  const cap = page.document.querySelector("#gr-tab-limit-input");
+  cap.value = "1";
+  cap.emit("change");
+  page.openedTabs[0].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 2, "One remaining tab already fills the reduced cap");
+  page.openedTabs[1].close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 3);
+  assert.equal(page.openedTabs.filter((tab) => !tab.closed).length, 1);
+});
+
+test("Keyfire opens the first giveaway immediately and starts the gap after the previous tab closes", async () => {
+  const page = keyfirePage(undefined, { automationSettings: null });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 1);
+  const first = page.openedTabs[0];
+  assert.ok(first.openedAt <= 1500, "There must be no initial two-second pacing wait");
+  await page.advanceAsync(10000);
+  assert.equal(page.openedTabs.length, 1);
+  first.close();
+  await page.flush();
+  assert.equal(page.openedTabs.length, 1);
+  await page.advanceAsync(1999);
+  assert.equal(page.openedTabs.length, 1);
+  await page.advanceAsync(1);
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.openedTabs[1].openedAt - first.closedAt, 2000);
+  assert.equal(page.openedTabs[1].options.active, true);
+  const config = new URLSearchParams(new URL(first.href).hash.slice(1)).get("grKeyfireConfig");
+  assert.deepEqual(JSON.parse(Buffer.from(config, "base64url").toString("utf8")), exampleKeyfireSettings);
+});
+
+for (const seconds of [0, 0.5, 60]) {
+  test(`giveaway delay ${seconds} seconds uses its exact supported boundary`, async () => {
+    const page = keyfirePage(undefined, {
+      automationSettings: { ...defaultAutomationSettings, giveawayDelaySeconds: seconds },
+    });
+    await page.advanceAsync(1500);
+    const first = page.openedTabs[0];
+    first.close();
+    await page.flush();
+    if (seconds > 0) {
+      assert.match(
+        page.document.querySelector("#gr-open-all-btn").textContent,
+        new RegExp(`Next giveaway in ${Math.ceil(seconds)}s`),
+      );
+      await page.advanceAsync(seconds * 1000 - 1);
+      assert.equal(page.openedTabs.length, 1);
+      await page.advanceAsync(1);
+    }
+    assert.equal(page.openedTabs.length, 2);
+    assert.equal(page.openedTabs[1].openedAt - first.closedAt, seconds * 1000);
+  });
+}
+
+for (const cancellation of ["auto", "keyfire", "pagehide"]) {
+  test(`cancelling by ${cancellation} during a giveaway gap prevents the queued opening`, async () => {
+    const page = keyfirePage(undefined, { automationSettings: null });
+    await page.advanceAsync(1500);
+    page.openedTabs[0].close();
+    await page.flush();
+    await page.advanceAsync(500);
+    if (cancellation === "auto") page.setAutoOpen(false);
+    else if (cancellation === "keyfire") page.setKeyfire(false);
+    else page.window.emit("pagehide");
+    await page.advanceAsync(65000);
+    assert.equal(page.openedTabs.length, 1);
+    assert.deepEqual(page.alerts, []);
+    assert.doesNotMatch(page.document.querySelector("#gr-open-all-btn").textContent, /Next giveaway in/);
+  });
+}
+
+test("changing a delay preserves an in-flight wait and applies to the next gap", async () => {
+  const page = keyfirePage({ pages: [[123, 456, 789]] }, { automationSettings: null });
+  await page.advanceAsync(1500);
+  page.openedTabs[0].close();
+  await page.flush();
+  const firstClosedAt = page.openedTabs[0].closedAt;
+  await page.advanceAsync(500);
+  changeTiming(page, "giveawayDelaySeconds", 10);
+  await advanceTo(page, firstClosedAt + 2000);
+  assert.equal(page.openedTabs.length, 2);
+  page.openedTabs[1].close();
+  await page.flush();
+  await page.advanceAsync(9999);
+  assert.equal(page.openedTabs.length, 2);
+  await page.advanceAsync(1);
+  assert.equal(page.openedTabs.length, 3);
+  assert.equal(page.openedTabs[2].openedAt - page.openedTabs[1].closedAt, 10000);
+});
+
+test("the inter-giveaway gap survives a capped batch refresh", async () => {
+  const first = keyfirePage({ pages: giveawayPages(1, 200) });
+  await first.advanceAsync(4500);
+  await closeBatch(first, 99);
+  changeTiming(first, "giveawayDelaySeconds", 5);
+  first.openedTabs[99].close();
+  await first.flush();
+  assert.equal(first.navigations.length, 1);
+  const lastClosedAt = first.openedTabs[99].closedAt;
+  const next = createPage({
+    pathname: automaticListPath,
+    stored: first.stored,
+    sessionStored: first.sessionStored,
+    listing: { pages: [[201]] },
+    startTime: first.now + 50,
+    automationSettings: null,
+  });
+  await next.advanceAsync(1500);
+  assert.equal(next.openedTabs.length, 0);
+  await advanceTo(next, lastClosedAt + 4999);
+  assert.equal(next.openedTabs.length, 0);
+  await next.advanceAsync(1);
+  assert.equal(next.openedTabs.length, 1);
+  assert.equal(next.openedTabs[0].openedAt, lastClosedAt + 5000);
+});
+
+test("the default result delay starts only on the result page and never closes a submitted form", () => {
+  const entry = createPage({ pathname: entryPath, ready: true, automationSettings: null });
+  entry.controls.get("input#termsCheckBox").checked = true;
+  entry.controls.get("input#giveawaySubmitButton").click();
+  entry.document.emit("submit");
+  entry.advance(120000);
+  assert.equal(entry.closeCount, 0);
+  const result = createPage({ pathname: "/giveaway/show/123", automationSettings: null });
+  result.advance(999);
+  assert.equal(result.closeCount, 0);
+  result.advance(1);
+  assert.equal(result.closeCount, 1);
+  result.advance(30000);
+  assert.equal(result.closeCount, 1);
+});
+
+test("result delay is snapshotted for that page and cancelled when the page is left", () => {
+  const values = { ...defaultAutomationSettings, resultCloseDelaySeconds: 2.5 };
+  const result = createPage({ pathname: "/giveaway/show/123", automationSettings: values });
+  result.localStorage.setItem(automationSettingsKey, JSON.stringify({ ...values, resultCloseDelaySeconds: 0 }));
+  result.window.emit("storage", { key: automationSettingsKey });
+  result.advance(2499);
+  assert.equal(result.closeCount, 0);
+  result.advance(1);
+  assert.equal(result.closeCount, 1);
+  const leaving = createPage({ pathname: "/giveaway/show/123", automationSettings: values });
+  leaving.advance(500);
+  leaving.window.emit("pagehide");
+  leaving.advance(10000);
+  assert.equal(leaving.closeCount, 0);
+});
+
+test("result URL cleanup preserves the original close delay for the same giveaway", () => {
+  const result = createPage({
+    href: "https://www.goodreads.com/giveaway/show/123?source=entry#grGiveawayId=123",
+    automationSettings: null,
+  });
+  result.advance(400);
+  result.window.history.replaceState(null, "", "https://www.goodreads.com/giveaway/show/123");
+  result.advance(599);
+  assert.equal(result.closeCount, 0);
+  result.advance(1);
+  assert.equal(result.closeCount, 1);
+});
+
+test("a delayed result close cannot close a different giveaway or an entry form", () => {
+  for (const target of ["/giveaway/show/456", entryPath, "/book/show/123"]) {
+    const result = createPage({ pathname: "/giveaway/show/123", automationSettings: null });
+    result.advance(400);
+    result.window.history.replaceState(null, "", `https://www.goodreads.com${target}`);
+    result.advance(10000);
+    assert.equal(result.closeCount, 0, target);
+  }
+});
+
+test("a blank entry uses the default ten-second wait before its first refresh", () => {
+  const page = createPage({ pathname: entryPath, automationSettings: null });
+  page.advance(9999);
+  assert.deepEqual(page.navigations, []);
+  page.advance(1);
+  assert.equal(page.navigations.length, 1);
+  assert.equal(new URL(page.navigations[0]).searchParams.get(retryParam), "1");
+});
+
+test("zero automatic retries leaves a blank form open after its configured loading wait", () => {
+  const page = createPage({
+    pathname: entryPath,
+    automationSettings: { ...defaultAutomationSettings, pageLoadTimeoutSeconds: 1, maxReloads: 0 },
+  });
+  page.advance(999);
+  assert.equal(page.document.querySelector("#gr-giveaway-load-failure"), null);
+  page.advance(1);
+  assert.ok(page.document.querySelector("#gr-giveaway-load-failure"));
+  page.advance(60000);
+  assert.deepEqual(page.navigations, []);
+  assert.equal(page.closeCount, 0);
+});
+
+test("the chosen retry count bounds blank-page refreshes and preserves address and progress", () => {
+  const settings = { ...defaultAutomationSettings, pageLoadTimeoutSeconds: 3, maxReloads: 1 };
+  const original = `https://www.goodreads.com${entryPath}?address=456#grGiveawayIndex=2&grGiveawayTotal=5&grGiveawayId=123`;
+  const first = createPage({ href: original, automationSettings: settings });
+  first.advance(2999);
+  assert.equal(first.navigations.length, 0);
+  first.advance(1);
+  assert.equal(first.navigations.length, 1);
+  const next = createPage({ href: first.navigations[0], automationSettings: settings });
+  next.advance(60000);
+  assert.equal(next.navigations.length, 0);
+  assert.ok(next.document.querySelector("#gr-giveaway-load-failure"));
+  const refreshed = new URL(first.navigations[0]);
+  assert.equal(refreshed.searchParams.get("address"), "456");
+  assert.equal(refreshed.hash, new URL(original).hash);
+});
+
+test("a pending blank-page wait retains its timeout and retry snapshot after a settings change", () => {
+  const original = { ...defaultAutomationSettings, pageLoadTimeoutSeconds: 3, maxReloads: 1 };
+  const page = createPage({ pathname: entryPath, automationSettings: original });
+  page.advance(500);
+  page.localStorage.setItem(automationSettingsKey, JSON.stringify({ ...original, pageLoadTimeoutSeconds: 1, maxReloads: 0 }));
+  page.window.emit("storage", { key: automationSettingsKey });
+  page.advance(2499);
+  assert.equal(page.navigations.length, 0);
+  page.advance(1);
+  assert.equal(page.navigations.length, 1);
+  const next = createPage({ href: page.navigations[0], stored: page.stored, automationSettings: null });
+  next.advance(1000);
+  assert.equal(next.navigations.length, 0);
+  assert.ok(next.document.querySelector("#gr-giveaway-load-failure"));
+});
+
+test("the opener honors zero retries when an entry userscript never starts", async () => {
+  const page = keyfirePage(undefined, {
+    blankTabs: true,
+    automationSettings: { ...defaultAutomationSettings, pageLoadTimeoutSeconds: 1, maxReloads: 0 },
+  });
+  await page.advanceAsync(4000);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.openedTabs[0].closed, false);
+  assert.match(page.alerts.join(" "), /blank|load|attempt/i);
+  await page.advanceAsync(30000);
+  assert.equal(page.openedTabs.length, 1);
+});
+
+test("the opener waits the configured interval and reopens a blank tab only up to its retry limit", async () => {
+  const page = keyfirePage(undefined, {
+    blankTabs: true,
+    automationSettings: { ...defaultAutomationSettings, pageLoadTimeoutSeconds: 2, maxReloads: 1 },
+  });
+  await page.advanceAsync(1500);
+  const first = page.openedTabs[0];
+  await advanceTo(page, first.openedAt + 1999);
+  assert.equal(first.closed, false);
+  assert.equal(page.openedTabs.length, 1);
+  await page.advanceAsync(1);
+  assert.equal(first.closed, true);
+  await page.advanceAsync(500);
+  assert.equal(page.openedTabs.length, 2);
+  const retry = page.openedTabs[1];
+  assert.equal(new URL(retry.href).searchParams.get(retryParam), "1");
+  assert.equal(new URL(retry.href).pathname, new URL(first.href).pathname);
+  await page.advanceAsync(30000);
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(retry.closed, false);
+  assert.equal(page.openedTabs.filter((tab) => !tab.closed).length, 1);
 });

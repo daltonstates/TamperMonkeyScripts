@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.33
+// @version      4.34
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -48,6 +48,7 @@
   const LS_FILTER_ENABLED = "gr_filter_enabled";
   const LS_BLOCKED_GENRES = "gr_blocked_genres";
   const LS_MAX_OPEN_TABS = "gr_max_open_tabs";
+  const LS_AUTOMATION_SETTINGS = "gr_automation_settings";
   const LS_AUTO_OPEN_ALL = "gr_auto_open_all";
   const LS_KEYFIRE_ENABLED = "gr_keyfire_enabled";
   const LS_KEYFIRE_RUN_PREFIX = "gr_keyfire_run_";
@@ -74,11 +75,23 @@
   const MAX_OPEN_TABS = 50;
   const MAX_GIVEAWAY_ROWS = 100;
   const GIVEAWAY_LOAD_TIMEOUT_MS = 30000;
+  const AUTOMATION_SETTINGS_DEFAULTS = Object.freeze({
+    giveawayDelaySeconds: 2,
+    resultCloseDelaySeconds: 1,
+    pageLoadTimeoutSeconds: 10,
+    maxReloads: 3,
+  });
+  const AUTOMATION_SETTINGS_LIMITS = Object.freeze({
+    giveawayDelaySeconds: { min: 0, max: 60, step: 0.5 },
+    resultCloseDelaySeconds: { min: 0, max: 30, step: 0.5 },
+    pageLoadTimeoutSeconds: { min: 1, max: 30, step: 1 },
+    maxReloads: { min: 0, max: 3, step: 1 },
+  });
   const AUTO_OPEN_LIST_URL =
     "https://www.goodreads.com/giveaway?sort=ending_soon&format=print";
   const AUTO_OPEN_URL_PARAM = "autoload";
-  const GIVEAWAY_TAB_LOAD_TIMEOUT_MS = 5000;
-  const MAX_GIVEAWAY_RELOADS = 3;
+  const INITIAL_FOCUS_RECOVERY_MS = 5000;
+  const MAX_ADDRESS_SUBMIT_RETRIES = 3;
   const GIVEAWAY_RELOAD_PARAM = "grGiveawayReload";
   // Background list tabs can have their timers throttled to once a minute.
   const KEYFIRE_RUN_LIFETIME_MS = 90000;
@@ -119,6 +132,43 @@
 
   const defaultGenres = () => [];
 
+  function normalizeAutomationSettings(value) {
+    const normalized = {};
+    for (const [name, fallback] of Object.entries(AUTOMATION_SETTINGS_DEFAULTS)) {
+      const raw = value?.[name];
+      const parsed =
+        typeof raw === "number" || (typeof raw === "string" && raw.trim() !== "")
+          ? Number(raw)
+          : NaN;
+      const { min, max, step } = AUTOMATION_SETTINGS_LIMITS[name];
+      const bounded = Number.isFinite(parsed)
+        ? Math.min(max, Math.max(min, parsed))
+        : fallback;
+      normalized[name] = Math.min(
+        max,
+        Math.max(min, Math.round(bounded / step) * step),
+      );
+    }
+    return normalized;
+  }
+
+  function loadAutomationSettings() {
+    try {
+      return normalizeAutomationSettings(
+        JSON.parse(localStorage.getItem(LS_AUTOMATION_SETTINGS)),
+      );
+    } catch {
+      return normalizeAutomationSettings(null);
+    }
+  }
+
+  function saveAutomationSettings(value) {
+    const normalized = normalizeAutomationSettings(value);
+    localStorage.setItem(LS_AUTOMATION_SETTINGS, JSON.stringify(normalized));
+    automationSettings = normalized;
+    return normalized;
+  }
+
   function normalizeKeyfireSettings(value) {
     return {
       macroName:
@@ -150,6 +200,7 @@
   let filteringEnabled = loadFilterEnabled();
   let BLOCKED = new Set(loadBlockedGenres().map((g) => g.toLowerCase()));
   let maxOpenTabs = loadMaxOpenTabs();
+  let automationSettings = loadAutomationSettings();
   let autoOpenAllEnabled =
     localStorage.getItem(LS_AUTO_OPEN_ALL) === "1" || isUrlAutoOpenRequested();
   let keyfireSettings = loadKeyfireSettings();
@@ -168,6 +219,15 @@
   let openAllButton = null;
   let workflowStatus = null;
   let dailyRun = null;
+  let giveawayPacing = null;
+  let giveawayPacingUntil = null;
+
+  // Other tabs in this Goodreads profile can save settings too. Existing waits
+  // retain their captured values; only subsequent waits use the updated ones.
+  window.addEventListener("storage", (event) => {
+    if (event.key === LS_AUTOMATION_SETTINGS || event.key === null)
+      automationSettings = loadAutomationSettings();
+  });
 
   const openedGiveawayLinks = new Set();
   const trackedGiveawayTabs = new Set();
@@ -626,14 +686,13 @@
           ? `Keyfire on. Waiting for ${manualGiveawayTabs.size} tabs opened for manual entry to close.`
           : `Keyfire on: ${keyfireSettings.macroName}. One giveaway at a time.`
         : "Keyfire needs setup. Open Keyfire setup before starting."
-      : "Keyfire off. Tabs open for manual entry. Check Use Keyfire workflow to claim automatically.";
+      : "Keyfire off. Tabs open for manual entry. Open settings to enable the Keyfire workflow.";
     if (workflowStatus.textContent !== text) workflowStatus.textContent = text;
   }
 
   function keyfireReadyToStart() {
     if (!keyfireEnabled || isKeyfireConfigured(keyfireSettings)) return true;
-    const setup = document.querySelector("#gr-keyfire-setup");
-    if (setup) setup.open = true;
+    openKeyfireSetup();
     refreshWorkflowStatus();
     alert(
       "Keyfire is selected but needs setup. Save a valid macro and browser. No giveaway tabs were opened.",
@@ -655,11 +714,13 @@
         : loadingGiveaways
           ? `Loading giveaways (${document.querySelectorAll("article.BookListItem").length}/${MAX_GIVEAWAY_ROWS} rows)...`
           : openingGiveaways
-            ? keyfireEnabled
-              ? `Claiming giveaway ${progress}...`
-              : waitingForTabs
-                ? `Waiting for tabs to close (${progress} opened)...`
-                : `Opening giveaways (${progress})...`
+            ? giveawayPacingUntil !== null
+              ? `Next giveaway in ${Math.max(0, Math.ceil((giveawayPacingUntil - Date.now()) / 1000))}s (${progress})`
+              : keyfireEnabled
+                ? `Claiming giveaway ${progress}...`
+                : waitingForTabs
+                  ? `Waiting for tabs to close (${progress} opened)...`
+                  : `Opening giveaways (${progress})...`
             : "Open all giveaways";
     }
 
@@ -718,6 +779,77 @@
         signal.removeEventListener("abort", abort);
       });
     });
+  }
+
+  function waitForGiveawayDelay(milliseconds, signal) {
+    signal.throwIfAborted();
+    if (milliseconds <= 0) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+      };
+      const abort = () => {
+        cleanup();
+        reject(signal.reason);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, milliseconds);
+      signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  function restoreGiveawayPacing(continuation) {
+    if (!continuation?.openedIds?.length) return;
+    const pacing = continuation.pacing;
+    const now = Date.now();
+    if (
+      pacing &&
+      typeof pacing.keyfire === "boolean" &&
+      Number.isFinite(pacing.lastOpenedAt) &&
+      pacing.lastOpenedAt >= 0 &&
+      pacing.lastOpenedAt <= now &&
+      Number.isFinite(pacing.lastClosedAt) &&
+      pacing.lastClosedAt >= pacing.lastOpenedAt &&
+      pacing.lastClosedAt <= now
+    ) {
+      giveawayPacing = { ...pacing };
+      return;
+    }
+    // Old userscript versions did not save pacing. Keep their deduplication
+    // state, but start a conservative gap rather than bypass the new setting.
+    const savedAt = Number.isFinite(continuation.createdAt)
+      ? Math.min(now, Math.max(0, continuation.createdAt))
+      : now;
+    giveawayPacing = {
+      lastOpenedAt: savedAt,
+      lastClosedAt: savedAt,
+      keyfire: keyfireEnabled,
+    };
+  }
+
+  async function waitForGiveawayPacing(workflow, signal) {
+    if (!giveawayPacing) return;
+    const gap = automationSettings.giveawayDelaySeconds * 1000;
+    const previous = giveawayPacing;
+    // The foreground workflow waits for closure before beginning its gap.
+    // Background mode spaces openings, independently of the open-tab limit.
+    const startedAt =
+      workflow && previous.keyfire
+        ? (previous.lastClosedAt ?? Date.now())
+        : previous.lastOpenedAt;
+    const remaining = Math.max(0, startedAt + gap - Date.now());
+    if (remaining === 0) return;
+    giveawayPacingUntil = Date.now() + remaining;
+    refreshOpenButton();
+    try {
+      await waitForGiveawayDelay(remaining, signal);
+    } finally {
+      giveawayPacingUntil = null;
+      refreshOpenButton();
+    }
   }
 
   async function waitForGiveawayPage(previousCount, signal, pagination) {
@@ -802,6 +934,7 @@
     // Keep the last known total until the entire list has loaded.
     const pagination = { total: null };
     const previouslyOpenedIds = new Set(continuation?.openedIds ?? []);
+    restoreGiveawayPacing(continuation);
     let capped = false;
     let preparedWorkflow = null;
     giveawayRunController = controller;
@@ -896,6 +1029,7 @@
             workflow: keyfireEnabled ? JSON.stringify(keyfireSettings) : null,
             createdAt: Date.now(),
             openedIds: [...previouslyOpenedIds],
+            pacing: giveawayPacing,
           }),
         );
       } catch (error) {
@@ -929,6 +1063,8 @@
       let retryPending = false;
       let closed = false;
       let openedAt = Date.now();
+      let waitSettings = { ...automationSettings };
+      let navigationIdentity = null;
       const retryUrl = new URL(recovery.href);
 
       const stopRecovery = () => {
@@ -942,6 +1078,7 @@
       const settle = () => {
         if (settled) return;
         settled = true;
+        if (recovery.pacing) recovery.pacing.lastClosedAt = Date.now();
         stopRecovery();
         if (pollId !== null) clearInterval(pollId);
         resolve();
@@ -984,6 +1121,8 @@
             }
             closed = false;
             openedAt = Date.now();
+            waitSettings = { ...automationSettings };
+            navigationIdentity = null;
             watchClose();
             return;
           }
@@ -1008,9 +1147,17 @@
               hash.set(key, value);
             }
             retryUrl.hash = hash.toString();
-            openedAt = navigation.at;
+            const observedNavigation = `${navigation.at}:${navigation.href}`;
+            if (observedNavigation !== navigationIdentity) {
+              navigationIdentity = observedNavigation;
+              openedAt = navigation.at;
+              waitSettings = navigation.waitSettings
+                ? normalizeAutomationSettings(navigation.waitSettings)
+                : { ...automationSettings };
+            }
           }
-          if (Date.now() - openedAt < GIVEAWAY_TAB_LOAD_TIMEOUT_MS) return;
+          if (Date.now() - openedAt < waitSettings.pageLoadTimeoutSeconds * 1000)
+            return;
 
           const retries = Math.max(
             0,
@@ -1019,10 +1166,10 @@
               10,
             ) || 0,
           );
-          if (retries >= MAX_GIVEAWAY_RELOADS) {
+          if (retries >= waitSettings.maxReloads) {
             stopRecovery();
             giveawayError(
-              `This giveaway stayed blank after ${MAX_GIVEAWAY_RELOADS} reopen attempts. Check Tampermonkey and your connection, then finish or close the tab.`,
+              `This giveaway stayed blank after ${waitSettings.maxReloads} reopen attempts. Check Tampermonkey and your connection, then finish or close the tab.`,
             );
             return;
           }
@@ -1061,8 +1208,7 @@
 
   async function waitForOpenTabSlot(signal) {
     // A native keyboard workflow needs the giveaway it is claiming in front.
-    const limit = keyfireEnabled ? 1 : maxOpenTabs;
-    while (trackedGiveawayTabs.size >= limit) {
+    while (trackedGiveawayTabs.size >= (keyfireEnabled ? 1 : maxOpenTabs)) {
       await waitForGiveawayTask(Promise.race(trackedGiveawayTabs), signal);
     }
     signal.throwIfAborted();
@@ -1100,6 +1246,9 @@
       }
       for (const [linkIndex, link] of links.entries()) {
         await waitForOpenTabSlot(signal);
+        await waitForGiveawayPacing(workflow, signal);
+        // Settings may lower the background tab limit during a pacing wait.
+        await waitForOpenTabSlot(signal);
         signal.throwIfAborted();
 
         const tabId = crypto.randomUUID().replace(/-/g, "");
@@ -1122,10 +1271,16 @@
           }
           openedGiveawayLinks.add(link);
           openedIds.push(getGiveawayId(link));
+          giveawayPacing = {
+            lastOpenedAt: Date.now(),
+            lastClosedAt: null,
+            keyfire: Boolean(workflow),
+          };
           trackGiveawayTab(tab, link, workflow, {
             key: tabKey,
             href: numberedLink,
             controller,
+            pacing: giveawayPacing,
           });
           opened++;
           giveawayBatchOpened = opened;
@@ -1325,7 +1480,7 @@
       refresh();
     };
     const submitted = () => {
-      if (stage !== "address" || ++addressSubmissions > MAX_GIVEAWAY_RELOADS) {
+      if (stage !== "address" || ++addressSubmissions > MAX_ADDRESS_SUBMIT_RETRIES) {
         stop();
         return;
       }
@@ -1363,12 +1518,32 @@
                 position: fixed;
                 top: 20px;
                 right: 20px;
-                width: 284px;
+                width: 320px;
+                max-width: calc(100vw - 40px);
                 max-height: calc(100vh - 40px);
+                max-height: calc(100dvh - 40px);
                 z-index: 99999;
                 display: flex;
                 flex-direction: column;
                 gap: 10px;
+                font: 14px/1.4 system-ui, sans-serif;
+            }
+
+            #gr-controls,
+            #gr-controls * {
+                box-sizing: border-box;
+            }
+
+            #gr-controls :where(button, input, select) {
+                font: inherit;
+            }
+
+            #gr-controls button:focus-visible,
+            #gr-controls input:focus-visible,
+            #gr-controls select:focus-visible,
+            #gr-controls summary:focus-visible {
+                outline: 3px solid #6ce3ce;
+                outline-offset: 2px;
             }
 
             #gr-open-btn,
@@ -1396,6 +1571,26 @@
             #gr-open-all-btn {
                 flex: 1;
                 min-width: 0;
+                overflow-wrap: anywhere;
+            }
+
+            #gr-settings-toggle {
+                flex: 0 0 36px;
+                align-self: stretch;
+                min-height: 38px;
+                padding: 0;
+                border: 1px solid #555;
+                border-radius: 6px;
+                background: #222;
+                color: #fff;
+                font-size: 22px;
+                cursor: pointer;
+            }
+
+            #gr-settings-toggle:hover,
+            #gr-settings-toggle[aria-expanded="true"] {
+                background: #394b47;
+                border-color: #6ce3ce;
             }
 
             #gr-auto-open-label {
@@ -1411,6 +1606,7 @@
             }
 
             #gr-open-btn[hidden],
+            #gr-settings[hidden],
             #gr-keyfire-row[hidden],
             #gr-workflow-status[hidden] {
                 display: none;
@@ -1424,16 +1620,118 @@
 
             #gr-settings {
                 min-height: 0;
+                overscroll-behavior: contain;
                 overflow-y: auto;
-                padding: 12px;
+                padding: 14px;
                 background: #222;
                 color: #fff;
                 border-radius: 8px;
                 font-size: 14px;
-                box-shadow: 0 0 8px rgba(0,0,0,0.4);
+                border: 1px solid #555;
+                box-shadow: 0 6px 18px rgba(0,0,0,0.3);
+            }
+
+            #gr-settings-heading-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                margin-bottom: 8px;
+            }
+
+            #gr-settings-heading {
+                margin: 0;
+                font: 600 16px/1.4 system-ui, sans-serif;
+                color: #fff;
+            }
+
+            #gr-settings-close {
+                flex: 0 0 32px;
+                height: 32px;
+                padding: 0;
+                border: 1px solid #666;
+                border-radius: 4px;
+                background: transparent;
+                color: #fff;
+                font-size: 23px;
+                line-height: 1;
+                cursor: pointer;
+            }
+
+            #gr-settings-help,
+            #gr-settings-status,
+            .gr-setting-help {
+                margin: 6px 0;
+                color: #d0d5d3;
+                font-size: 12px;
+                line-height: 1.45;
+            }
+
+            #gr-settings-status {
+                min-height: 18px;
+                color: #a1eadc;
+            }
+
+            #gr-timing-settings {
+                min-width: 0;
+                margin: 12px 0 8px;
+                padding: 12px 0 0;
+                border: 0;
+                border-top: 1px solid #555;
+            }
+
+            #gr-timing-settings legend {
+                padding: 0 6px 0 0;
+                font-weight: 600;
+                color: #fff;
+            }
+
+            .gr-setting-field {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 70px;
+                align-items: center;
+                gap: 3px 12px;
+                margin-bottom: 12px;
+            }
+
+            .gr-setting-field .gr-setting-help {
+                grid-column: 1 / -1;
+                margin: 0;
+            }
+
+            .gr-setting-field input,
+            #gr-tab-limit-input {
+                width: 70px;
+                min-width: 0;
+                padding: 5px 6px;
+                border: 1px solid #777;
+                border-radius: 4px;
+                background: #fff;
+                color: #222;
+            }
+
+            #gr-settings-reset-timing,
+            #gr-filter-toggle {
+                padding: 6px 9px;
+                border: 1px solid #777;
+                border-radius: 4px;
+                background: #333;
+                color: #fff;
+                cursor: pointer;
+            }
+
+            #gr-filter-toggle {
+                width: 100%;
+                margin-top: 14px;
             }
 
             #gr-accordion-header {
+                width: 100%;
+                padding: 8px 0;
+                border: 0;
+                background: transparent;
+                color: #fff;
+                text-align: left;
                 cursor: pointer;
                 font-weight: bold;
                 margin-bottom: 6px;
@@ -1449,17 +1747,15 @@
                 margin-top: 8px;
             }
 
-            #gr-tab-limit-input {
-                width: 64px;
-                padding: 4px 6px;
-                border: 1px solid #555;
-                border-radius: 4px;
-                background: #fff;
-                color: #222;
-            }
-
             #gr-workflow-status {
-                margin: 8px 0;
+                flex-shrink: 0;
+                max-height: min(160px, 24vh);
+                overflow-y: auto;
+                margin: 0;
+                padding: 8px 10px;
+                background: #222;
+                color: #fff;
+                border-radius: 6px;
                 font-size: 12px;
                 line-height: 1.4;
                 overflow-wrap: anywhere;
@@ -1525,6 +1821,9 @@
 
             .gr-tag-remove {
                 margin-left: 6px;
+                padding: 0 2px;
+                border: 0;
+                background: transparent;
                 cursor: pointer;
                 color: #ff6b6b;
                 font-weight: bold;
@@ -1537,6 +1836,8 @@
                 border: 1px solid #555;
                 margin-top: 10px;
                 margin-bottom: 6px;
+                color: #222;
+                background: #fff;
             }
 
             #gr-add-btn {
@@ -1548,6 +1849,16 @@
                 border-radius: 4px;
                 cursor: pointer;
             }
+
+            @media (max-width: 600px) {
+                #gr-controls {
+                    top: 12px;
+                    right: 12px;
+                    max-width: calc(100vw - 24px);
+                    max-height: calc(100vh - 24px);
+                    max-height: calc(100dvh - 24px);
+                }
+            }
         `;
     const style = document.createElement("style");
     style.textContent = css;
@@ -1558,18 +1869,171 @@
    *  SETTINGS UI
    * ------------------------------------------------------------ */
 
+  const AUTOMATION_SETTING_FIELDS = [
+    {
+      key: "giveawayDelaySeconds",
+      id: "gr-setting-giveaway-delay",
+      label: "Between giveaways (seconds)",
+      help: "Manual: space out new tab openings. Keyfire: wait after the previous giveaway closes.",
+    },
+    {
+      key: "resultCloseDelaySeconds",
+      id: "gr-setting-result-delay",
+      label: "Result-page pause (seconds)",
+      help: "How long the final giveaway page stays open before it closes automatically.",
+    },
+    {
+      key: "pageLoadTimeoutSeconds",
+      id: "gr-setting-load-timeout",
+      label: "Blank-page wait (seconds)",
+      help: "Wait for an entry page and its controls before retrying. Listing-page loading is unchanged.",
+    },
+    {
+      key: "maxReloads",
+      id: "gr-setting-retry-limit",
+      label: "Blank-page retries",
+      help: "Retries per giveaway page. Set 0 to turn off automatic reloads.",
+    },
+  ];
+
+  function refreshAutomationSettingInputs() {
+    for (const field of AUTOMATION_SETTING_FIELDS) {
+      const input = document.querySelector(`#${field.id}`);
+      if (input) input.value = String(automationSettings[field.key]);
+    }
+  }
+
+  function setSettingsPanelOpen(open, { focus = true } = {}) {
+    const panel = document.querySelector("#gr-settings");
+    const toggle = document.querySelector("#gr-settings-toggle");
+    if (!panel || !toggle) return;
+    panel.hidden = !open;
+    toggle.setAttribute("aria-expanded", String(open));
+    if (open) refreshAutomationSettingInputs();
+    if (focus) {
+      const target = open
+        ? document.querySelector("#gr-settings-close")
+        : toggle;
+      target?.focus();
+    }
+  }
+
+  function openKeyfireSetup() {
+    setSettingsPanelOpen(true, { focus: false });
+    const setup = document.querySelector("#gr-keyfire-setup");
+    if (setup) setup.open = true;
+    document.querySelector("#gr-keyfire-macro")?.focus();
+  }
+
   function createSettingsPanel() {
-    const panel = document.createElement("div");
+    const panel = document.createElement("section");
     panel.id = "gr-settings";
+    panel.hidden = true;
+    panel.setAttribute("role", "region");
+    panel.setAttribute("aria-labelledby", "gr-settings-heading");
+
+    const headingRow = document.createElement("div");
+    headingRow.id = "gr-settings-heading-row";
+    const heading = document.createElement("h2");
+    heading.id = "gr-settings-heading";
+    heading.textContent = "Giveaway settings";
+    headingRow.appendChild(heading);
+    const close = document.createElement("button");
+    close.id = "gr-settings-close";
+    close.type = "button";
+    close.textContent = "×";
+    close.title = "Close settings";
+    close.setAttribute("aria-label", "Close giveaway settings");
+    close.onclick = () => setSettingsPanelOpen(false);
+    headingRow.appendChild(close);
+    panel.appendChild(headingRow);
+
+    const help = document.createElement("p");
+    help.id = "gr-settings-help";
+    help.textContent =
+      "Changes apply to new waits and page loads. A wait already running keeps its original timing. Recorded macro steps are unchanged.";
+    panel.appendChild(help);
+
+    const timing = document.createElement("fieldset");
+    timing.id = "gr-timing-settings";
+    const legend = document.createElement("legend");
+    legend.textContent = "Timing and retries";
+    timing.appendChild(legend);
+
+    const status = document.createElement("p");
+    status.id = "gr-settings-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.textContent = "Changes save automatically for this browser profile.";
+    const saveTiming = (next, message) => {
+      try {
+        saveAutomationSettings(next);
+        refreshAutomationSettingInputs();
+        status.textContent = message;
+      } catch {
+        refreshAutomationSettingInputs();
+        status.textContent =
+          "Could not save these changes. Browser storage may be unavailable.";
+      }
+    };
+
+    for (const field of AUTOMATION_SETTING_FIELDS) {
+      const row = document.createElement("label");
+      row.className = "gr-setting-field";
+      row.setAttribute("for", field.id);
+      const label = document.createElement("span");
+      label.textContent = field.label;
+      row.appendChild(label);
+      const input = document.createElement("input");
+      input.id = field.id;
+      input.type = "number";
+      const limits = AUTOMATION_SETTINGS_LIMITS[field.key];
+      input.min = String(limits.min);
+      input.max = String(limits.max);
+      input.step = String(limits.step);
+      input.value = String(automationSettings[field.key]);
+      input.setAttribute("aria-describedby", `${field.id}-help`);
+      input.addEventListener("change", () => {
+        saveTiming(
+          { ...automationSettings, [field.key]: input.value },
+          "Timing and retry settings saved.",
+        );
+      });
+      row.appendChild(input);
+      const description = document.createElement("small");
+      description.id = `${field.id}-help`;
+      description.className = "gr-setting-help";
+      description.textContent = field.help;
+      row.appendChild(description);
+      timing.appendChild(row);
+    }
+
+    const reset = document.createElement("button");
+    reset.id = "gr-settings-reset-timing";
+    reset.type = "button";
+    reset.textContent = "Reset timing defaults";
+    reset.title =
+      "Reset only timing and retry settings. Keep your tab limit, genres, and Keyfire setup.";
+    reset.onclick = () =>
+      saveTiming(
+        { ...AUTOMATION_SETTINGS_DEFAULTS },
+        "Timing defaults restored. Other settings were kept.",
+      );
+    timing.appendChild(reset);
+    panel.appendChild(timing);
+    panel.appendChild(status);
 
     /* Filter toggle */
-    const toggle = document.createElement("div");
+    const toggle = document.createElement("button");
+    toggle.id = "gr-filter-toggle";
+    toggle.type = "button";
     toggle.textContent = `Filter: ${filteringEnabled ? "ON" : "OFF"}`;
-    toggle.style.cursor = "pointer";
+    toggle.setAttribute("aria-pressed", String(filteringEnabled));
     toggle.onclick = () => {
       filteringEnabled = !filteringEnabled;
       saveFilterEnabled(filteringEnabled);
       toggle.textContent = `Filter: ${filteringEnabled ? "ON" : "OFF"}`;
+      toggle.setAttribute("aria-pressed", String(filteringEnabled));
       runFilter();
       updateCounts();
     };
@@ -1586,6 +2050,7 @@
     tabLimitInput.min = String(MIN_OPEN_TABS);
     tabLimitInput.max = String(MAX_OPEN_TABS);
     tabLimitInput.value = String(maxOpenTabs);
+    tabLimitInput.setAttribute("aria-describedby", "gr-tab-limit-help");
     tabLimitInput.addEventListener("change", () => {
       maxOpenTabs = normalizeMaxOpenTabs(tabLimitInput.value);
       tabLimitInput.value = String(maxOpenTabs);
@@ -1594,11 +2059,12 @@
 
     tabLimitRow.appendChild(tabLimitInput);
     panel.appendChild(tabLimitRow);
-
-    workflowStatus = document.createElement("p");
-    workflowStatus.id = "gr-workflow-status";
-    workflowStatus.setAttribute("role", "status");
-    panel.appendChild(workflowStatus);
+    const tabLimitHelp = document.createElement("p");
+    tabLimitHelp.id = "gr-tab-limit-help";
+    tabLimitHelp.className = "gr-setting-help";
+    tabLimitHelp.textContent =
+      "Applies to manual mode. Keyfire keeps one giveaway tab in the foreground.";
+    panel.appendChild(tabLimitHelp);
 
     const keyfireRow = document.createElement("label");
     keyfireRow.id = "gr-keyfire-row";
@@ -1610,6 +2076,7 @@
     keyfireCheckbox.addEventListener("change", () => {
       if (keyfireCheckbox.checked && !isKeyfireConfigured(keyfireSettings)) {
         keyfireCheckbox.checked = false;
+        openKeyfireSetup();
         return;
       }
       keyfireEnabled =
@@ -1645,8 +2112,11 @@
     createKeyfireSetup(panel, keyfireRow, keyfireCheckbox);
 
     /* Accordion header */
-    const header = document.createElement("div");
+    const header = document.createElement("button");
     header.id = "gr-accordion-header";
+    header.type = "button";
+    header.setAttribute("aria-controls", "gr-accordion-content");
+    header.setAttribute("aria-expanded", "false");
     header.textContent = `▶ Blocked Genres (${BLOCKED.size})`;
     panel.appendChild(header);
 
@@ -1666,8 +2136,10 @@
         tag.className = "gr-tag";
         tag.textContent = genre;
 
-        const remove = document.createElement("span");
+        const remove = document.createElement("button");
         remove.className = "gr-tag-remove";
+        remove.type = "button";
+        remove.setAttribute("aria-label", `Remove ${genre}`);
         remove.textContent = "✕";
         remove.onclick = () => {
           BLOCKED.delete(genre);
@@ -1689,10 +2161,12 @@
     const input = document.createElement("input");
     input.id = "gr-genre-input";
     input.placeholder = "Add genre…";
+    input.setAttribute("aria-label", "Genre to block");
     content.appendChild(input);
 
     const addBtn = document.createElement("button");
     addBtn.id = "gr-add-btn";
+    addBtn.type = "button";
     addBtn.textContent = "Add Genre";
     addBtn.onclick = () => {
       const val = input.value.trim();
@@ -1711,10 +2185,21 @@
     header.onclick = () => {
       const open = content.style.display === "block";
       content.style.display = open ? "none" : "block";
+      header.setAttribute("aria-expanded", String(!open));
       header.textContent = `${open ? "▶" : "▼"} Blocked Genres (${BLOCKED.size})`;
     };
 
     document.querySelector("#gr-controls").appendChild(panel);
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key !== "Escape" || panel.hidden) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setSettingsPanelOpen(false);
+      },
+      true,
+    );
   }
 
   function createKeyfireSetup(panel, row, checkbox) {
@@ -1770,7 +2255,7 @@
 
     const help = document.createElement("p");
     help.textContent =
-      "Match the macro name saved in Keyfire. Supported steps: Enter, Space, Tab, and Wait (ms). Switching away pauses typing. Escape pauses the batch. Unchecking the Keyfire control cancels it. Stop any manual macro loop before starting.";
+      "Match the macro name saved in Keyfire. Supported steps: Enter, Space, Tab, and Wait (ms). Switching away pauses typing. Escape also stops the Keyfire companion; use × to close settings during a run. Unchecking the Keyfire control cancels it. Stop any manual macro loop before starting.";
     setup.appendChild(help);
     const save = document.createElement("button");
     save.id = "gr-keyfire-save";
@@ -1881,6 +2366,17 @@
     autoOpenLabel.appendChild(autoOpenCheckbox);
     autoOpenLabel.appendChild(autoOpenText);
     openAllRow.appendChild(autoOpenLabel);
+    const settingsToggle = document.createElement("button");
+    settingsToggle.id = "gr-settings-toggle";
+    settingsToggle.type = "button";
+    settingsToggle.textContent = "⚙";
+    settingsToggle.title = "Giveaway settings";
+    settingsToggle.setAttribute("aria-label", "Giveaway settings");
+    settingsToggle.setAttribute("aria-controls", "gr-settings");
+    settingsToggle.setAttribute("aria-expanded", "false");
+    settingsToggle.onclick = () =>
+      setSettingsPanelOpen(Boolean(document.querySelector("#gr-settings")?.hidden));
+    openAllRow.appendChild(settingsToggle);
     controls.appendChild(openAllRow);
 
     const btn = document.createElement("button");
@@ -1890,6 +2386,12 @@
     btn.innerHTML = `🗗 <span>Open Giveaways (Filtered)</span>`;
     btn.onclick = () => openVisibleGiveaways();
     controls.appendChild(btn);
+
+    workflowStatus = document.createElement("p");
+    workflowStatus.id = "gr-workflow-status";
+    workflowStatus.hidden = true;
+    workflowStatus.setAttribute("role", "status");
+    controls.appendChild(workflowStatus);
     document.body.appendChild(controls);
     openButton = btn;
 
@@ -2013,24 +2515,47 @@
   }
 
   function handleAutoClose() {
-    const url = window.location.href;
-    if (/goodreads\.com\/giveaway\/show\/\d+/.test(url)) {
-      window.close();
+    const resultUrl = new URL(window.location.href);
+    if (
+      resultUrl.origin === "https://www.goodreads.com" &&
+      /^\/giveaway\/show\/\d+/.test(resultUrl.pathname)
+    ) {
+      const giveawayId = getGiveawayId(resultUrl.href);
+      const delay = automationSettings.resultCloseDelaySeconds * 1000;
+      if (delay === 0) {
+        window.close();
+        return;
+      }
+      const cancel = () => clearTimeout(timer);
+      const timer = setTimeout(() => {
+        window.removeEventListener("pagehide", cancel);
+        const currentUrl = new URL(window.location.href);
+        // Goodreads may clean query/hash metadata without leaving this result.
+        if (
+          currentUrl.origin === resultUrl.origin &&
+          /^\/giveaway\/show\/\d+/.test(currentUrl.pathname) &&
+          getGiveawayId(currentUrl.href) === giveawayId
+        )
+          window.close();
+      }, delay);
+      window.addEventListener("pagehide", cancel, { once: true });
     }
   }
 
-  function showGiveawayLoadFailure() {
+  function showGiveawayLoadFailure(maxReloads) {
     if (!document.body) {
-      document.addEventListener("DOMContentLoaded", showGiveawayLoadFailure, {
-        once: true,
-      });
+      document.addEventListener(
+        "DOMContentLoaded",
+        () => showGiveawayLoadFailure(maxReloads),
+        { once: true },
+      );
       return;
     }
 
     const notice = document.createElement("div");
     notice.id = "gr-giveaway-load-failure";
     notice.setAttribute("role", "alert");
-    notice.textContent = `This giveaway still hasn't loaded after ${MAX_GIVEAWAY_RELOADS} refresh attempts. Check the page or your connection. `;
+    notice.textContent = `This giveaway still hasn't loaded after ${maxReloads} refresh attempts. Check the page or your connection. `;
     Object.assign(notice.style, {
       position: "fixed",
       top: "20px",
@@ -2060,6 +2585,7 @@
   function waitForGiveawayControls(findControls, onReady) {
     let pollId = null;
     let timeoutId = null;
+    const waitSettings = { ...automationSettings };
 
     const stopWaiting = () => {
       clearInterval(pollId);
@@ -2094,8 +2620,8 @@
         Number.parseInt(retryUrl.searchParams.get(GIVEAWAY_RELOAD_PARAM), 10) ||
           0,
       );
-      if (retries >= MAX_GIVEAWAY_RELOADS) {
-        showGiveawayLoadFailure();
+      if (retries >= waitSettings.maxReloads) {
+        showGiveawayLoadFailure(waitSettings.maxReloads);
         return;
       }
 
@@ -2103,7 +2629,7 @@
       // A changed URL makes a fresh GET, even with a progress hash or after a POST.
       reportGiveawayNavigation(retryUrl.href);
       window.location.replace(retryUrl.href);
-    }, GIVEAWAY_TAB_LOAD_TIMEOUT_MS);
+    }, waitSettings.pageLoadTimeoutSeconds * 1000);
     checkControls();
   }
 
@@ -2189,7 +2715,10 @@
     if (!progress?.tabId || !isGiveawayEntryLink(href)) return;
     const key = LS_GIVEAWAY_TAB_PREFIX + progress.tabId;
     if (localStorage.getItem(key) !== null) {
-      localStorage.setItem(key, JSON.stringify({ href, at: Date.now() }));
+      localStorage.setItem(
+        key,
+        JSON.stringify({ href, at: Date.now(), waitSettings: automationSettings }),
+      );
     }
   }
 
@@ -2217,7 +2746,7 @@
     const timer = setInterval(focus, 250);
     const timeout = setTimeout(
       () => clearInterval(timer),
-      GIVEAWAY_TAB_LOAD_TIMEOUT_MS,
+      INITIAL_FOCUS_RECOVERY_MS,
     );
     const stop = () => {
       stopped = true;

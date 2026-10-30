@@ -1,8 +1,11 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.33 keeps an entry tab open after Submit until Goodreads navigates to
-its result page. Earlier versions closed it after 50 milliseconds, which could
-interrupt a pending submission or hide a validation error. Scheduled windows
+Version 4.34 adds a compact settings button with per-profile pacing, result-page
+delay, blank-page recovery, and tab-limit controls. These work with Tampermonkey
+alone and with the optional Keyfire companion. It retains version 4.33's fix:
+an entry tab stays open after Submit until Goodreads navigates to its result
+page. Earlier versions closed it after 50 milliseconds, which could interrupt
+a pending submission or hide a validation error. Scheduled windows
 also retry identification for up to 30 seconds before entry processing starts,
 support window cleanup, and recognize Goodreads' explicit empty-results page.
 `autoload=1` starts a run
@@ -40,6 +43,39 @@ applicable, a companion restart. User settings and signed-in browser sessions
 are not copied between profiles.
 
 See [Tampermonkey's update documentation](https://www.tampermonkey.net/documentation.php?locale=en&q=update_url).
+
+## Timing and settings
+
+Select the small **Giveaway settings** gear beside **Open all giveaways**.
+The panel starts closed and contains the timing controls, tab limit, genre
+filters, and optional Keyfire setup. Close it with the gear or **×** button.
+Run progress and errors remain visible while settings are closed.
+
+Timing inputs save when changed and are stored separately for each browser
+profile. No companion installation is needed to use these settings.
+
+| Setting | Default | Allowed values | Behavior |
+| --- | --- | --- | --- |
+| Delay between giveaways | 2 seconds | 0–60 seconds, in half-second steps | Spaces new tab openings in manual mode. With Keyfire, waits after the previous tab closes before opening the next. The first giveaway starts immediately. |
+| Result-page pause | 1 second | 0–30 seconds, in half-second steps | Waits on the result page before closing it. This starts after result navigation, never when Submit is clicked. |
+| Blank-page wait | 10 seconds | 1–30 seconds | Waits for an entry page's controls or a blank tab to load before recovery. |
+| Blank-page retries | 3 | 0–3 | Limits automatic reload/reopen attempts. Zero disables automatic retries. |
+| Max open tabs | Existing saved value; 8 for a new profile | 1–50 | Limits concurrent tabs in manual mode. Keyfire processes one foreground giveaway at a time. |
+
+Current waits finish using the duration with which they started. Saved changes
+apply to subsequent waits and newly opened pages. The pause also carries across
+automatic batch refreshes. **Reset timing** restores the four timing/retry
+defaults; it does not reset the tab limit, genres, or macro selection.
+
+In Tampermonkey-only mode, users still submit entries themselves; pacing controls
+tab openings, not the timing of manual clicks across several open tabs. Set
+**Max open tabs** to **1** for one-at-a-time manual entry.
+
+These delays are separate from the macro's saved key/wait steps. Address-selection
+retries, the companion's communication deadlines, and scheduled runner limits
+keep their existing behavior. Longer pacing does not extend the scheduled
+runner's 45-minute limit per account. Escape retains the companion's emergency
+stop behavior; use the gear or **×** to close settings during a Keyfire run.
 
 ## Giveaway workflow
 
@@ -207,7 +243,7 @@ That location is also saved in the startup shortcut when `-InstallStartup` is us
 
 ## Choose the macro on the giveaway page
 
-Open **Keyfire setup** in the filter/settings panel:
+Open **Giveaway settings** using the gear, then expand **Keyfire setup**:
 
 | Setting    | What to enter                                                                                                                                       |
 | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
