@@ -132,14 +132,18 @@ Copy-VMFile -VMName 'GoodreadsGiveaways' -SourcePath $zip -DestinationPath 'C:\U
 Extract the package inside the guest. In every guest Edge profile:
 
 1. Sign into the intended Goodreads account.
-2. Install the current `Goodreads/Giveaways.js`, **4.31 or later**, in
+2. Install the current `Goodreads/Giveaways.js`, **4.34 or later**, in
    Tampermonkey, with the current Python runner for bounded startup-window
-   retries. Avoid duplicate enabled copies.
+   retries. Version 4.33 waits for result navigation after Submit instead of
+   closing the entry tab while the request may still be pending. Avoid duplicate
+   enabled copies.
 3. In Tampermonkey Settings, select Advanced configuration and set Content
    Script API to **UserScripts API Dynamic**.
-4. Save the intended genre filters and Keyfire macro selection, and enable
-   **Use Keyfire workflow**. The optional Keyfire profile is independent of the
-   Edge profile. Auto on load may stay off.
+4. Open the **Giveaway settings** gear in each guest profile. Save the intended
+   genre filters, pacing, and Keyfire macro selection, and enable **Use Keyfire
+   workflow**. The optional Keyfire profile is independent of the Edge profile.
+   Auto on load may stay off. Timing values belong to that browser profile and
+   do not modify the macro's own saved delays.
 
 Run the guest installer in elevated PowerShell **under the guest account that
 will run the workflow**, replacing the extracted-package path:
@@ -252,8 +256,33 @@ delivery and click handling use the native Windows API. The installed
 `DesktopReportActivator-<source hash>.exe` registers a real COM callback, so a
 click can launch the report after the notification sender has exited.
 `notification-activation.json` records actual `notification-click` callbacks;
-`notification-delivery.json` records submission. The earlier generic card and
-non-working protocol action are retired under a fresh sender identity.
+`notification-delivery.json` records submission. These receipts distinguish
+sending a notification from receiving an actual click callback.
+
+The toast's completion timestamp uses whole seconds. Windows can replace the
+entire notification with **New notification**, losing its text and button, if
+the XML contains the seven fractional digits emitted by .NET's round-trip
+timestamp format. This is the failure described in the Windows Community
+Toolkit's [timestamp issue](https://github.com/CommunityToolkit/WindowsCommunityToolkit/issues/1073).
+Preview uses the same timestamp as scheduled delivery so a manual test covers
+that field too. After updating the source, run `Install-DesktopStatus.ps1` again
+as the normal signed-in host user to copy the repaired sender into the desktop
+installation and refresh the latest notification. Userscript updates do not
+update this installed PowerShell file.
+
+To open the existing report directly while notification activation is unavailable:
+
+```powershell
+Start-Process (Join-Path $env:USERPROFILE '.goodreads-giveaways\desktop\report.html')
+```
+
+To diagnose remaining giveaways, compare the same run's `daily-last-run.json`
+and `host-last-run.json` under `C:\ProgramData\GoodreadsGiveawaysVM\reports`.
+Each profile's `state`, `reason`, `progress`, and `userscriptVersion` distinguish
+an apparently completed queue from a timeout or a capped batch with no new
+eligible entries. Saved genre filters still apply. A failed profile's
+`failureRecovered` field means its tabs were cleaned up; its missed entries
+were not retried. Include `daily.log` when investigating a recorded failure.
 
 Building the native helper requires Visual Studio C++ Build Tools and a Windows
 SDK on the host. The installer finds them with `vswhere`, compiles with the
@@ -274,6 +303,11 @@ The notifier uses Windows' documented
 and [silent audio](https://learn.microsoft.com/en-us/uwp/schemas/tiles/toastschema/element-audio)
 options. Run the report, freshness, and duplicate-delivery checks with
 `python Goodreads/VM/DesktopStatus.test.py`.
+Run `powershell -NoProfile -File Goodreads/VM/Show-DesktopStatus.test.ps1` for
+notification-content regression checks. These invoke the actual sender with
+`-ContentOnly`, which returns XML without registering or sending a notification.
+They cover timestamp precision, preview parity, locale, escaped text, and the
+body and button actions. They do not replace a real Windows notification click.
 
 For an explicitly requested fresh run outside the morning window, launch
 `Run-VMNow.ps1` in an administrator PowerShell window with a new
