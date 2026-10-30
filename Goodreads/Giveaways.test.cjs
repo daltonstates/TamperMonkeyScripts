@@ -605,7 +605,7 @@ test("leaving a page cancels pending recovery", () => {
 });
 
 for (const hasAgeConfirmation of [false, true]) {
-  test(`entry keyboard flow and auto-close work with age confirmation ${hasAgeConfirmation}`, () => {
+  test(`entry keyboard flow waits for navigation with age confirmation ${hasAgeConfirmation}`, () => {
     const page = createPage({ pathname: entryPath, ready: true });
     const terms = page.controls.get("input#termsCheckBox");
     const submit = page.controls.get("input#giveawaySubmitButton");
@@ -621,13 +621,25 @@ for (const hasAgeConfirmation of [false, true]) {
       assert.equal(submit.focusCount, 1);
     }
     submit.emit("click");
-    page.advance(49);
+    page.document.emit("submit");
+    page.advance(30000);
     assert.equal(page.closeCount, 0);
-    page.advance(1);
-    assert.equal(page.closeCount, 1);
     assert.deepEqual(page.navigations, []);
   });
 }
+
+test("an entry click blocked by form validation leaves the form open", () => {
+  const page = createPage({ pathname: entryPath, ready: true });
+  const terms = page.controls.get("input#termsCheckBox");
+  const age = page.addControl("input#ageAttestationCheckBox");
+  terms.checked = false;
+  age.checked = false;
+  page.controls.get("input#giveawaySubmitButton").click();
+  // A failed browser validity check does not dispatch a submit event or navigate.
+  page.advance(30000);
+  assert.equal(page.closeCount, 0);
+  assert.deepEqual(page.navigations, []);
+});
 
 test("the giveaway list waits for the DOM and initializes its controls", () => {
   const page = createPage({ pathname: automaticListPath, loading: true });
@@ -2240,6 +2252,38 @@ test("daily completion waits for the final Keyfire tab to close", async () => {
     [...page.stored.keys()].some((key) => key.startsWith("gr_keyfire_run_")),
     false,
   );
+});
+
+test("a scheduled entry awaiting its response cannot finish the daily run", async () => {
+  const page = dailyPage({ listing: { pages: [[123]] } });
+  await page.advanceAsync(1500);
+  const tab = page.openedTabs[0];
+  const entryUrl = new URL(tab.href);
+  entryUrl.pathname = entryPath;
+  const entry = createPage({
+    href: entryUrl.href,
+    ready: true,
+    stored: page.stored,
+    startTime: page.now,
+  });
+  entry.window.close = () => tab.close();
+  entry.controls.get("input#termsCheckBox").checked = true;
+  entry.controls.get("input#giveawaySubmitButton").click();
+  entry.document.emit("submit");
+  // Model a slow response: the old 50 ms timer closed the child and reported
+  // this entire account finished before the response could navigate anywhere.
+  entry.advance(10000);
+  await page.advanceAsync(10000);
+  assert.equal(tab.closed, false);
+  assert.equal(page.dailyRequests.some((r) => r.state === "finished"), false);
+  assert.equal(page.openedTabs.length, 1);
+
+  // The existing result-navigation close path still frees the tracked tab.
+  const result = createPage({ pathname: "/giveaway/show/123" });
+  assert.equal(result.closeCount, 1);
+  tab.close();
+  await page.advanceAsync(0);
+  assert.equal(page.dailyRequests.at(-1).state, "finished");
 });
 
 test("managed runs close only the listing after the last entry tab closes", async () => {

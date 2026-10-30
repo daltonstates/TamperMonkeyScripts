@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.32
+// @version      4.33
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -2159,11 +2159,10 @@
           }
         });
 
-        submitBtn.addEventListener("click", () => {
-          setTimeout(() => {
-            window.close();
-          }, 50);
-        });
+        // A click does not establish that Goodreads received the entry. Native
+        // validation can prevent submission, and closing the tab can cancel an
+        // in-flight request. Let the existing /giveaway/show/ navigation handler
+        // close the tab after the response; a stalled form must remain pending.
       },
     );
   }

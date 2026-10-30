@@ -1,8 +1,11 @@
 # Goodreads Giveaway Enhancer
 
-Version 4.30 lets scheduled windows retry identification for up to 30 seconds
-before entry processing starts. It also supports scheduled window cleanup and
-recognizes Goodreads' explicit empty-results page. `autoload=1` starts a run
+Version 4.33 keeps an entry tab open after Submit until Goodreads navigates to
+its result page. Earlier versions closed it after 50 milliseconds, which could
+interrupt a pending submission or hide a validation error. Scheduled windows
+also retry identification for up to 30 seconds before entry processing starts,
+support window cleanup, and recognize Goodreads' explicit empty-results page.
+`autoload=1` starts a run
 from a bookmark without saving
 Auto on load as enabled. Automatic GitHub updates and the daily runner remain available.
 No pairing code or special paired userscript is required. Lists still run in
@@ -104,6 +107,13 @@ is reached. Closing a giveaway tab lets the next one open; the limit does not
 limit the total batch. With Keyfire, the button shows the current giveaway number
 and the batch total, and only one giveaway stays open at a time. An unfinished tab
 must finish or close before the next book opens.
+
+Clicking Submit does not close an entry tab. The existing `/giveaway/show/`
+result-page handler closes it after navigation, while a slow request or invalid
+form stays open. In a scheduled run, a stalled form can then reach the runner's
+existing failure deadline instead of being counted as a closed queue item.
+Result navigation and tab closure still do not independently verify that
+Goodreads accepted the entry; the run report describes processed queue items.
 
 ## Blank tabs and address selection
 
