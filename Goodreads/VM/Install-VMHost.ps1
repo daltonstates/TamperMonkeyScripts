@@ -48,7 +48,12 @@ if ($Enable) {
     }
 }
 $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + $runner + '"') -WorkingDirectory $runtime
-$trigger = New-ScheduledTaskTrigger -Daily -At ([DateTime]::ParseExact($settings.hostStartAt, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture))
+$startAt = [DateTime]::ParseExact($settings.hostStartAt, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+$trigger = New-ScheduledTaskTrigger -Daily -At $startAt
+# A fixed offset makes 03:55 EDT become 02:55 EST after the autumn change.
+# With no offset, Task Scheduler uses the host's Eastern time and DST rules.
+# https://learn.microsoft.com/windows/win32/api/taskschd/nf-taskschd-itrigger-put_startboundary
+$trigger.StartBoundary = $startAt.ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description 'Boot the giveaway VM each morning and wait for its guest job to shut it down. Save a stalled VM at the time limit to release RAM; saved failures require inspection.' -Force | Out-Null

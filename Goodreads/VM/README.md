@@ -4,7 +4,8 @@ These scripts are a separate installation for a dedicated Windows VM. The
 ordinary [userscript and companion](../README.md) work without them. Checking
 out this directory does not change Windows or install any tasks.
 
-The default host task boots the VM at **03:55 Eastern**. The guest signs in to
+The default host task boots the VM at **03:55 Eastern**, following daylight-saving
+changes rather than storing a fixed UTC offset. The guest signs in to
 its own Windows console and runs its Edge profiles around **04:00, 04:30, and
 05:00**, each with a 0–5 minute delay. Completed listing windows close before
 the next account starts. After success the guest shuts down, releasing its

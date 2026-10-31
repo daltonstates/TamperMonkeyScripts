@@ -20,6 +20,8 @@ try {
     $path = Join-Path $scratch 'settings.json'
     $settings = Read-VMSettings (Join-Path $PSScriptRoot 'vm-settings.example.json')
     $settings.vmId = [guid]::NewGuid().ToString()
+    # Keep pre-existing installed watchdog receipts out of these fake-VM cases.
+    $settings.reportDirectory = Join-Path $scratch 'initial-reports'
     Write-VMJson $path $settings
     Assert-Check ((Read-VMSettings $path).vmId -eq $settings.vmId) 'Settings round trip failed.'
     foreach ($change in @(
