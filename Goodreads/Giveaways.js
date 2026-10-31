@@ -2,9 +2,9 @@
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
 // @version      4.35
-// @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js
-// @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js
-// @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/vm/Goodreads
+// @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
+// @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
+// @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, optionally opens all on load, and supports a Keyfire workflow companion while claiming.

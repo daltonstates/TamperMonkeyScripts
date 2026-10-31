@@ -1,23 +1,5 @@
 # Optional Hyper-V giveaway workflow
 
-## VM development branch
-
-Keep VM repairs and their validation on the `vm` branch. The general userscript
-release remains on `main`. The VM branch's userscript header and
-`Configure-TampermonkeyUpdates.cjs` both use the
-[`vm` update feed](https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js).
-Installing that userscript in an existing VM profile preserves its script name
-and namespace. Use one enabled copy per profile and check for saved URL
-overrides that could keep it on `main`.
-
-Creating or updating the branch does not deploy the Python or PowerShell files
-into Windows, switch an existing profile's update feed, or establish a successful
-live run. Validate the installed copies with an observed scheduled run through
-all profiles, cleanup, VM shutdown, fresh report export, and an actual report
-notification click before promoting changes to the general release.
-
-## Workflow
-
 These scripts are a separate installation for a dedicated Windows VM. The
 ordinary [userscript and companion](../README.md) work without them. Checking
 out this directory does not change Windows or install any tasks.
@@ -150,7 +132,7 @@ Copy-VMFile -VMName 'GoodreadsGiveaways' -SourcePath $zip -DestinationPath 'C:\U
 Extract the package inside the guest. In every guest Edge profile:
 
 1. Sign into the intended Goodreads account.
-2. Install the current `Goodreads/Giveaways.js` from the `vm` branch, **4.35 or later**, in
+2. Install the current `Goodreads/Giveaways.js`, **4.35 or later**, in
    Tampermonkey, with the current Python runner for bounded startup-window
    retries. Version 4.33 waits for result navigation after Submit instead of
    closing the entry tab while the request may still be pending. Avoid duplicate
