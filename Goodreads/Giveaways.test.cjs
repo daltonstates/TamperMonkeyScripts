@@ -93,6 +93,7 @@ function createPage({
   dailyFailure = null,
   dailyCloseListing = false,
   dailyWindowWait = 0,
+  dailyResponse = null,
   automationSettings = legacyAutomationSettings,
 } = {}) {
   if (automationSettings !== null && !stored.has(automationSettingsKey)) {
@@ -355,22 +356,25 @@ function createPage({
         dailyRequests.push(value);
         schedule(() => {
           if (dailyFailure === "offline") return options.onerror();
+          const response = {
+            protocol: 1,
+            mode:
+              value.state === "ready" && now < startTime + dailyWindowWait
+                ? "wait"
+                : dailyMode,
+            closeListing:
+              dailyCloseListing &&
+              ["finished", "verified"].includes(value.state),
+            cancel:
+              ["cancel", "cleanup"].includes(dailyFailure) &&
+              value.state === "running",
+            closeRunTabs: dailyFailure === "cleanup",
+          };
           options.onload({
             status: 200,
-            responseText: JSON.stringify({
-              protocol: 1,
-              mode:
-                value.state === "ready" && now < startTime + dailyWindowWait
-                  ? "wait"
-                  : dailyMode,
-              closeListing:
-                dailyCloseListing &&
-                ["finished", "verified"].includes(value.state),
-              cancel:
-                ["cancel", "cleanup"].includes(dailyFailure) &&
-                value.state === "running",
-              closeRunTabs: dailyFailure === "cleanup",
-            }),
+            responseText: JSON.stringify(
+              dailyResponse ? { ...response, ...dailyResponse(value) } : response,
+            ),
           });
         }, 0);
         return {
@@ -1992,6 +1996,61 @@ test("only a ready entry from the active Keyfire batch gets a helper marker", as
   assert.equal(entry.openedTabs.length, 0);
 });
 
+for (const [stage, pathname] of [["address", addressPath], ["entry", entryPath]]) {
+  for (const hash of ["", "#grGiveawayIndex=1"]) {
+    test(`${stage} helper authorization survives tracking-fragment cleanup to ${hash || "empty"}`, async () => {
+      const page = keyfirePage();
+      await page.advanceAsync(1250);
+      const url = new URL(page.openedTabs[0].href);
+      url.pathname = pathname;
+      const entry = createPage({
+        href: url.href,
+        stored: page.stored,
+        ready: true,
+      });
+      const control = entry.document.activeElement;
+      assert.match(entry.document.title, /^\[GR Keyfire /);
+
+      // Goodreads can clean tracking metadata through history.replaceState
+      // while keeping this focused form and its per-tab authorization alive.
+      url.hash = hash;
+      entry.window.history.replaceState(null, "", url.href);
+      entry.advance(250);
+      assert.match(entry.document.title, /^\[GR Keyfire /);
+      assert.equal(entry.document.activeElement, control);
+      assert.ok(entry.sessionStored.has("gr_giveaway_progress"));
+
+      if (stage === "address") {
+        entry.document.emit("keydown", { key: "Enter", target: control });
+        assert.match(entry.document.title, /^\[GR Keyfire /);
+      }
+      entry.document.emit("submit");
+      assert.equal(entry.document.title, "Giveaways | Goodreads");
+      entry.advance(6000);
+      if (stage === "address") assert.match(entry.document.title, /^\[GR Keyfire /);
+      else assert.equal(entry.document.title, "Giveaways | Goodreads");
+    });
+  }
+}
+
+for (const change of ["origin", "path", "query"]) {
+  test(`address helper authorization stops when its document ${change} changes`, async () => {
+    const page = keyfirePage();
+    await page.advanceAsync(1250);
+    const entry = createPage({
+      href: page.openedTabs[0].href,
+      stored: page.stored,
+      ready: true,
+    });
+    assert.match(entry.document.title, /^\[GR Keyfire /);
+    if (change === "origin") entry.window.location.hostname = "example.com";
+    else if (change === "path") entry.window.location.pathname = "/giveaway/enter_choose_address/456";
+    else entry.window.location.search = "?address=another-address";
+    entry.advance(250);
+    assert.equal(entry.document.title, "Giveaways | Goodreads");
+  });
+}
+
 test("cancelling the last pending claim removes its helper marker and never opens another tab", async () => {
   const page = keyfirePage();
   await page.advanceAsync(1250);
@@ -2216,6 +2275,90 @@ test("VM failure cleanup closes only its tracked tabs before closing its listing
   assert.equal(page.openedTabs.length, 1);
 });
 
+test("VM cleanup retains its window marker through delayed child closure and refused script closure", async () => {
+  const tag = "e".repeat(32);
+  const prefix = `[GR Daily ${tag}] `;
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${tag}`,
+    dailyFailure: "cleanup",
+  });
+  await page.advanceAsync(1500);
+  const child = page.openedTabs[0];
+  child.close = () => {};
+  let listingCloseRequests = 0;
+  page.window.close = () => { listingCloseRequests++; };
+  await page.advanceAsync(4500);
+
+  page.document.title = "Goodreads rendered a new title";
+  await page.advanceAsync(250);
+  assert.ok(page.document.title.startsWith(prefix));
+  assert.equal(page.dailyRequests.some((r) => r.state === "cleanup-ready"), false);
+  assert.equal(listingCloseRequests, 0);
+
+  // The native fallback must still recognize this exact window after the
+  // child acknowledges closure and script-based window.close is refused.
+  page.document.title = "Another Goodreads title";
+  child.closed = true;
+  child.onclose();
+  await page.advanceAsync(0);
+  assert.equal(page.dailyRequests.filter((r) => r.state === "cleanup-ready").length, 1);
+  assert.equal(listingCloseRequests, 1);
+  assert.ok(page.document.title.startsWith(prefix));
+  page.document.title = "A title after script closure was refused";
+  await page.advanceAsync(250);
+  assert.ok(page.document.title.startsWith(prefix));
+  assert.equal(page.openedTabs.length, 1);
+
+  page.window.emit("pagehide");
+  page.document.title = "The page has left";
+  await page.advanceAsync(1000);
+  assert.equal(page.document.title, "The page has left");
+});
+
+test("repeated authorized VM cleanup responses share one close and acknowledgement", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"e".repeat(32)}`,
+    dailyFailure: "cleanup",
+    // The real coordinator also repeats cancellation on the failed-state
+    // acknowledgement after cancelling an earlier running heartbeat.
+    dailyResponse: (request) => request.state === "failed"
+      ? { cancel: true, closeRunTabs: true }
+      : {},
+  });
+  await page.advanceAsync(1500);
+  const child = page.openedTabs[0];
+  let childCloseRequests = 0;
+  child.close = () => { childCloseRequests++; };
+  await page.advanceAsync(4500);
+  assert.equal(childCloseRequests, 1);
+  assert.equal(page.dailyRequests.some((r) => r.state === "cleanup-ready"), false);
+  child.closed = true;
+  child.onclose();
+  await page.advanceAsync(0);
+  assert.equal(page.dailyRequests.filter((r) => r.state === "cleanup-ready").length, 1);
+  assert.equal(page.closeCount, 1);
+  assert.equal(page.openedTabs.length, 1);
+});
+
+test("leaving a listing stops pending VM cleanup without closing the replacement page", async () => {
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"e".repeat(32)}`,
+    dailyFailure: "cleanup",
+  });
+  await page.advanceAsync(1500);
+  const child = page.openedTabs[0];
+  child.close = () => {};
+  await page.advanceAsync(4500);
+  page.window.emit("pagehide");
+  page.document.title = "A different page";
+  child.closed = true;
+  child.onclose();
+  await page.advanceAsync(1000);
+  assert.equal(page.document.title, "A different page");
+  assert.equal(page.dailyRequests.some((r) => r.state === "cleanup-ready"), false);
+  assert.equal(page.closeCount, 0);
+});
+
 test("a delayed scheduled window waits without requesting a macro or opening tabs", async () => {
   const page = dailyPage({ dailyWindowWait: 8000, dailyMode: "verify" });
   await page.advanceAsync(7000);
@@ -2358,6 +2501,29 @@ test("managed runs close only the listing after the last entry tab closes", asyn
   await page.advanceAsync(0);
   assert.equal(page.closeCount, 1);
   assert.equal(page.dailyRequests.at(-1).state, "finished");
+});
+
+test("completed managed listings retain the marker until native closure or pagehide", async () => {
+  const tag = "a".repeat(32);
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${tag}`,
+    dailyCloseListing: true,
+    listing: { pages: [[123]] },
+  });
+  let closeRequests = 0;
+  page.window.close = () => { closeRequests++; };
+  await page.advanceAsync(1500);
+  page.openedTabs[0].close();
+  await page.advanceAsync(0);
+  assert.equal(closeRequests, 1);
+  assert.equal(page.dailyRequests.at(-1).state, "finished");
+  page.document.title = "A title after window.close was refused";
+  await page.advanceAsync(250);
+  assert.ok(page.document.title.startsWith(`[GR Daily ${tag}] `));
+  page.window.emit("pagehide");
+  page.document.title = "Another page";
+  await page.advanceAsync(1000);
+  assert.equal(page.document.title, "Another page");
 });
 
 test("managed verification exercises listing closure without opening entries", async () => {

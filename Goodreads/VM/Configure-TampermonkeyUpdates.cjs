@@ -3,7 +3,7 @@ const path = require("node:path");
 const cp = require("node:child_process");
 
 const UPDATE_URL =
-  "https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js";
+  "https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js";
 
 function updatedRecords(records) {
   const all = new Map(records);

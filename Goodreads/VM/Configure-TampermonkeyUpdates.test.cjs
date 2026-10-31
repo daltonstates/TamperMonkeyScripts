@@ -48,6 +48,12 @@ test("changes update settings in place and preserves script source, storage, fil
   assert.equal(JSON.stringify(records), before);
   assert.equal(result.uuid, "uuid");
   assert.equal(changed.get("!extdb.@meta#uuid").value.version, "4.30");
+  for (const field of ["updateURL", "downloadURL", "fileURL"]) {
+    assert.equal(
+      changed.get("!extdb.@meta#uuid").value[field],
+      "https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js",
+    );
+  }
   assert.deepEqual(changed.get("!extdb.@meta#uuid").value.options.override, {
     keep: true,
   });

@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.34
-// @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
-// @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
-// @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
+// @version      4.35
+// @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js
+// @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js
+// @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/vm/Goodreads
 // @author       Dalton
 // @license      MIT
 // @description  Filters Goodreads giveaways, optionally opens all on load, and supports a Keyfire workflow companion while claiming.
@@ -358,6 +358,58 @@
     return `${dailyRun?.baseOpened + giveawayBatchOpened || 0}/${giveawayBatchTotal};${trackedGiveawayTabs.size} open;${loadingGiveaways ? "loading" : "claiming"}`;
   }
 
+  function stopDailyTitleRetention(run = dailyRun) {
+    if (!run) return;
+    clearInterval(run.titleTimer);
+    run.titleTimer = null;
+  }
+
+  function retainDailyTitle(run = dailyRun) {
+    if (
+      !run?.windowTag ||
+      run !== dailyRun ||
+      leavingPage ||
+      (run.stopped && !run.closing)
+    ) return false;
+    const prefix = `[GR Daily ${run.windowTag}] `;
+    if (!document.title.startsWith(prefix))
+      document.title =
+        prefix + document.title.replace(/^\[GR Daily [a-f0-9]{32}\] /, "");
+    return true;
+  }
+
+  function keepDailyTitle(run = dailyRun) {
+    if (!retainDailyTitle(run) || run.titleTimer !== null) return;
+    run.titleTimer = setInterval(() => {
+      if (!retainDailyTitle(run)) stopDailyTitleRetention(run);
+    }, 250);
+  }
+
+  function cleanupDailyRun(token) {
+    const run = dailyRun;
+    if (!run?.windowTag || run.token !== token || leavingPage) return;
+    if (run.cleanupPromise) return run.cleanupPromise;
+    // Stopping entries and closing their owned window are separate states.
+    // Windows still needs the nonce title if script window.close is refused.
+    run.closing = true;
+    keepDailyTitle(run);
+    run.cleanupPromise = Promise.resolve()
+      .then(async () => {
+        if (leavingPage || dailyRun !== run) return;
+        giveawayRunController?.abort();
+        for (const close of giveawayTabClosers.values()) close();
+        await Promise.all([...trackedGiveawayTabs]);
+        if (leavingPage || dailyRun !== run) return;
+        retainDailyTitle(run);
+        await dailyRequest(run.token, "cleanup-ready");
+        if (leavingPage || dailyRun !== run) return;
+        retainDailyTitle(run);
+        window.close();
+      })
+      .catch(() => {});
+    return run.cleanupPromise;
+  }
+
   function dailyRequest(token, state, reason = "") {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -411,16 +463,9 @@
                 value.closeRunTabs &&
                 dailyRun?.windowTag
               ) {
-                giveawayRunController?.abort();
-                for (const close of giveawayTabClosers.values()) close();
                 // Only close this authenticated scheduled listing after its own
                 // child tabs really closed. A refused close preserves the run.
-                void Promise.all([...trackedGiveawayTabs])
-                  .then(async () => {
-                    await dailyRequest(dailyRun.token, "cleanup-ready");
-                    window.close();
-                  })
-                  .catch(() => {});
+                void cleanupDailyRun(token);
               }
               if (
                 response.status !== 200 ||
@@ -452,7 +497,7 @@
     dailyRun.waitingForWindow = false;
     dailyRun.message = `Daily run stopped: ${message}`;
     clearInterval(dailyRun.timer);
-    clearInterval(dailyRun.titleTimer);
+    if (!dailyRun.closing) stopDailyTitleRetention();
     giveawayRunController?.abort();
     sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
     void dailyRequest(dailyRun.token, "failed", message).catch(() => {});
@@ -468,25 +513,14 @@
       token,
       windowTag,
       stopped: false,
+      closing: false,
+      cleanupPromise: null,
       waitingForWindow: true,
       timer: null,
       titleTimer: null,
       baseOpened: continuation?.openedIds.length ?? 0,
     };
-    if (windowTag) {
-      const prefix = `[GR Daily ${windowTag}] `;
-      const retainTitle = () => {
-        if (dailyRun.stopped || leavingPage) {
-          clearInterval(dailyRun.titleTimer);
-          return;
-        }
-        if (!document.title.startsWith(prefix))
-          document.title =
-            prefix + document.title.replace(/^\[GR Daily [a-f0-9]{32}\] /, "");
-      };
-      retainTitle();
-      dailyRun.titleTimer = setInterval(retainTitle, 250);
-    }
+    keepDailyTitle();
     try {
       let response;
       const readyDeadline = Date.now() + 35000;
@@ -561,10 +595,12 @@
       if (!dailyRun.windowTag)
         throw new Error("The daily listing has no cleanup identifier.");
       // Close only this scheduled listing. Keep profile sign-ins and other windows.
+      dailyRun.closing = true;
+      keepDailyTitle();
       window.close();
     }
     dailyRun.stopped = true;
-    clearInterval(dailyRun.titleTimer);
+    if (!dailyRun.closing) stopDailyTitleRetention();
   }
 
   function giveawayListPageKey() {
@@ -1441,14 +1477,19 @@
     let stopped = false;
     let addressPendingUntil = 0;
     let addressSubmissions = 0;
-    const pageHref = window.location.href;
+    const pageUrl = new URL(window.location.href);
     const refresh = () => {
+      const currentUrl = new URL(window.location.href);
       const expiresAt = Number(
         localStorage.getItem(LS_KEYFIRE_RUN_PREFIX + progress.keyfireRun),
       );
       const active =
         !stopped &&
-        window.location.href === pageHref &&
+        // Tracking fragments can be cleaned without leaving this form. The
+        // original route and query still bind authorization to this giveaway.
+        currentUrl.origin === pageUrl.origin &&
+        currentUrl.pathname === pageUrl.pathname &&
+        currentUrl.search === pageUrl.search &&
         Date.now() >= addressPendingUntil &&
         localStorage.getItem(LS_KEYFIRE_ENABLED) === "1" &&
         document.hasFocus() &&
@@ -2804,6 +2845,7 @@
       setInterval(tick, 1000);
       window.addEventListener("pagehide", () => {
         leavingPage = true;
+        stopDailyTitleRetention();
         giveawayRunController?.abort();
       });
       const continuation = takeGiveawayContinuation();

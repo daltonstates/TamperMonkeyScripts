@@ -1,5 +1,23 @@
 # Optional Hyper-V giveaway workflow
 
+## VM development branch
+
+Keep VM repairs and their validation on the `vm` branch. The general userscript
+release remains on `main`. The VM branch's userscript header and
+`Configure-TampermonkeyUpdates.cjs` both use the
+[`vm` update feed](https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js).
+Installing that userscript in an existing VM profile preserves its script name
+and namespace. Use one enabled copy per profile and check for saved URL
+overrides that could keep it on `main`.
+
+Creating or updating the branch does not deploy the Python or PowerShell files
+into Windows, switch an existing profile's update feed, or establish a successful
+live run. Validate the installed copies with an observed scheduled run through
+all profiles, cleanup, VM shutdown, fresh report export, and an actual report
+notification click before promoting changes to the general release.
+
+## Workflow
+
 These scripts are a separate installation for a dedicated Windows VM. The
 ordinary [userscript and companion](../README.md) work without them. Checking
 out this directory does not change Windows or install any tasks.
@@ -132,7 +150,7 @@ Copy-VMFile -VMName 'GoodreadsGiveaways' -SourcePath $zip -DestinationPath 'C:\U
 Extract the package inside the guest. In every guest Edge profile:
 
 1. Sign into the intended Goodreads account.
-2. Install the current `Goodreads/Giveaways.js`, **4.34 or later**, in
+2. Install the current `Goodreads/Giveaways.js` from the `vm` branch, **4.35 or later**, in
    Tampermonkey, with the current Python runner for bounded startup-window
    retries. Version 4.33 waits for result navigation after Submit instead of
    closing the entry tab while the request may still be pending. Avoid duplicate
@@ -283,6 +301,21 @@ an apparently completed queue from a timeout or a capped batch with no new
 eligible entries. Saved genre filters still apply. A failed profile's
 `failureRecovered` field means its tabs were cleaned up; its missed entries
 were not retried. Include `daily.log` when investigating a recorded failure.
+
+Failure cleanup allows up to 90 seconds for a background listing to receive the
+cancel instruction, acknowledge that its own entry tabs closed, and close its
+owned listing window. The deadline does not restart when the browser polls.
+The listing keeps its identifying title until it actually leaves the page, so
+the native close fallback can still verify the window. Unconfirmed cleanup
+preserves the unfinished-work marker and blocks the next account.
+
+The profile's `cleanup` object records whether the command was offered, whether
+the browser acknowledged child closure, whether the listing closed, elapsed
+time, and a failure reason. A command offered by the server is not proof that
+the browser received it. These fields explain cleanup failures separately from
+the entry-processing error in `reason`. A `progress` value such as
+`1/33;1 open;claiming` means one entry tab was opened and remained open when
+the account failed; it does not establish that the entry was accepted.
 
 Building the native helper requires Visual Studio C++ Build Tools and a Windows
 SDK on the host. The installer finds them with `vswhere`, compiles with the

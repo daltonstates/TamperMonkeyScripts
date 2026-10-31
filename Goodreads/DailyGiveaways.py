@@ -25,6 +25,9 @@ LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&aut
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
 WINDOW_BIND_TIMEOUT = "The scheduled Edge window was not identified within 30 seconds; see windowBinding in the daily report."
+# Background listing timers may run only once a minute. Leave time for the
+# next authenticated heartbeat to receive cancellation and then close its tabs.
+FAILED_CLEANUP_SECONDS = 90
 
 
 def read_settings(path):
@@ -221,8 +224,19 @@ class Session:
         self.recover_failures = recover_failures
         self.cleanup_supported = False
         self.cleanup_ready = False
+        self.cleanup_requested_at = None
+        self.cleanup_ready_at = None
         self.capabilities = {}
         self.userscript_version = None
+
+    def cleanup_response(self):
+        """Return the same cancellation without restarting any cleanup deadline."""
+        close_tabs = self.state == "failed" and self.recover_failures and self.cleanup_supported
+        if close_tabs and self.cleanup_requested_at is None:
+            # This records an offered command, not proof of browser receipt.
+            # cleanup-ready is the separate authenticated acknowledgement.
+            self.cleanup_requested_at = self.clock()
+        return {"protocol": 1, "cancel": True, "closeRunTabs": close_tabs}
 
     def event(self, value):
         with self.lock:
@@ -232,11 +246,13 @@ class Session:
                 raise ValueError("Unknown scheduled run")
             if self.state in TERMINAL:
                 if (self.state == "failed" and self.recover_failures and self.cleanup_supported
+                        and self.cleanup_requested_at is not None
                         and value.get("state") == "cleanup-ready" and value.get("windowTag") == self.window_tag):
                     self.cleanup_ready = True
+                    if self.cleanup_ready_at is None:
+                        self.cleanup_ready_at = self.clock()
                     return {"protocol": 1, "cancel": False, "closeListing": True}
-                return {"protocol": 1, "cancel": True,
-                        "closeRunTabs": self.state == "failed" and self.recover_failures and self.cleanup_supported}
+                return self.cleanup_response()
             state = value.get("state")
             allowed = {"ready", "verified", "failed", "cancelled"} if self.verify else {
                 "ready", "running", "finished", "failed", "cancelled",
@@ -320,7 +336,7 @@ class Session:
                 self.last_progress, self.progress = now, progress
             self.state, self.reason = state, reason
             if state == "failed" and self.recover_failures and self.cleanup_supported:
-                return {"protocol": 1, "cancel": True, "closeRunTabs": True}
+                return self.cleanup_response()
             return {"protocol": 1, "mode": "verify" if self.verify else "run", "cancel": False}
 
     def check_deadlines(self):
@@ -429,6 +445,56 @@ def save_report(path, report):
     temporary.replace(path)
 
 
+def recover_failed_listing(session):
+    """Wait for child acknowledgement and actual closure of this owned window."""
+    started = session.clock()
+    deadline = started + FAILED_CLEANUP_SECONDS
+    next_close_attempt = started
+    diagnostics = {"timeoutSeconds": FAILED_CLEANUP_SECONDS, "requestOffered": False,
+                   "readyObserved": False, "listingClosed": False, "closeAttempts": 0,
+                   "closeRequestAccepted": False, "recovered": False}
+    name = session.profile.get("name", "Account")
+    logging.info("%s: waiting up to %ss for authenticated failure cleanup", name, FAILED_CLEANUP_SECONDS)
+    while True:
+        now = session.clock()
+        with session.lock:
+            requested_at, ready_at = session.cleanup_requested_at, session.cleanup_ready_at
+            ready = session.cleanup_ready
+        for key, observed_at in (("requestOffered", requested_at), ("readyObserved", ready_at)):
+            if observed_at is not None and not diagnostics[key]:
+                diagnostics[key] = True
+                diagnostics[key + "AfterSeconds"] = round(max(0, observed_at - started), 3)
+                logging.info("%s: failure cleanup %s after %.3fs", name, key,
+                             diagnostics[key + "AfterSeconds"])
+        diagnostics["listingClosed"] = session.listing.closed()
+        diagnostics["elapsedSeconds"] = round(max(0, now - started), 3)
+        if ready and diagnostics["listingClosed"]:
+            diagnostics.update(recovered=True, reason="Child tabs acknowledged closed and the owned listing closed.")
+            break
+        if now >= deadline:
+            if not diagnostics["requestOffered"]:
+                reason = "No authenticated browser request arrived to receive the cleanup command."
+            elif not ready:
+                reason = "The browser did not acknowledge that its child tabs closed."
+            elif diagnostics["closeAttempts"] and not diagnostics["closeRequestAccepted"]:
+                reason = "The owned listing changed identity or Windows refused its close request."
+            else:
+                reason = "The owned listing did not close after child cleanup was acknowledged."
+            diagnostics["reason"] = reason
+            break
+        if ready and not diagnostics["listingClosed"] and now >= next_close_attempt:
+            diagnostics["closeAttempts"] += 1
+            accepted = bool(session.listing.request_close())
+            diagnostics["closeRequestAccepted"] |= accepted
+            if diagnostics["closeAttempts"] == 1:
+                logging.info("%s: first owned listing close request accepted=%s", name, accepted)
+            next_close_attempt = now + 1
+        time.sleep(min(0.25, max(0, deadline - session.clock())))
+    logging.info("%s: failure cleanup recovered=%s after %.3fs: %s", name,
+                 diagnostics["recovered"], diagnostics["elapsedSeconds"], diagnostics["reason"])
+    return diagnostics
+
+
 def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False):
     run_started = datetime.now()
     base_starts = planned_starts(settings, run_started, immediate, randbelow=lambda _: 0)
@@ -501,12 +567,8 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
                     and listing.handle is not None):
                 # The authenticated listing closes only the tabs it opened when
                 # it receives closeRunTabs. Confirm closure before another account.
-                cleanup_deadline = time.monotonic() + 20
-                while not listing.closed() and time.monotonic() < cleanup_deadline:
-                    if session.cleanup_ready:
-                        listing.request_close()
-                    time.sleep(0.25)
-                if listing.closed():
+                item["cleanup"] = recover_failed_listing(session)
+                if item["cleanup"]["recovered"]:
                     item.update(listingClosed=True, failureRecovered=True)
                     pending_path.unlink(missing_ok=True)
             if listing and session.state in {"finished", "verified"}:

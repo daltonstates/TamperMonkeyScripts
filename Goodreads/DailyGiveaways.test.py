@@ -571,6 +571,150 @@ class QueueTests(unittest.TestCase):
 
 
 class FailureRecoveryTests(unittest.TestCase):
+    def exercise_delayed_cleanup(self, events, *, accept_close=True):
+        """Drive real queue/session cleanup with delayed browser protocol events."""
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            now = [0.0]
+            first_closed = [False]
+            server, first, second = MagicMock(), MagicMock(), MagicMock()
+            first.handle, second.handle = 123, 456
+            first.closed.side_effect = lambda: first_closed[0]
+            second.closed.return_value = True
+            close_requests, launches, replies, sessions = [], [], [], []
+            pending_events = list(events)
+
+            def request_close():
+                close_requests.append(now[0])
+                return accept_close
+
+            first.request_close.side_effect = request_close
+            settings = {"startAt": "04:00", "edgePath": "edge.exe", "userDataDirectory": folder,
+                        "closeCompletedListings": True,
+                        "profiles": [{"name": name, "directory": name, "offsetMinutes": i * 30}
+                                     for i, name in enumerate(("A", "B"))]}
+
+            def launch(arguments):
+                launches.append(now[0])
+                session = server.session
+                sessions.append(session)
+                session.clock = lambda: now[0]
+                session.started = session.last_seen = session.last_progress = now[0]
+                session.event({"token": session.token, "state": "ready", "closeListingSupported": True,
+                               "windowTag": session.window_tag, "addressSubmitRetrySupported": True,
+                               "failureCleanupSupported": True, "progress": "1/34;1 open;claiming"})
+                if len(launches) == 1:
+                    # The queue has stalled while its authenticated listing is
+                    # still reachable. Cancellation awaits a future heartbeat.
+                    session.last_progress = now[0] - 181
+                    session.check_deadlines()
+                    self.assertIn("No giveaway progress", session.reason)
+                else:
+                    session.event({"token": session.token, "state": "finished", "progress": "1/1;0 open;claiming"})
+
+            def sleep(seconds):
+                until = now[0] + seconds
+                while pending_events and pending_events[0][0] <= until:
+                    at, action = pending_events.pop(0)
+                    now[0] = at
+                    if action == "closed":
+                        first_closed[0] = True
+                        continue
+                    session = sessions[0]
+                    value = {"token": session.token, "state": "running", "windowTag": session.window_tag}
+                    if action in {"ready", "wrong-ready"}:
+                        value["state"] = "cleanup-ready"
+                    if action == "wrong-ready":
+                        value["windowTag"] = "invalid-owned-window"
+                    replies.append(session.event(value))
+                now[0] = until
+
+            with patch.object(daily, "Server", return_value=server), \
+                 patch.object(daily, "ListingWindow", side_effect=[first, second]), \
+                 patch.object(daily, "desktop_available", return_value=True), \
+                 patch.object(daily.subprocess, "Popen", side_effect=launch), \
+                 patch.object(daily.time, "sleep", side_effect=sleep):
+                code = daily.run_queue(settings, output, immediate=True, recover_failures=True)
+            return {"code": code, "report": json.loads((output / "daily-last-run.json").read_text()),
+                    "pending": (output / "daily-incomplete.json").exists(), "launches": launches,
+                    "closeRequests": close_requests, "replies": replies}
+
+    def test_delayed_heartbeat_and_child_ack_still_recover_before_next_profile(self):
+        result = self.exercise_delayed_cleanup([(45, "heartbeat"), (65, "ready"), (70, "closed")])
+        profiles = result["report"]["profiles"]
+        self.assertEqual(result["code"], 1)  # Cleanup never reclassifies the failed entry as success.
+        self.assertEqual([p["state"] for p in profiles], ["failed", "finished"])
+        self.assertTrue(profiles[0]["failureRecovered"])
+        self.assertTrue(profiles[0]["listingClosed"])
+        self.assertFalse(result["pending"])
+        self.assertGreaterEqual(result["launches"][1], 70)
+        self.assertTrue(result["closeRequests"])
+        self.assertTrue(all(at >= 65 for at in result["closeRequests"]))
+        cleanup = profiles[0]["cleanup"]
+        self.assertEqual(cleanup["requestOfferedAfterSeconds"], 45)
+        self.assertEqual(cleanup["readyObservedAfterSeconds"], 65)
+        self.assertEqual(cleanup["elapsedSeconds"], 70)
+        self.assertTrue(cleanup["recovered"])
+
+    def test_heartbeats_without_child_ack_cannot_close_or_unblock_profile(self):
+        result = self.exercise_delayed_cleanup([(45, "heartbeat"), (70, "heartbeat"), (85, "heartbeat")])
+        profiles = result["report"]["profiles"]
+        self.assertEqual([p["state"] for p in profiles], ["failed", "skipped"])
+        self.assertTrue(result["pending"])
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(result["closeRequests"], [])
+        cleanup = profiles[0]["cleanup"]
+        self.assertTrue(cleanup["requestOffered"])
+        self.assertFalse(cleanup["readyObserved"])
+        self.assertFalse(cleanup["recovered"])
+        self.assertEqual(cleanup["elapsedSeconds"], daily.FAILED_CLEANUP_SECONDS)
+        self.assertIn("did not acknowledge", cleanup["reason"])
+
+    def test_repeated_ready_does_not_extend_deadline_or_replace_actual_closure(self):
+        result = self.exercise_delayed_cleanup([(45, "heartbeat"), (60, "ready"), (85, "ready")])
+        profiles = result["report"]["profiles"]
+        self.assertEqual([p["state"] for p in profiles], ["failed", "skipped"])
+        self.assertTrue(result["pending"])
+        self.assertEqual(len(result["launches"]), 1)
+        cleanup = profiles[0]["cleanup"]
+        self.assertEqual(cleanup["readyObservedAfterSeconds"], 60)
+        self.assertEqual(cleanup["elapsedSeconds"], daily.FAILED_CLEANUP_SECONDS)
+        self.assertTrue(cleanup["closeRequestAccepted"])
+        self.assertFalse(cleanup["listingClosed"])
+        self.assertFalse(cleanup["recovered"])
+        self.assertIn("did not close", cleanup["reason"])
+
+    def test_refused_owned_window_close_records_the_cleanup_phase(self):
+        result = self.exercise_delayed_cleanup([(30, "heartbeat"), (40, "ready")], accept_close=False)
+        profile = result["report"]["profiles"][0]
+        cleanup = profile["cleanup"]
+        self.assertTrue(result["pending"])
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertGreater(cleanup["closeAttempts"], 0)
+        self.assertFalse(cleanup["closeRequestAccepted"])
+        self.assertFalse(cleanup["recovered"])
+        self.assertIn("changed identity or Windows refused", cleanup["reason"])
+
+    def test_wrong_window_ack_cannot_authorize_cleanup_even_if_listing_disappears(self):
+        result = self.exercise_delayed_cleanup([(30, "heartbeat"), (40, "wrong-ready"), (50, "closed")])
+        cleanup = result["report"]["profiles"][0]["cleanup"]
+        self.assertTrue(result["pending"])
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(result["closeRequests"], [])
+        self.assertFalse(cleanup["readyObserved"])
+        self.assertTrue(cleanup["listingClosed"])
+        self.assertFalse(cleanup["recovered"])
+
+    def test_no_returning_browser_request_records_undelivered_cleanup(self):
+        result = self.exercise_delayed_cleanup([])
+        cleanup = result["report"]["profiles"][0]["cleanup"]
+        self.assertTrue(result["pending"])
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertFalse(cleanup["requestOffered"])
+        self.assertFalse(cleanup["readyObserved"])
+        self.assertIn("No authenticated browser request", cleanup["reason"])
+        self.assertEqual(cleanup["elapsedSeconds"], daily.FAILED_CLEANUP_SECONDS)
+
     def test_vm_cleanup_requires_current_script_and_authenticated_child_close_ack(self):
         listing = MagicMock()
         session = daily.Session({}, listing=listing, window_tag="a" * 32, recover_failures=True)

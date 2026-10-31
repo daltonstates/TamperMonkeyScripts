@@ -1,5 +1,11 @@
 # Goodreads Giveaway Enhancer
 
+This checkout is the **VM development branch**. Version **4.35** contains the
+VM cleanup repairs and preserves the address helper when Goodreads removes
+the tracking fragment from the current page's URL. The general release is on
+[`main`](https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads).
+See the [VM guide](VM/README.md) for deployment and live validation.
+
 Version 4.34 adds a compact settings button with per-profile pacing, result-page
 delay, blank-page recovery, and tab-limit controls. These work with Tampermonkey
 alone and with the optional Keyfire companion. It retains version 4.33's fix:
@@ -22,15 +28,15 @@ required when using a Keyfire macro; ordinary tab opening works without it.
 Update the existing Tampermonkey script to the current version in each Edge profile.
 Keep automatic userscript update checks enabled in each profile's Tampermonkey
 installation. Future updates can then download automatically from the
-[published script](https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js).
+[VM branch script](https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/vm/Goodreads/Giveaways.js).
 The update runs on Tampermonkey's configured check interval while the browser is
 available; pushing to GitHub does not instantly update every profile.
 
 The header contains `@updateURL` and `@downloadURL`, both pointing at the script
-on `main`. `@namespace` identifies the script; a GitHub profile in that field
+on `vm`. `@namespace` identifies the script; a GitHub profile in that field
 alone does not enable updates. Keep its name and namespace stable, increase
 `@version` for each new userscript version, and commit and push that version to
-`main`. Local edits that have not been pushed are unavailable to the updater.
+`vm`. Local edits that have not been pushed are unavailable to the updater.
 
 For a script installed by pasting or opening a local file, this is a one-time
 replacement of its contents. Avoid leaving two enabled copies of the giveaway
