@@ -79,6 +79,31 @@ function Export-GiveawaysLiveReport($Settings, $Bundle) {
             else { [IO.File]::WriteAllText($path, [string]$Bundle.files.$name, [Text.UTF8Encoding]::new($false)) }
         }
     }
+    # This file is an exported snapshot, never a guest control marker. Once the
+    # same guest run proves every owned window closed, archive its old snapshot
+    # so a completed host report does not still appear to have unfinished work.
+    $runId=[string]$Bundle.runId
+    $guest=$Bundle.files.'vm-last-run.json'
+    if($runId -match '^[a-f0-9]{32}$' -and $guest.queueClosed -eq $true -and
+       $Bundle.files.PSObject.Properties.Name -notcontains 'daily-incomplete.json'){
+        $pending=Join-Path $Settings.reportDirectory 'daily-incomplete.json'
+        if(Test-Path -LiteralPath $pending){
+            if((Get-Item -LiteralPath $pending).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Host report paths must not be links.'}
+            $previous=Get-Content -LiteralPath $pending -Raw|ConvertFrom-Json
+            if($previous.runId -eq $runId){
+                $history=Join-Path $Settings.reportDirectory 'history'
+                New-Item -ItemType Directory -Path $history -Force|Out-Null
+                $deadline=[DateTimeOffset]::Now.AddSeconds(5)
+                do{
+                    try{Move-Item -LiteralPath $pending -Destination (Join-Path $history ('completed-pending-'+$runId+'.json')) -Force -ErrorAction Stop;break}
+                    catch{
+                        if(($_.Exception.HResult -band 65535) -notin @(5,32,33) -or [DateTimeOffset]::Now -ge $deadline){throw}
+                        Start-Sleep -Milliseconds 50
+                    }
+                }while($true)
+            }
+        }
+    }
 }
 
 function Get-GiveawaysHostShutdownEligibility($Settings) {

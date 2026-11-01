@@ -49,6 +49,21 @@ try{
     $script:exchange.GuestExchangeItems=@((KvpXml 'Goodreads.Report' $bad),(KvpXml 'Goodreads.Report.0' $encoded))
     Check ($null -eq (Read-GiveawaysLiveReport $settings)) 'A partial or corrupt report must not be accepted.'
 
+    $reports=Join-Path $scratch 'reports'
+    New-Item -ItemType Directory -Path $reports|Out-Null
+    $settings|Add-Member NoteProperty reportDirectory $reports
+    $completed=[pscustomobject]@{runId=('a'*32);files=[pscustomobject]@{'vm-last-run.json'=[pscustomobject]@{runId=('a'*32);queueClosed=$true}}}
+    Write-VMJson (Join-Path $reports 'daily-incomplete.json') @{runId=('a'*32);profile='A'}
+    Export-GiveawaysLiveReport $settings $completed
+    Check (-not(Test-Path (Join-Path $reports 'daily-incomplete.json')) -and (Test-Path (Join-Path $reports ('history\completed-pending-'+('a'*32)+'.json')))) 'Confirmed completion must archive its stale exported marker.'
+    Write-VMJson (Join-Path $reports 'daily-incomplete.json') @{runId=('b'*32);profile='B'}
+    Export-GiveawaysLiveReport $settings $completed
+    Check (Test-Path (Join-Path $reports 'daily-incomplete.json')) "Completion must preserve another run's exported marker."
+    Write-VMJson (Join-Path $reports 'daily-incomplete.json') @{runId=('a'*32);profile='A'}
+    $completed.files.'vm-last-run.json'.queueClosed=$false
+    Export-GiveawaysLiveReport $settings $completed
+    Check (Test-Path (Join-Path $reports 'daily-incomplete.json')) 'An active queue must preserve its exported unfinished-work evidence.'
+
     $previousProgramData=$env:ProgramData
     try{
         $env:ProgramData=$scratch
