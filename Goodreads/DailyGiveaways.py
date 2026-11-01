@@ -22,11 +22,11 @@ import time
 from KeyfireGiveaways import Settings, read_workflow
 
 PORT = 17385
-VERSION = "2026.11.01.1"
+VERSION = "2026.11.01.2"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
-WINDOW_BIND_TIMEOUT = "The scheduled Edge window was not identified within 30 seconds; see windowBinding in the daily report."
+WINDOW_BIND_TIMEOUT = "The scheduled Edge window was not identified and brought to the foreground within 30 seconds; see windowBinding in the daily report."
 # Background listing timers may run only once a minute. Leave time for the
 # next authenticated heartbeat to receive cancellation and then close its tabs.
 FAILED_CLEANUP_SECONDS = 90
@@ -127,10 +127,25 @@ class ListingWindow:
         self.user32.EnumWindows.restype = wintypes.BOOL
         self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         self.user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        self.user32.GetWindowThreadProcessId.restype = wintypes.DWORD
         self.user32.IsWindow.argtypes = [wintypes.HWND]
         self.user32.IsWindow.restype = wintypes.BOOL
         self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
         self.user32.IsWindowVisible.restype = wintypes.BOOL
+        self.user32.GetForegroundWindow.argtypes = []
+        self.user32.GetForegroundWindow.restype = wintypes.HWND
+        self.user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        self.user32.SetForegroundWindow.restype = wintypes.BOOL
+        self.user32.IsIconic.argtypes = [wintypes.HWND]
+        self.user32.IsIconic.restype = wintypes.BOOL
+        self.user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+        self.user32.ShowWindowAsync.restype = wintypes.BOOL
+        self.user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        self.user32.AttachThreadInput.restype = wintypes.BOOL
+        self.user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                           wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        self.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        self.user32.GetAsyncKeyState.restype = ctypes.c_short
         self.user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         self.user32.PostMessageW.restype = wintypes.BOOL
         self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -139,6 +154,8 @@ class ListingWindow:
             wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
         ]
         self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.kernel32.GetCurrentThreadId.argtypes = []
+        self.kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
     def window_pid(self, handle):
         pid = wintypes.DWORD()
@@ -187,7 +204,46 @@ class ListingWindow:
         if len(matches) != 1:
             return False
         self.handle, self.pid = matches[0]
-        return True
+        # An existing Edge process may create its window behind Explorer when
+        # launched by a scheduled task. Focus only this nonce- and path-bound
+        # window before authorizing the userscript to open keyboard entry tabs.
+        counts["focusRequested"] = self.user32.GetForegroundWindow() != self.handle
+        if self.user32.IsIconic(self.handle):
+            self.user32.ShowWindowAsync(self.handle, 9)  # SW_RESTORE
+        if counts["focusRequested"]:
+            self.focus()
+        counts["foregroundReady"] = self.user32.GetForegroundWindow() == self.handle
+        return counts["foregroundReady"]
+
+    def focus(self):
+        """Activate this already identified window without sending any keys."""
+        title = ctypes.create_unicode_buffer(1024)
+        self.user32.GetWindowTextW(self.handle, title, len(title))
+        if not title.value.startswith(self.prefix) or self.window_pid(self.handle) != self.pid or any(
+                self.user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12, 0x5B, 0x5C)):
+            return False
+        if self.user32.SetForegroundWindow(self.handle):
+            return True
+        # The scheduled worker has its own input queue. Temporarily share the
+        # foreground/target input context, then release every attachment. The
+        # userscript still waits for actual foreground readiness before running.
+        message = wintypes.MSG()
+        self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+        current = self.kernel32.GetCurrentThreadId()
+        foreground = self.user32.GetForegroundWindow()
+        threads = {self.user32.GetWindowThreadProcessId(foreground, None),
+                   self.user32.GetWindowThreadProcessId(self.handle, None)}
+        attached = []
+        try:
+            for thread in threads:
+                if thread and thread != current:
+                    if not self.user32.AttachThreadInput(current, thread, True):
+                        return False
+                    attached.append(thread)
+            return bool(self.user32.SetForegroundWindow(self.handle))
+        finally:
+            for thread in reversed(attached):
+                self.user32.AttachThreadInput(current, thread, False)
 
     def closed(self):
         return self.handle is not None and (

@@ -10,6 +10,17 @@ signed-in interactive account and also checks at logon. Signing in again is
 not required for another request. Its Windows principal is `InteractiveToken`,
 not a service session. Keep the existing basic-console autologon configuration;
 an RDP session that leaves the console locked cannot run keyboard automation.
+An active guest request keeps the guest display and system awake through queue
+pacing, then releases that temporary power request. It does not change the
+power plan. Keeping only the system awake allows the virtual display to sleep,
+which hides browser pages and removes their authenticated keyboard targets.
+The queue brings only its uniquely marked, executable-verified Edge window to
+the foreground before opening entry tabs. Refused focus is a startup failure;
+the helper's fresh foreground authentication remains required for every key.
+The guest installer also preserves existing site exclusions while adding
+Goodreads to Edge's [sleeping-tabs exclusions](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies/sleepingtabsblockedforurls).
+The request listener remains enabled when `guest-settings.json` disables the
+queue, so disabled requests can still deliver current skip reports.
 
 If an earlier or manual queue is still active, the host keeps its new request
 queued while monitoring that queue. The startup acknowledgement deadline does

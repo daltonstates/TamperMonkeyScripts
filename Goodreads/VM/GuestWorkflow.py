@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-VERSION = "2026.11.01.1"
+VERSION = "2026.11.01.2"
 KVP_ROOT = r"SOFTWARE\Microsoft\Virtual Machine"
 REPORT_NAMES = ("vm-last-run.json", "vm-last-skip.json", "daily-last-run.json",
                 "daily-verification.json", "daily-incomplete.json", "helper-status.json", "installation.json")
@@ -190,7 +190,12 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
                 command.append("--recover-failures")
             if request.get("entryLimit"):
                 command += ["--entry-limit", str(request["entryLimit"])]
-            ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+            # A sleeping guest display hides browser pages and removes their
+            # authenticated keyboard target. Keep both display and system awake
+            # through queue pacing; restore the power request in finally.
+            if not ctypes.windll.kernel32.SetThreadExecutionState(0x80000003):
+                raise RuntimeError("Could not keep the guest display and system awake for keyboard automation")
+            report["powerRequest"] = {"systemRequired": True, "displayRequired": True}
             report["state"] = "running"
             emit()
             with (output / "vm-runner.log").open("a", encoding="utf-8") as log:

@@ -16,6 +16,11 @@ spec.loader.exec_module(guest)
 
 
 class GuestTests(unittest.TestCase):
+    def setUp(self):
+        power = patch.object(guest.ctypes, 'windll', MagicMock(), create=True)
+        power.start()
+        self.addCleanup(power.stop)
+
     def settings(self, root):
         daily=root/'daily-settings.json'
         guest.write_report(daily, {'closeCompletedListings':True,'profiles':[{'name':str(i)} for i in range(3)]})
@@ -68,6 +73,9 @@ class GuestTests(unittest.TestCase):
             self.assertTrue(report['shutdown']['eligible'])
             self.assertGreaterEqual(publish.call_count,4)
             self.assertFalse((root/'vm-last-success.json').exists()) # A limited check is not a full day's work.
+            calls=guest.ctypes.windll.kernel32.SetThreadExecutionState.call_args_list
+            self.assertEqual([call.args[0] for call in calls],[0x80000003,0x80000000])
+            self.assertTrue(report['powerRequest']['displayRequired'])
 
     def test_another_designated_job_defers_shutdown_and_unknown_inventory_is_safe(self):
         with tempfile.TemporaryDirectory() as folder:

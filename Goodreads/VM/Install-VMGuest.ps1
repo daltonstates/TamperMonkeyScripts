@@ -80,7 +80,7 @@ $companion=Join-Path $env:LOCALAPPDATA 'GoodreadsKeyfireCompanion'
 $pairing=Join-Path $companion 'pairing-key.txt'
 if(-not (Test-Path -LiteralPath $pairing)){throw 'Set up the existing local Keyfire helper in this account before enabling the VM adapter.'}
 $settings=if(Test-Path -LiteralPath $settingsPath){Get-Content -LiteralPath $settingsPath -Raw|ConvertFrom-Json}else{[pscustomobject]@{enabled=$false}}
-foreach($entry in @{dailyRunner=$dailyRunner;dailySettings=$dailyPath;recoverFailedProfiles=$true;adapterVersion='2026.11.01.1';interactiveUserSid=$identity.User.Value}.GetEnumerator()){$settings|Add-Member -Force NoteProperty $entry.Key $entry.Value}
+foreach($entry in @{dailyRunner=$dailyRunner;dailySettings=$dailyPath;recoverFailedProfiles=$true;adapterVersion='2026.11.01.2';interactiveUserSid=$identity.User.Value}.GetEnumerator()){$settings|Add-Member -Force NoteProperty $entry.Key $entry.Value}
 # The host owns shutdown and report delivery; the guest never powers off itself.
 $settings|Add-Member -Force NoteProperty shutdownAfterSuccess $false
 $settings|Add-Member -Force NoteProperty preflightUserScriptUpdates $false
@@ -101,8 +101,23 @@ if($admin){
     }finally{$registryKey.Dispose()}
 }
 $kvpKey=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Virtual Machine\Guest',[Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,[Security.AccessControl.RegistryRights]::SetValue)
-try{$kvpKey.SetValue('Goodreads.InstallVersion','2026.11.01.1',[Microsoft.Win32.RegistryValueKind]::String)}finally{$kvpKey.Dispose()}
+try{$kvpKey.SetValue('Goodreads.InstallVersion','2026.11.01.2',[Microsoft.Win32.RegistryValueKind]::String)}finally{$kvpKey.Dispose()}
 $wrapper=Join-Path $root 'Goodreads\VM\GuestWorkflow.py'
+# Keep Goodreads' background listing/coordinator out of Edge sleeping tabs.
+# Preserve every other existing site exclusion and profile preference.
+$sleepKeyPath='SOFTWARE\Policies\Microsoft\Edge\SleepingTabsBlockedForUrls'
+$sleepKey=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($sleepKeyPath)
+$exclusions=@()
+try{if($sleepKey){$exclusions=@($sleepKey.GetValueNames()|ForEach-Object{@{name=$_;value=[string]$sleepKey.GetValue($_)}})}}finally{if($sleepKey){$sleepKey.Dispose()}}
+if(-not @($exclusions|Where-Object{$_.value -eq '[*.]goodreads.com'}).Count){
+    if(-not $admin){throw 'An elevated guest installation is required once to configure the Goodreads sleeping-tabs exclusion.'}
+    $sleepKey=[Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($sleepKeyPath)
+    try{
+        $index=1
+        while($sleepKey.GetValueNames() -contains [string]$index){$index++}
+        $sleepKey.SetValue([string]$index,'[*.]goodreads.com',[Microsoft.Win32.RegistryValueKind]::String)
+    }finally{$sleepKey.Dispose()}
+}
 $taskName='Goodreads VM workflow'
 $existing=Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if($existing){
@@ -122,8 +137,9 @@ $poll.StartBoundary=[DateTime]::Today.ToString("yyyy-MM-dd'T'HH:mm:ss")
 $principal=New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
 $taskSettings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon,$poll) -Principal $principal -Settings $taskSettings -Description 'Poll for a Hyper-V host request in the signed-in interactive console. Run one completion-ordered queue; the host receives reports before deciding shutdown.' -Force|Out-Null
-if($settings.enabled){Enable-ScheduledTask -TaskName $taskName|Out-Null}else{Disable-ScheduledTask -TaskName $taskName|Out-Null}
+# The listener must remain available to publish a fresh disabled/skip result.
+Enable-ScheduledTask -TaskName $taskName|Out-Null
 $taskInfo=Get-ScheduledTaskInfo -TaskName $taskName
-@{state='installed';version='2026.11.01.1';at=[DateTimeOffset]::Now.ToString('o');timeZone=(Get-TimeZone).Id;identity=$identity.Name;taskState=[string](Get-ScheduledTask -TaskName $taskName).State;taskXml=(Export-ScheduledTask -TaskName $taskName);lastRunTime=$taskInfo.LastRunTime.ToString('o');lastTaskResult=$taskInfo.LastTaskResult;profiles=$daily.profiles}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $output 'installation.json') -Encoding UTF8
+@{state='installed';version='2026.11.01.2';at=[DateTimeOffset]::Now.ToString('o');timeZone=(Get-TimeZone).Id;identity=$identity.Name;taskState=[string](Get-ScheduledTask -TaskName $taskName).State;taskXml=(Export-ScheduledTask -TaskName $taskName);lastRunTime=$taskInfo.LastRunTime.ToString('o');lastTaskResult=$taskInfo.LastTaskResult;profiles=$daily.profiles}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $output 'installation.json') -Encoding UTF8
 if($VerifyOnly){& $python $wrapper --settings $settingsPath --verify-only --keep-running;if($LASTEXITCODE -ne 0){throw 'Guest setup verification failed.'}}
-Write-Output "Installed guest adapter 2026.11.01.1; task enabled: $($settings.enabled). Existing browser and macro settings preserved."
+Write-Output "Installed guest adapter 2026.11.01.2; task enabled: $($settings.enabled). Existing browser and macro settings preserved."

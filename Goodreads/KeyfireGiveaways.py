@@ -27,7 +27,7 @@ import threading
 import time
 
 
-VERSION = "2026.11.01.1"
+VERSION = "2026.11.01.2"
 MARKER = re.compile(
     r"^\[GR Keyfire ([a-f0-9]{32}) ([a-f0-9]{64}) ([A-Za-z0-9_-]{1,2048}) (\d+) (address|entry) (\d+)\] "
 )

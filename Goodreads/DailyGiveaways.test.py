@@ -244,6 +244,9 @@ class QueueTests(unittest.TestCase):
         window.edge_path = os.path.normcase(os.path.abspath("edge.exe"))
         window.callback_type = lambda callback: callback
         window.user32, window.kernel32 = MagicMock(), MagicMock()
+        window.user32.GetForegroundWindow.return_value = 1
+        window.user32.IsIconic.return_value = False
+        window.user32.GetAsyncKeyState.return_value = 0
         window.user32.IsWindowVisible.side_effect = lambda handle: handle != 4
         window.window_pid = lambda handle: handle
         window.kernel32.OpenProcess.side_effect = lambda flags, inherit, pid: pid
@@ -262,9 +265,32 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(window.bind())
         self.assertEqual((window.handle, window.pid), (1, 1))
         self.assertEqual(window.diagnostics, {"visibleEdgeWindows": 2, "markerWindows": 2,
-                                              "matchingEdgeWindows": 1, "rejectedMarkerWindows": 1})
+                                              "matchingEdgeWindows": 1, "rejectedMarkerWindows": 1,
+                                              "focusRequested": False, "foregroundReady": True})
         self.assertNotIn("a" * 32, json.dumps(window.diagnostics))
         window.user32.PostMessageW.assert_not_called()
+        window.user32.GetForegroundWindow.side_effect = [2, 1]
+        self.assertTrue(window.bind())
+        window.user32.SetForegroundWindow.assert_called_once_with(1)
+        self.assertTrue(window.diagnostics["focusRequested"])
+        window.user32.GetForegroundWindow.side_effect = None
+        window.user32.GetForegroundWindow.return_value = 2
+        self.assertFalse(window.bind())
+        self.assertFalse(window.diagnostics["foregroundReady"])
+        window.user32.SetForegroundWindow.side_effect = [False, True]
+        window.user32.GetForegroundWindow.side_effect = [2, 2, 1]
+        window.kernel32.GetCurrentThreadId.return_value = 11
+        window.user32.GetWindowThreadProcessId.return_value = 22
+        window.user32.AttachThreadInput.return_value = True
+        self.assertTrue(window.bind())
+        self.assertEqual([call.args for call in window.user32.AttachThreadInput.call_args_list],
+                         [(11, 22, True), (11, 22, False)])
+        window.user32.GetForegroundWindow.side_effect = None
+        window.user32.GetForegroundWindow.return_value = 2
+        window.user32.GetAsyncKeyState.return_value = 0x8000
+        window.user32.SetForegroundWindow.reset_mock()
+        self.assertFalse(window.bind())
+        window.user32.SetForegroundWindow.assert_not_called()
 
     def test_native_probe_errors_stop_before_authorizing_entries(self):
         listing = MagicMock()
