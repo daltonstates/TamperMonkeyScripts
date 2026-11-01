@@ -175,8 +175,68 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request(**value)[1]["mode"], "verify")
         self.assertTrue(self.server.session.window_binding["retrySupported"])
 
+    def test_ready_contract_loads_selected_macro_and_credits_its_waits_once(self):
+        now = [0]
+        listing = MagicMock()
+        listing.bind.return_value = True
+        listing.diagnostics = {"matchingEdgeWindows": 1}
+        session = daily.Session({"name": "A"}, clock=lambda: now[0], listing=listing,
+                                window_tag="a" * 32, recover_failures=True,
+                                entry_limit=1, keyfire_config="selected.json")
+        self.server.session = session
+        value = {"closeListingSupported": True, "windowTag": "a" * 32, "windowWaitSupported": True,
+                 "addressSubmitRetrySupported": True, "failureCleanupSupported": True,
+                 "controlledEntryLimitSupported": True, "userscriptVersion": "4.37",
+                 "workflow": {"macroName": "Saved macro", "browser": "edge", "profile": ""},
+                 "metrics": {"processed": 0, "loaded": 90}}
+        workflow = MagicMock(steps=[MagicMock(kind="wait", value=300000)])
+        with patch.object(daily, "read_workflow", return_value=workflow) as read:
+            status, body = self.request(**value)
+            self.assertEqual((status, body["mode"], body["entryLimit"]), (200, "run", 1))
+            self.assertEqual(read.call_args.args[1].macro_name, "Saved macro")
+            now[0] = 1100
+            self.request(**value)
+            session.check_deadlines()
+            self.assertEqual(session.state, "ready")
+            now[0] = 1201
+            self.request(**value)
+            session.check_deadlines()
+            self.assertEqual(session.state, "failed")
+            self.assertEqual(session.counters, {"processed": 0, "loaded": 90})
+
 
 class QueueTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows file-sharing regression")
+    def test_report_survives_a_real_windows_reader_that_temporarily_denies_replacement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "report.json"
+            daily.save_report(path, {"old": True})
+            kernel = daily.ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.CreateFileW.argtypes = [daily.wintypes.LPCWSTR, daily.wintypes.DWORD, daily.wintypes.DWORD,
+                                          daily.wintypes.LPVOID, daily.wintypes.DWORD, daily.wintypes.DWORD,
+                                          daily.wintypes.HANDLE]
+            kernel.CreateFileW.restype = daily.wintypes.HANDLE
+            kernel.CloseHandle.argtypes = [daily.wintypes.HANDLE]
+            handle = kernel.CreateFileW(str(path), 0x80000000, 3, None, 3, 128, None)
+            self.assertNotEqual(handle, daily.ctypes.c_void_p(-1).value)
+            errors = []
+            def write():
+                try:
+                    daily.save_report(path, {"new": True})
+                except Exception as error:
+                    errors.append(error)
+            writer = threading.Thread(target=write)
+            try:
+                writer.start()
+                writer.join(.15)
+                self.assertTrue(writer.is_alive())
+            finally:
+                kernel.CloseHandle(handle)
+                writer.join(3)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(json.loads(path.read_text()), {"new": True})
+
     def test_native_window_probe_rejects_hidden_windows_and_wrong_executables(self):
         window = daily.ListingWindow.__new__(daily.ListingWindow)
         window.handle = window.pid = None

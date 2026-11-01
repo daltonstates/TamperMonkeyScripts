@@ -9,7 +9,14 @@ function Assert-VMAdministrator {
 function Write-VMJson($Path, $Value) {
     $temporary = $Path + '.tmp'
     [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $temporary -Destination $Path -Force
+    $deadline=[DateTimeOffset]::Now.AddSeconds(5)
+    while($true){
+        try{Move-Item -LiteralPath $temporary -Destination $Path -Force -ErrorAction Stop;break}
+        catch{
+            if(($_.Exception.HResult -band 65535) -notin @(5,32,33) -or [DateTimeOffset]::Now -ge $deadline){throw}
+            Start-Sleep -Milliseconds 50
+        }
+    }
 }
 
 function Protect-VMStorage($Path, [Security.Principal.SecurityIdentifier]$OwnerSid) {

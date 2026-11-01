@@ -11,6 +11,10 @@ not required for another request. Its Windows principal is `InteractiveToken`,
 not a service session. Keep the existing basic-console autologon configuration;
 an RDP session that leaves the console locked cannot run keyboard automation.
 
+If an earlier or manual queue is still active, the host keeps its new request
+queued while monitoring that queue. The startup acknowledgement deadline does
+not impose a total runtime limit on the existing work.
+
 The queue runs Profile 1, then Profile 2 after safe cleanup, then Profile 3.
 The VM installation uses `profileStartPolicy: "completion"`; the former 04:30
 and 05:00 minimum times are removed. Existing start jitter is applied once to
@@ -33,6 +37,8 @@ The installer grants the guest account registry value access only on
 `HKLM\SOFTWARE\Microsoft\Virtual Machine\Guest`; the browser/helper remain
 limited interactive processes. Reports use bounded compressed chunks with a
 SHA-256 manifest; incomplete snapshots are retried.
+Report writers retry temporary Windows file-sharing conflicts for up to five
+seconds so a concurrent report reader does not interrupt a healthy queue.
 
 ## Inactivity and recovery
 

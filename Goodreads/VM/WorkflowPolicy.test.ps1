@@ -6,6 +6,12 @@ $script:checks=0
 $scratch=Join-Path ([IO.Path]::GetTempPath()) ('goodreads-policy-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch|Out-Null
 try{
+    $active=[pscustomobject]@{runId=('b'*32);files=[pscustomobject]@{'vm-last-run.json'=[pscustomobject]@{runId=('b'*32);state='running'}}}
+    Check (Test-GiveawaysOtherActiveQueue $active ('a'*32)) 'A progressing earlier queue must keep the new request queued without a total wait cutoff.'
+    Check (-not (Test-GiveawaysOtherActiveQueue $active ('b'*32))) 'The requested queue must be handled as its own acknowledgement.'
+    $active.files.'vm-last-run.json'|Add-Member NoteProperty endedAt '2026-11-01T17:00:00Z'
+    Check (-not (Test-GiveawaysOtherActiveQueue $active ('a'*32))) 'A completed old report must not indefinitely postpone startup failure reporting.'
+    Check (-not (Test-GiveawaysOtherActiveQueue $null ('a'*32))) 'Missing transport must not be mistaken for active work.'
     $settings=[pscustomobject]@{jobInventoryVerified=$true;otherJobTasks=@('Other automation')}
     function Get-ScheduledTask {param($TaskName) [pscustomobject]@{TaskName=$TaskName;State=$script:otherState}}
     $script:otherState='Running'

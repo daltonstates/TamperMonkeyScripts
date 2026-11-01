@@ -15,7 +15,14 @@ function Save-HostResult {
     $target=Join-Path $reportDirectory 'host-last-run.json'
     $temporary=$target+'.tmp'
     [IO.File]::WriteAllText($temporary,($report|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $temporary -Destination $target -Force
+    $deadline=[DateTimeOffset]::Now.AddSeconds(5)
+    while($true){
+        try{Move-Item -LiteralPath $temporary -Destination $target -Force -ErrorAction Stop;break}
+        catch{
+            if(($_.Exception.HResult -band 65535) -notin @(5,32,33) -or [DateTimeOffset]::Now -ge $deadline){throw}
+            Start-Sleep -Milliseconds 50
+        }
+    }
 }
 try {
     . (Join-Path $PSScriptRoot 'VM.Common.ps1')
@@ -45,8 +52,25 @@ try {
     $ackDeadline=[DateTimeOffset]::Now.AddMinutes(5)
     $lastTransport=[DateTimeOffset]::Now
     $acknowledged=$false
+    $waitingForQueue=$false
     do {
         $bundle=Read-GiveawaysLiveReport $settings
+        if(Test-GiveawaysOtherActiveQueue $bundle $report.runId){
+            # An earlier/manual healthy queue owns the interactive task. Keep
+            # this request queued and monitored rather than abandoning it after
+            # the startup deadline; the generic runner owns stall detection.
+            $waitingForQueue=$true
+            $report.waitingForRunId=$bundle.runId
+            $report.guestUpdatedAt=$bundle.at
+            $stamp=[DateTimeOffset]::Parse($bundle.at)
+            if($stamp -gt $lastTransport){$lastTransport=$stamp}
+            Export-GiveawaysLiveReport $settings $bundle
+            Save-HostResult
+        }elseif($waitingForQueue){
+            $waitingForQueue=$false
+            $ackDeadline=[DateTimeOffset]::Now.AddMinutes(5)
+            $report.Remove('waitingForRunId')
+        }
         if($bundle -and $bundle.runId -eq $report.runId){
             $acknowledged=$true
             $stamp=[DateTimeOffset]::Parse($bundle.at)
@@ -58,8 +82,8 @@ try {
             Save-HostResult
             if($guest.endedAt){break}
         }
-        if(-not $acknowledged -and [DateTimeOffset]::Now -gt $ackDeadline){throw 'Guest job did not acknowledge this request. Check the enabled interactive guest task, sign-in, and KVP access. The VM was left running.'}
-        if($acknowledged -and ([DateTimeOffset]::Now-$lastTransport).TotalMinutes -gt 3){throw 'Guest report monitoring stopped. Elapsed runtime does not prove a website stall; the VM and queue were left running.'}
+        if(-not $acknowledged -and -not $waitingForQueue -and [DateTimeOffset]::Now -gt $ackDeadline){throw 'Guest job did not acknowledge this request. Check the enabled interactive guest task, sign-in, and KVP access. The VM was left running.'}
+        if(($acknowledged -or $waitingForQueue) -and ([DateTimeOffset]::Now-$lastTransport).TotalMinutes -gt 3){throw 'Guest report monitoring stopped. Elapsed runtime does not prove a website stall; the VM and queue were left running.'}
         if([string](Get-OwnedGiveawaysVM $settings).State -ne 'Running'){throw 'The VM stopped before delivering its current final report.'}
         Start-Sleep -Seconds 10
     } while($true)

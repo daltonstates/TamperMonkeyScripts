@@ -43,7 +43,15 @@ def write_report(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in {5, 32, 33} or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def read_json(path):

@@ -1,5 +1,11 @@
 # Hyper-V KVP transport. Only this adapter depends on the virtualization API.
 # https://learn.microsoft.com/windows-server/virtualization/hyper-v/integration-services-data-exchange
+function Test-GiveawaysOtherActiveQueue($Bundle, $RunId) {
+    $guest=$Bundle.files.'vm-last-run.json'
+    return ($Bundle -and $Bundle.runId -ne $RunId -and $guest.runId -eq $Bundle.runId -and
+            $guest.state -in @('starting','running') -and -not $guest.endedAt)
+}
+
 function Get-GiveawaysKvpVM($Settings) {
     [void](Get-OwnedGiveawaysVM $Settings)
     Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter ("Name='" + $Settings.vmId + "'") -ErrorAction Stop

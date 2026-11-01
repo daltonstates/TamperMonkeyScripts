@@ -558,7 +558,15 @@ def main():
                           "modifiersDown": desktop.modifiers_down()}
                 temporary = log_dir / 'helper-status.tmp'
                 temporary.write_text(json.dumps(status, indent=2), encoding='utf-8')
-                temporary.replace(log_dir / 'helper-status.json')
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        temporary.replace(log_dir / 'helper-status.json')
+                        break
+                    except PermissionError as error:
+                        if getattr(error, 'winerror', None) not in {5, 32, 33} or time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
                 last_status = time.monotonic()
             if target and target.run != last_run:
                 last_run = target.run

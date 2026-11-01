@@ -476,6 +476,7 @@ class Handler(BaseHTTPRequestHandler):
             result = self.server.session.event(value)
             self.reply(200, result)
         except (ValueError, OSError) as error:
+            logging.warning("Daily userscript request rejected: %s", error)
             self.reply(400, {"error": str(error)})
 
     def do_GET(self):
@@ -506,7 +507,15 @@ class Server(ThreadingHTTPServer):
 def save_report(path, report):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in {5, 32, 33} or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def recover_failed_listing(session):
@@ -664,6 +673,7 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
         return 0 if len(report["profiles"]) == len(starts) and all(
             p["state"] in {"finished", "verified"} for p in report["profiles"]) else 1
     except Exception as error:
+        report.update(state="failed", reason=str(error))
         if report["profiles"]:
             report["profiles"][-1].update(state="failed", reason=str(error))
         logging.exception("Daily profile queue failed")
