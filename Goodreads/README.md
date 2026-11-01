@@ -1,9 +1,10 @@
 # Goodreads Giveaway Enhancer
 
-Version **4.35** contains cleanup repairs and preserves the address helper when
-Goodreads removes the tracking fragment from the current page's URL. These
-repairs still require live VM validation before release. Both desktop and VM
-installations use the published userscript on `main`.
+Version **4.37** adds meaningful progress counters, same-day processing
+deduplication, and controlled live-check limits. Both desktop and VM installations
+use the published userscript on `main`. The generic profile runner now uses
+15 minutes of inactivity, without an account or total morning runtime cutoff.
+The [VM adapter](VM/README.md) requests one completion-ordered queue at 04:00 Eastern.
 
 Version 4.34 adds a compact settings button with per-profile pacing, result-page
 delay, blank-page recovery, and tab-limit controls. These work with Tampermonkey
@@ -77,9 +78,9 @@ tab openings, not the timing of manual clicks across several open tabs. Set
 **Max open tabs** to **1** for one-at-a-time manual entry.
 
 These delays are separate from the macro's saved key/wait steps. Address-selection
-retries, the companion's communication deadlines, and scheduled runner limits
-keep their existing behavior. Longer pacing does not extend the scheduled
-runner's 45-minute limit per account. Escape retains the companion's emergency
+retries and the companion's communication deadlines remain bounded. Intentional
+pacing is preserved; useful entry processing or batch loading renews the
+runner's configurable inactivity interval. Escape retains the companion's emergency
 stop behavior; use the gear or **×** to close settings during a Keyfire run.
 
 ## Giveaway workflow
@@ -429,10 +430,12 @@ Clearing the marker does not open or close a browser. Verify the profiles again
 before resuming unattended runs. Reports from completed attempts are also kept in
 the `history` folder beside the current report.
 
-The runner stops the remaining accounts if a userscript does not connect within
-two minutes, contact is lost for two minutes, progress stalls for three minutes,
-an account runs for 45 minutes, the user cancels, or Windows locks. It does not
-close unfinished tabs, kill Edge, or launch the next account after a failure.
+The runner records failure if a userscript does not connect within two minutes,
+useful progress or contact stalls for `inactivityMinutes` (default 15), the user
+cancels, or Windows locks. It has no total runtime or morning-window cutoff.
+With `--recover-failures`, it closes only authenticated owned windows and starts
+the next account after child-tab acknowledgement and observed listing closure.
+Otherwise it preserves unfinished tabs and stops later accounts. It never kills Edge.
 Scheduled userscripts remove keyboard authorization when the runner cancels or
 cannot be reached. A background tab can delay this check until its next timer.
 The local status endpoint is `127.0.0.1:17385`; each account uses a fresh temporary

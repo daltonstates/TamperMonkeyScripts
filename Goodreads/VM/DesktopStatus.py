@@ -17,7 +17,7 @@ import subprocess
 import time
 
 
-TERMINAL = {"completed", "completed-with-failures", "failed", "timed-out-saved", "already-running"}
+TERMINAL = {"completed", "completed-with-failures", "failed", "skipped", "timed-out-saved", "already-running"}
 NOTE = "Processed counts describe the tab queue. Goodreads acceptance of each entry is not independently confirmed."
 
 
@@ -57,6 +57,7 @@ def fresh_daily(host, daily):
         start, end = timestamp(host["startedAt"]), timestamp(host["endedAt"])
         daily_start, daily_end = timestamp(daily["startedAt"]), timestamp(daily["endedAt"])
         return (daily.get("verificationOnly") is False and start <= end
+                and (not host.get("runId") or daily.get("runId") == host["runId"])
                 and start - timedelta(seconds=5) <= daily_start <= daily_end <= end + timedelta(seconds=5)
                 and isinstance(daily.get("profiles"), list) and 0 < len(daily["profiles"]) <= 20)
     except (KeyError, TypeError, ValueError):
@@ -77,6 +78,13 @@ def summarize(host, daily=None):
     if host.get("state") not in TERMINAL or not host.get("endedAt"):
         return None
     stamp = timestamp(host["endedAt"])
+    if host.get("state") == "skipped":
+        reason = str(host.get("reason") or "The request was deliberately skipped.").splitlines()[0]
+        complete = "Already completed" in reason
+        return {"id": run_id(host), "requestId": host.get("runId"), "title": "Goodreads skipped",
+                "body": reason, "detail": reason, "healthy": complete, "endedAt": stamp.isoformat(),
+                "hostState": "skipped", "profiles": [], "processed": None,
+                "errors": [] if complete else [reason], "note": NOTE, "shutdown": host.get("shutdownDecision")}
     matching = (isinstance(daily, dict) and fresh_daily(host, daily)
                 and all(isinstance(p, dict) for p in daily["profiles"]))
     profiles, errors = [], []
@@ -84,9 +92,12 @@ def summarize(host, daily=None):
         for item in daily["profiles"]:
             state = str(item.get("state", "unknown"))
             reason = str(item.get("reason") or "")[:1000]
-            counts = queue_counts(item.get("progress"))
+            counters = item.get("counters")
+            counts = ({key: counters.get(key) for key in ("processed", "opened", "open", "unconfirmed")}
+                      if isinstance(counters, dict) and type(counters.get("processed")) is int
+                      else queue_counts(item.get("progress")))
             # A queue that claims completion with tabs still open is not healthy.
-            healthy = state == "finished" and item.get("listingClosed") is True and (counts is None or counts["open"] == 0)
+            healthy = state == "finished" and item.get("listingClosed") is True and (counts is None or counts.get("open", 0) in {0, None})
             profile = {"name": str(item.get("name", "Account"))[:100], "state": state,
                        "healthy": healthy, "counts": counts, "reason": reason}
             profiles.append(profile)
@@ -109,9 +120,10 @@ def summarize(host, daily=None):
         detail = f"{total} processed; no runner errors." if total is not None else "No runner errors; counts unavailable."
     else:
         detail = next((p["reason"] for p in profiles if p["reason"]), errors[0])
-    return {"id": run_id(host), "title": title, "body": body[:500], "detail": detail[:300],
+    return {"id": run_id(host), "requestId": host.get("runId"), "title": title, "body": body[:500], "detail": detail[:300],
             "healthy": healthy, "endedAt": stamp.isoformat(), "hostState": host["state"],
-            "profiles": profiles, "processed": total, "errors": errors, "note": NOTE}
+            "profiles": profiles, "processed": total, "errors": errors, "note": NOTE,
+            "shutdown": host.get("shutdownDecision"), "entryLimit": host.get("entryLimit")}
 
 
 def missing_summary(config, host, now):
@@ -121,6 +133,8 @@ def missing_summary(config, host, now):
     if now.time().replace(tzinfo=None) < deadline:
         return None
     try:
+        if host.get("state") == "running" and host.get("updatedAt") and (now - timestamp(host["updatedAt"])).total_seconds() < 20 * 60:
+            return None
         if timestamp(host["startedAt"]).astimezone(now.tzinfo).date() == now.date():
             if host.get("state") in TERMINAL and host.get("endedAt"):
                 return None
@@ -158,6 +172,8 @@ th,td{{padding:12px;text-align:left;border-bottom:1px solid #e2e3de;vertical-ali
 </style><main><p class="note">Goodreads · Daily desktop report</p>
 <h1>{text(summary['title'])}</h1><p class="status">{text(summary.get('detail',''))}</p>
 <p>{text(summary.get('endedAt',''))}</p>
+<p>Shutdown: {text((summary.get('shutdown') or {}).get('state','Unavailable'))}. {text((summary.get('shutdown') or {}).get('reason',''))}</p>
+{('<p>Controlled live check: at most ' + text(summary['entryLimit']) + ' entries per profile.</p>') if summary.get('entryLimit') else ''}
 {('<table><thead><tr><th>Account</th><th>Result</th><th>Processed</th><th>Error</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>') if rows else ''}
 {('<ul>' + errors + '</ul>') if errors else ''}
 <p class="note">{text(summary.get('note',NOTE))}</p>
@@ -208,7 +224,12 @@ def poll(config, root, state, now, notifier=notify):
     missing = missing_summary(config, host, now)
     if missing:
         summary = missing
-    if summary is None or summary["id"] == state.get("lastId"):
+    if summary is None:
+        return False
+    if summary["id"] == state.get("lastId"):
+        # Refresh final shutdown details without sending a duplicate toast.
+        if not state.get("baselineOnly"):
+            publish(root, summary)
         return False
     if state.get("retryId") == summary["id"] and now.timestamp() < state.get("retryAfter", 0):
         return False

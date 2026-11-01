@@ -1,411 +1,151 @@
-# Optional Hyper-V giveaway workflow
+# Optional Hyper-V installation
 
-These scripts are a separate installation for a dedicated Windows VM. The
-ordinary [userscript and companion](../README.md) work without them. Checking
-out this directory does not change Windows or install any tasks.
+The ordinary [userscript and Keyfire helper](../README.md) do not need Hyper-V.
+`main` is the single userscript release/update source. There is no VM feed.
 
-The default host task boots the VM at **03:55 Eastern**, following daylight-saving
-changes rather than storing a fixed UTC offset. The guest signs in to
-its own Windows console and runs its Edge profiles around **04:00, 04:30, and
-05:00**, each with a 0–5 minute delay. Completed listing windows close before
-the next account starts. After success the guest shuts down, releasing its
-assigned memory and CPU. The physical PC can remain locked or signed out.
+At **04:00 Eastern** the SYSTEM host task **Goodreads giveaway VM** starts or
+resumes the owned VM and sends a request, including when it is already running.
+The guest task **Goodreads VM workflow** polls once a minute in the existing
+signed-in interactive account and also checks at logon. Signing in again is
+not required for another request. Its Windows principal is `InteractiveToken`,
+not a service session. Keep the existing basic-console autologon configuration;
+an RDP session that leaves the console locked cannot run keyboard automation.
 
-A VM account that fails closes only its authenticated run's tabs and listing
-before the next account starts. Its report still records the failure. After
-all windows close, even a partially failed queue shuts down so tomorrow can run.
-If cleanup cannot finish, the 195-minute host limit saves the VM. With
-`recoverSavedFailures` enabled, the next morning can retire an unchanged saved
-failure created by this watchdog, shut down the old guest, and cold boot again.
-Manually saved or paused sessions are left for inspection. An
-already-running VM is left alone, so a manually started automation session
-does not get shut down by this host task.
+The queue runs Profile 1, then Profile 2 after safe cleanup, then Profile 3.
+The VM installation uses `profileStartPolicy: "completion"`; the former 04:30
+and 05:00 minimum times are removed. Existing start jitter is applied once to
+the beginning of the queue. Browser pacing, filters, cookies, macro selections,
+and actual profile directories remain in place.
 
-## Source and local data
+## Responsibilities
 
-| Location | Purpose |
+| Component | Responsibility |
 | --- | --- |
-| This directory | Reusable PowerShell/Python source, tests, example settings |
-| `C:\ProgramData\GoodreadsGiveawaysVM` on the host | Protected installed host runtime, settings, exported reports |
-| Your chosen VM storage directory | Virtual disk, installation media, local setup/package files |
-| `C:\GoodreadsVM` inside the guest | Installed guest runtime, private configuration, reports |
-
-Keep disks, ISOs, downloaded executables, exported macros, private settings,
-credentials, browser data, and logs outside the checkout. The local `.gitignore`
-also excludes common generated files. The example contains no VM identity;
-creation saves the new identity only in the local installed settings.
-
-## Requirements
-
-- A Windows host with Hyper-V support and enough disk space for a Windows guest.
-- Windows PowerShell with administrator access for host installation and VM
-  management. The scripts require the host's Windows time zone to be
-  `Eastern Standard Time`.
-- A Windows x64 installation ISO and appropriate guest license.
-- A dedicated guest Windows account, separate Edge profiles, Tampermonkey, and
-  your own Goodreads sign-ins and saved macro.
-- The [official Windows embedded Python package](https://www.python.org/downloads/windows/)
-  for the guest runtime. Third-party Python packages are not needed.
-- For unattended console sign-in, configure
-  [Microsoft Sysinternals Autologon](https://learn.microsoft.com/en-us/sysinternals/downloads/autologon)
-  yourself inside the guest. No password is collected by these installers.
-
-The default resources are 4 GB static RAM, two CPUs, and an 80 GB expanding
-disk. `vm-settings.example.json` allows bounded resource changes and a different
-local storage drive. The physical PC must be on or able to wake from sleep;
-Task Scheduler cannot boot a fully powered-off physical PC.
-
-## Host installation
-
-Run host commands from the repository root in elevated Windows PowerShell.
-If Hyper-V is not enabled:
-
-```powershell
-& .\Goodreads\VM\Enable-HyperV.ps1
-```
-
-This uses `-NoRestart`, records its result under ProgramData, and reports when
-a manual reboot is required. It does not change BIOS settings.
-
-For a new installation, copy `vm-settings.example.json` to a local settings
-file outside the checkout and edit its storage paths. Do not replace settings
-from an existing installation: its `vmId` identifies the owned VM.
-
-```powershell
-& .\Goodreads\VM\Install-VMHost.ps1 -SettingsPath 'C:\HyperV\GoodreadsGiveaways\vm-settings.json'
-```
-
-The installer protects the selected storage folder, copies the host runtime
-into ProgramData, and registers **Goodreads giveaway VM** as a **disabled**
-SYSTEM task. It leaves the ordinary desktop schedule available until the final
-enable step. Installed runtime code/settings allow writes only by
-Administrators and SYSTEM; the installing user has read/execute access.
-
-After the host reboot, create the VM using your ISO path:
-
-```powershell
-& 'C:\ProgramData\GoodreadsGiveawaysVM\New-GiveawaysVM.ps1' -IsoPath 'C:\InstallMedia\Windows11-x64.iso'
-Start-VM -Name 'GoodreadsGiveaways'
-vmconnect.exe localhost 'GoodreadsGiveaways'
-```
-
-Creation uses generation 2, Secure Boot, a virtual TPM, and the Default Switch.
-It refuses an existing VM name or disk instead of adopting or overwriting one.
-Install Windows and sign into the dedicated guest account yourself. Use the
-basic VMConnect console for unattended setup: disconnecting an enhanced/RDP
-session can lock the guest. Test with the connection window closed.
-
-## Prepare and transfer the guest package
-
-Preparation reads an existing daily-settings file and exports only its selected
-supported Keyfire macro. Its default input is
-`%LOCALAPPDATA%\GoodreadsKeyfireCompanion\daily-settings.json`; override it with
-`-DailySettingsPath` if needed. Guest profile display names must match the names
-passed to `-GuestProfileNames`. The installer resolves each display name to its
-actual guest profile folder, which may differ from the host folder number.
-
-Extract the official embedded Python package into the destination's `runtime/`
-folder first. Add `..\Goodreads` and `..\Goodreads\VM` to its `python*._pth`
-file, keeping the standard library ZIP and `.` entries. Then run:
-
-```powershell
-$package = Join-Path $env:LOCALAPPDATA 'GoodreadsGiveawaysVM\guest-package'
-& .\Goodreads\VM\Prepare-VMGuestPackage.ps1 -Destination $package -GuestProfileNames 'Profile 1','Profile 2','Profile 3'
-$zip = Join-Path (Split-Path -Parent $package) 'guest-package.zip'
-Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
-```
-
-The package contains `Goodreads/`, `runtime/`, the selected macro in
-`keyfire-config.json`, a daily-settings template, and this guide. You may also
-place the separately downloaded Autologon tool in it. Preparation does not
-download executables, copy browser sessions, or copy the host helper's private
-key. The Keyfire application itself is unnecessary inside the guest: the
-companion reads the selected macro's supported steps.
-
-Transfer the ZIP from an elevated host shell while the guest is running:
-
-```powershell
-Copy-VMFile -VMName 'GoodreadsGiveaways' -SourcePath $zip -DestinationPath 'C:\Users\Public\Downloads\GoodreadsVM-setup.zip' -FileSource Host -CreateFullPath
-```
-
-## Guest installation and verification
-
-Extract the package inside the guest. In every guest Edge profile:
-
-1. Sign into the intended Goodreads account.
-2. Install the current `Goodreads/Giveaways.js`, **4.35 or later**, in
-   Tampermonkey, with the current Python runner for bounded startup-window
-   retries. Version 4.33 waits for result navigation after Submit instead of
-   closing the entry tab while the request may still be pending. Avoid duplicate
-   enabled copies.
-3. In Tampermonkey Settings, select Advanced configuration and set Content
-   Script API to **UserScripts API Dynamic**.
-4. Open the **Giveaway settings** gear in each guest profile. Save the intended
-   genre filters, pacing, and Keyfire macro selection, and enable **Use Keyfire
-   workflow**. The optional Keyfire profile is independent of the Edge profile.
-   Auto on load may stay off. Timing values belong to that browser profile and
-   do not modify the macro's own saved delays.
-
-Run the guest installer in elevated PowerShell **under the guest account that
-will run the workflow**, replacing the extracted-package path:
-
-```powershell
-& '<extracted-package>\Goodreads\VM\Install-VMGuest.ps1' -VerifyOnly
-```
-
-The installer refuses a physical PC. It installs into `C:\GoodreadsVM` and
-checks each account without opening giveaway entry tabs or sending entry keys.
-It also verifies listing-window cleanup. Resolve failed verification before
-proceeding; the guest remains running with its task disabled.
-
-Configure Autologon through its own UI for this dedicated guest account, then:
-
-```powershell
-& 'C:\GoodreadsVM\Goodreads\VM\Install-VMGuest.ps1' -PackagePath 'C:\GoodreadsVM' -Enable
-```
-
-Enabling requires successful recent verification and autologon for the current
-guest user. It creates a limited interactive task **Goodreads VM workflow**,
-45 seconds after logon. The wrapper checks that it is inside Hyper-V and runs
-only in the morning window, once per successful local day. It sets Eastern
-Time and disables idle sleep, hibernation, and the screen saver **inside the
-guest**. Guest policy must also permit the console to stay unlocked.
-
-`shutdownAfterSuccess` is enabled in the local guest settings. A manual boot
-outside the morning window remains available for other automation work.
-
-## Enable the morning schedule
-
-Shut down the guest after completing setup. From the host repository root:
-
-```powershell
-& .\Goodreads\VM\Install-VMHost.ps1 -SettingsPath 'C:\ProgramData\GoodreadsGiveawaysVM\vm-settings.json' -Enable
-```
-
-This reads the powered-off guest's recent verification report, disables the
-old **Goodreads daily profiles** task if present, and enables the SYSTEM VM
-task. It refuses to switch while the old queue is running. Leave the VM off
-between daily runs. Observe a real cold-boot run through all profiles, window
-cleanup, and shutdown before relying on unattended operation. A setup-only
-verification does not establish successful real entries.
-
-## Results and recovery
-
-Host lifecycle reports are under
-`C:\ProgramData\GoodreadsGiveawaysVM\reports`. Guest reports are in
-`C:\GoodreadsVM\output`, with dated queue reports in `history`. The host exports
-reports only after the VM powers off. An optional protected embedded Python
-runtime under the host installation's `runtime/`, with `dissect.hypervisor`,
-`dissect.volume`, `dissect.ntfs`, and `dissect.fve` under `packages/`, reads the
-owned disk without mounting it. This also handles a BitLocker guest volume
-when it contains a clear key. Otherwise the unencrypted read-only mount
-exporter remains available.
-No guest password, host share, or internet-facing service is needed for routine
-runs. Report paths reject guest links/reparse points and oversized files.
-
-Check timestamps as well as state. When `host-last-run.json` says
-`timed-out-saved`, the exported `daily-last-run.json` may still describe an
-earlier successful run. Inspect the saved guest's own logs for the current
-failure. Do not treat the previous exported success as today's success.
-Hyper-V also supports a [separate VM export](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/deploy/export-and-import-virtual-machines)
-when a diagnostic copy is needed without resuming the saved session.
-
-`daily-last-run.json` records each profile's state, progress, reason, and
-`listingClosed`. `vm-last-run.json` records the wrapper result. **Finished**
-means the tab queue closed; it does not independently prove Goodreads accepted
-every entry. Expired sign-ins or changed site pages can still require attention.
-
-For one combined report on the physical desktop, run this as the normal
-signed-in host user; no elevation or guest password is needed:
-
-```powershell
-.\Goodreads\VM\Install-DesktopStatus.ps1
-```
-
-This adds **Goodreads run report** to the desktop and Start Menu. A hidden,
-per-user reader starts now and at sign-in and checks the exported host reports
-every 30 seconds. It has no VM or browser control. Success goes directly into
-Windows Notification Center without sound or a banner; errors use a short,
-silent banner. Clicking the notification opens the combined local report.
-Windows notification settings and Do Not Disturb remain in control.
-
-The report lists each configured account, processed queue counts, and error
-reasons. **Processed is not a count of independently confirmed accepted
-entries.** Account reports must match the host run's timestamps; stale exports
-are never substituted. A missing or unfinished morning report is flagged after
-07:30 Eastern, starting the day after installation. Notification IDs prevent
-repeat alerts for an unchanged run. If signed out when a run finishes, the
-latest report is collected at the next sign-in. Installation baselines existing
-reports so earlier maintenance tests do not appear as new failures.
-
-The reader and its reports live in
-`%USERPROFILE%\.goodreads-giveaways\desktop`; `watcher-health.json` records
-its last check, and `watcher-state.json` records delivery or a retry reason.
-No guest credentials or browser data are copied there. To stop the reader,
-set `enabled` to `false` in its `settings.json` and remove only the
-`GoodreadsGiveawaysStatus` value from the current user's Windows `Run` key.
-The reports and shortcuts can be kept.
-
-Installation runs its final registration in a limited interactive Windows task
-and stages its files outside AppData. This prevents a packaged caller's private
-filesystem or Registry view from hiding the report, URL handler, or startup
-entry from the real desktop. Existing reports are migrated, the old reader is
-disabled, and the temporary setup task is removed. This addresses Windows'
-[AppData and Registry virtualization](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization).
-Both the notification body and its **Open report** button open the report;
-delivery and click handling use the native Windows API. The installed
-`DesktopReportActivator-<source hash>.exe` registers a real COM callback, so a
-click can launch the report after the notification sender has exited.
-`notification-activation.json` records actual `notification-click` callbacks;
-`notification-delivery.json` records submission. These receipts distinguish
-sending a notification from receiving an actual click callback.
-
-The toast's completion timestamp uses whole seconds. Windows can replace the
-entire notification with **New notification**, losing its text and button, if
-the XML contains the seven fractional digits emitted by .NET's round-trip
-timestamp format. This is the failure described in the Windows Community
-Toolkit's [timestamp issue](https://github.com/CommunityToolkit/WindowsCommunityToolkit/issues/1073).
-Preview uses the same timestamp as scheduled delivery so a manual test covers
-that field too. After updating the source, run `Install-DesktopStatus.ps1` again
-as the normal signed-in host user to copy the repaired sender into the desktop
-installation and refresh the latest notification. Userscript updates do not
-update this installed PowerShell file.
-
-To open the existing report directly while notification activation is unavailable:
-
-```powershell
-Start-Process (Join-Path $env:USERPROFILE '.goodreads-giveaways\desktop\report.html')
-```
-
-To diagnose remaining giveaways, compare the same run's `daily-last-run.json`
-and `host-last-run.json` under `C:\ProgramData\GoodreadsGiveawaysVM\reports`.
-Each profile's `state`, `reason`, `progress`, and `userscriptVersion` distinguish
-an apparently completed queue from a timeout or a capped batch with no new
-eligible entries. Saved genre filters still apply. A failed profile's
-`failureRecovered` field means its tabs were cleaned up; its missed entries
-were not retried. Include `daily.log` when investigating a recorded failure.
-
-Failure cleanup allows up to 90 seconds for a background listing to receive the
-cancel instruction, acknowledge that its own entry tabs closed, and close its
-owned listing window. The deadline does not restart when the browser polls.
-The listing keeps its identifying title until it actually leaves the page, so
-the native close fallback can still verify the window. Unconfirmed cleanup
-preserves the unfinished-work marker and blocks the next account.
-
-The profile's `cleanup` object records whether the command was offered, whether
-the browser acknowledged child closure, whether the listing closed, elapsed
-time, and a failure reason. A command offered by the server is not proof that
-the browser received it. These fields explain cleanup failures separately from
-the entry-processing error in `reason`. A `progress` value such as
-`1/33;1 open;claiming` means one entry tab was opened and remained open when
-the account failed; it does not establish that the entry was accepted.
-
-Building the native helper requires Visual Studio C++ Build Tools and a Windows
-SDK on the host. The installer finds them with `vswhere`, compiles with the
-static C runtime, and keeps generated binaries outside Git. An unchanged
-source hash reuses the compiled helper. No compiler is required for daily
-operation, and nothing is installed in the guest for desktop reporting.
-
-For a manual click test,
-`Show-DesktopStatus.ps1 -SummaryPath <latest-report.json> -Preview` shows one
-silent banner; automatic successes still have no banner. The executable's
-`--test-activation` mode exercises cold COM startup, callback, and report launch;
-`--test-rejection` verifies that unknown actions cannot open anything. Those
-tests do not replace a real notification click. The native callback follows
-Microsoft's [desktop toast activation sample](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/DesktopToasts/CPP).
-
-The notifier uses Windows' documented
-[SuppressPopup](https://learn.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotification.suppresspopup)
-and [silent audio](https://learn.microsoft.com/en-us/uwp/schemas/tiles/toastschema/element-audio)
-options. Run the report, freshness, and duplicate-delivery checks with
-`python Goodreads/VM/DesktopStatus.test.py`.
-Run `powershell -NoProfile -File Goodreads/VM/Show-DesktopStatus.test.ps1` for
-notification-content regression checks. These invoke the actual sender with
-`-ContentOnly`, which returns XML without registering or sending a notification.
-They cover timestamp precision, preview parity, locale, escaped text, and the
-body and button actions. They do not replace a real Windows notification click.
-
-For an explicitly requested fresh run outside the morning window, launch
-`Run-VMNow.ps1` in an administrator PowerShell window with a new
-`-StateDirectory` under your local diagnostics folder. Enter the guest Windows
-password in that window; it is held only in memory. The VM must be off and
-free of unfinished work. This starts all configured profiles sequentially with
-the guest's `--run-now` option, then waits for shutdown and exports the fresh
-reports for the same desktop notifier. The regular schedule and its settings
-are left in place. Automatic logons still honor the morning window and the
-once-per-day success check; only this explicit manual option repeats a run.
-`Run-VMNow.ps1 -CheckOnly -StateDirectory <path>` checks its source paths and
-installed settings without starting a VM or asking for a password.
-
-Failures that cannot close their authenticated tabs preserve
-`daily-incomplete.json`. After a watchdog recovery cold boot, an ended
-previous-day failure can be archived and cleared only when no Edge windows
-remain. Manual recovery is still available inside the guest:
-
-```powershell
-& 'C:\GoodreadsVM\Goodreads\VM\Install-VMGuest.ps1' -PackagePath 'C:\GoodreadsVM' -ClearPending -VerifyOnly
-```
-
-After successful verification, repeat the guest enable step, shut down the VM,
-and repeat host enable. Do not discard saved state or clear the pending marker
-merely to retry an unexplained failure. These scripts do not disable encryption.
-
-## Updates and security
-
-The dedicated guest uses hourly Tampermonkey update checks, automatic
-installation, and silent installation of ordinary updates in every configured
-profile. `Configure-TampermonkeyUpdates.cjs` applies those settings through
-LevelDB only while guest Edge processes are stopped. It backs up each extension
-database, preserves script UUIDs, source, stored values and unrelated settings,
-and enables updates for the existing Goodreads script. Its maintenance bundle
-contains Node and `classic-level`; generated dependencies stay outside Git.
-`Continue-VMWorkflowRepair.ps1` runs the repair through PowerShell Direct and
-records the settings readback and verification results without dashboard clicks.
-
-With `preflightUserScriptUpdates` enabled, the guest opens owned verification
-windows for its configured profiles for 45 seconds before the queue. A
-temporary coordinator only returns verification instructions on a listing
-whose filter cannot auto-open entries. This wakes Tampermonkey in every
-profile so it can update. The windows are closed by their random identities
-before any giveaway entry opens. Verification records the installed userscript
-version as well as the protocol capabilities. Userscript updates cover the
-JavaScript only; Python and host tooling still require a validated deployment.
-
-`Update-VMWorkflow.ps1` stages a repair using PowerShell Direct and one guest
-password kept only in memory. Pass `-GuestUserName`, `-PythonRuntimePath`,
-`-ReportPackagesPath`, and `-StateDirectory` from an elevated host shell. It
-opens the three guest Tampermonkey dashboards, waits for a `verify` command in
-`update-command.json` (`id` must be unique), and requires every profile to prove
-the 4.31 address-retry and failure-cleanup protocol. A `smoke` command then
-tests a cold boot with an injected failure before any entry tabs open, verifies
-cleanup, shutdown and report export, and restores the normal enabled schedule.
-The receipt is `update-status.json`. This maintenance explicitly cancels the
-old failed VM browser run after archiving its reports; it never runs on the
-physical host's browsers.
-
-GitHub/Tampermonkey automatic updates cover `Giveaways.js` according to each
-profile's update interval. They do not update Python, the companion, VM tooling,
-or installed ProgramData/guest copies. After changing those files, repackage
-and reinstall, verify, and explicitly enable the relevant installation again.
-
-The SYSTEM task executes trusted installed host code with broad privileges;
-keep its runtime and settings protected. Read-only report mounting still uses
-the host's virtual-disk/filesystem drivers. Keep host and guest updated.
-Use a dedicated guest password: Microsoft documents that administrators can
-recover Autologon credentials. No host sign-in, lock, screen-saver, firewall,
-network-adapter, or sleep settings are changed by these scripts.
-
-## Checks
-
-```powershell
-powershell -NoProfile -File Goodreads/VM/Test-VMWorkflow.ps1
-python Goodreads/VM/GuestWorkflow.test.py
-python Goodreads/VM/Read-GuestReports.test.py
-python Goodreads/DailyGiveaways.test.py
-python Goodreads/KeyfireGiveaways.test.py
-```
-
-These cover resource/path/ownership checks, refusal to mount active disks,
-read-only extraction cleanup, stale/incomplete reports, physical-PC refusal,
-daily duplicate prevention, and failure preservation. Tests use mocks and
-temporary files; they do not operate a real VM or prove live-site acceptance.
+| `Giveaways.js`, `KeyfireGiveaways.py` | One profile's website workflow, saved macro steps, authenticated foreground targets, navigation, processing counters |
+| `DailyGiveaways.py` | Profile order, meaningful-progress inactivity, bounded startup/cleanup, owned-window cleanup, queue report |
+| `GuestWorkflow.py` | Receive a request, launch that queue in its interactive session, publish current reports |
+| `Invoke-VMWorkflow.ps1`, `VM.Transport.ps1` | VM readiness, request delivery, live report export, designated-job checks, report delivery before normal shutdown |
+| `DesktopStatus.py` and native notification handler | Local HTML report and Windows notification with Open report |
+
+Transport uses [Hyper-V KVP data exchange](https://learn.microsoft.com/windows-server/virtualization/hyper-v/integration-services-data-exchange)
+over VMbus. It requires no network listener, share, or stored guest password.
+The installer grants the guest account registry value access only on
+`HKLM\SOFTWARE\Microsoft\Virtual Machine\Guest`; the browser/helper remain
+limited interactive processes. Reports use bounded compressed chunks with a
+SHA-256 manifest; incomplete snapshots are retried.
+
+## Inactivity and recovery
+
+`daily-settings.json` has one configurable `inactivityMinutes` setting, default
+**15 minutes**. Only new processed-entry counts or new loaded giveaway IDs renew
+it. A changing timestamp, heartbeat, repeated retry, or key attempt does not.
+Intentional browser pacing is credited once per useful milestone. There are no
+per-account, morning-window, guest-child, host, scheduled-task, or manual-run
+total-duration limits. A healthy queue can run for hours or cross midnight.
+
+Individual blocked operations remain bounded: a userscript must connect within
+120 seconds, a marked Edge window must bind within 30 seconds, and failed-run
+cleanup must receive child-tab acknowledgement and confirm owned-window closure
+within 90 seconds. Cleanup failure preserves unfinished work and stops later
+profiles. A safely cleaned profile failure is recorded and the next profile
+can run. No browser process is killed and no saved state is discarded.
+
+The userscript keeps batch continuation and same-day processed-ID deduplication
+in the existing profile. Processing completion is **not proof of accepted entry**;
+the report labels outcomes without reliable site confirmation as unconfirmed.
+An unfinished marker is never removed by installation or a VM restart. Inspect
+its report and owned windows before explicitly using the generic runner's
+`--clear-pending` after justified recovery.
+
+Lost transport or frozen queue reporting produces a monitoring failure and
+leaves the VM running. It is not treated as elapsed-time proof of a website stall.
+
+## Installation and updates
+
+Keep private settings, VM disks, sign-ins, exported macros, logs, reports, and
+credentials outside Git. Defaults are:
+
+| Host | Guest |
+| --- | --- |
+| `C:\ProgramData\GoodreadsGiveawaysVM` | `C:\GoodreadsVM` |
+| `reports` | `output` |
+
+For a new VM, use `Enable-HyperV.ps1`, `Install-VMHost.ps1`, and
+`New-GiveawaysVM.ps1` with your existing ISO/license. Host installation initially
+leaves the new schedule disabled unless `-Enable` is specified. Use
+`Prepare-VMGuestPackage.ps1` with the official embedded Python runtime, set up
+the guest's existing Edge profiles and local Keyfire helper, and install
+`Giveaways.js` in each profile. Profile display names resolve to their actual
+directories; missing or ambiguous names fail installation.
+
+Run `Install-VMGuest.ps1 -Enable` under the dedicated guest account for initial
+installation. For an existing installation, `-Migrate -Enable` preserves its
+settings, checks the profile map, retires the obsolete restore/catch-up/manual
+controls, and updates the existing interactive task. It never clears pending
+work. KVP registry access must already be granted, or run the installer elevated
+once. Both normal tasks use `ExecutionTimeLimit=PT0S` and `IgnoreNew`.
+
+For a remote maintenance update, elevated host PowerShell can call
+`Update-VMWorkflow.ps1 -GuestCredential (Get-Credential)` with the dedicated
+guest account. The credential stays in that PowerShell session. PowerShell
+Direct installs files and registers the task; it does not itself provide an
+interactive desktop. The updater refuses an active queue and preserves the old
+runtime. After updating source/tasks, update the userscript in **every profile**
+through Tampermonkey's `main` feed. With Edge fully closed,
+`Configure-TampermonkeyUpdates.cjs` can enable those update checks in the existing
+profiles with a backup. It does not install script source: Tampermonkey must
+refresh its registered browser scripts as well as its stored source. Verify the
+running version in the profile report after updating.
+
+Host settings use `hostStartAt: "04:00"`. The host must use Windows time zone
+`Eastern Standard Time`; the recurring task's StartBoundary has **no UTC offset**
+so Windows follows Eastern daylight-saving changes. `StartWhenAvailable` also
+handles a missed start after waking. Enabling the migrated schedule is an
+installation step; source changes alone never update installed tasks.
+
+## Reports and shutdown
+
+Every host invocation writes `reports\host-last-run.json` and a run-ID history
+record, including startup failures. The guest writes `vm-last-run.json`, fresh
+skip reasons in `vm-last-skip.json`, and the generic queue report. The host exports
+these **while the guest runs**, including helper diagnostics and log tails.
+Reports correlate by run ID, rather than reusing yesterday's account counts.
+
+The existing desktop reporter writes `%USERPROFILE%\.goodreads-giveaways\desktop\report.html`
+and delivers its native Open report notification. Older installations may use
+`%LOCALAPPDATA%\GoodreadsGiveawaysDesktopStatus`; migrate that reporter separately.
+The host confirms current desktop HTML delivery before normal shutdown; failure
+to confirm delivery defers shutdown and records the reason.
+
+Both host and guest settings require an explicit `jobInventoryVerified: true`
+and `otherJobTasks: [...]` list before shutdown is eligible. An empty list means
+the installation was inspected and has no other designated tasks. Missing,
+unknown, queued, or running task state prevents shutdown. Optional
+`activeJobsFile` points to a shared JSON file such as
+`{"jobs":[{"name":"another automation","state":"running"}]}`. Recognized states
+are `queued`, `running`, `idle`, `finished`, `failed`, and `cancelled`. Keep active
+jobs registered until their cleanup completes. Windows background processes
+are not interpreted as automation jobs. Goodreads completion alone is insufficient.
+
+`Run-VMNow.ps1` makes an explicit repeat request through the same adapter and
+locks, with the same inactivity policy. It has no guest-password or separate
+runtime watchdog. The compatibility repair entry point forwards to the updater.
+
+## Verification
+
+Run the Python/Node tests beside each source file, `Test-VMWorkflow.ps1`, and
+`WorkflowPolicy.test.ps1`. They cover 660 simulated entries, useful progress
+past former cutoffs, heartbeat/retry-only stalls, safe sequential transitions,
+startup reporting, transport integrity, and shutdown blockers.
+
+For controlled installed checks, a temporary host setting `requestEntryLimit: 1`
+processes at most one entry per profile. The userscript must explicitly support
+that contract before any entry starts. Limited checks do not mark a full day as
+completed. **Remove this test setting before restoring the recurring schedule.**
+Exercise the registered host task using a temporary one-time trigger for a cold
+start and again while running. Capture task XML/history, guest interactive
+session, helper target/navigation evidence, profile start/closure order, current
+host/desktop reports, notification activation, and eligible/deferred shutdown.
+Restore the sole 04:00 Eastern recurring trigger and verify enabled state,
+`PT0S`, next-run time, and deployed hashes. `--now`, `--verify-only`, unit tests,
+or a GitHub push alone do not establish scheduled-workflow acceptance.

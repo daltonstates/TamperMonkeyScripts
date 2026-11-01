@@ -7,8 +7,9 @@
   "memoryGB": 4,
   "processors": 2,
   "diskGB": 80,
-  "hostStartAt": "03:55",
-  "maximumRuntimeMinutes": 195,
-  "recoverSavedFailures": true,
+  "hostStartAt": "04:00",
+  "jobInventoryVerified": false,
+  "otherJobTasks": [],
+  "desktopStatusDirectory": "C:\\Users\\YOUR_USER\\.goodreads-giveaways\\desktop",
   "reportDirectory": "C:\\ProgramData\\GoodreadsGiveawaysVM\\reports"
 }

@@ -100,6 +100,21 @@ class DesktopStatusTests(unittest.TestCase):
         self.assertNotIn("<img", html)
         self.assertIn("&lt;script&gt;", html)
 
+    def test_useful_active_queue_can_continue_overnight_without_a_missing_alert(self):
+        host, _ = completed()
+        host.update(state="running", updatedAt="2026-10-31T08:00:00-04:00")
+        now = datetime.fromisoformat("2026-10-31T08:01:00-04:00")
+        config = {"monitorFrom": "2026-10-30", "expectedBy": "07:30"}
+        self.assertIsNone(status.missing_summary(config, host, now))
+
+    def test_disabled_skip_uses_current_reason_without_old_profile_counts(self):
+        host, daily = completed()
+        host.update(state="skipped", reason="Guest workflow is disabled in guest-settings.json")
+        summary = status.summarize(host, daily)
+        self.assertEqual(summary["profiles"], [])
+        self.assertIsNone(summary["processed"])
+        self.assertIn("disabled", summary["body"])
+
     def test_malformed_account_records_and_unknown_counts_do_not_invent_success(self):
         host, daily = completed()
         daily["profiles"][0] = "damaged profile record"

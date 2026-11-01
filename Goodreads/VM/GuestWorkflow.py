@@ -1,328 +1,305 @@
-"""Run the existing giveaway queue inside its dedicated Hyper-V guest."""
+"""Interactive VM adapter: receive a host request, run the generic queue, export reports.
 
+KVP uses Hyper-V VMbus, without a network listener or saved guest password.
+The installer grants this account SetValue on the guest KVP registry key.
+Only the host shuts down the guest, after receiving and delivering its report.
+"""
 from __future__ import annotations
-
 import argparse
+import base64
 import ctypes
-from ctypes import wintypes
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
+import re
 import subprocess
 import sys
 import time
-import secrets
-import threading
+import uuid
+
+VERSION = "2026.11.01.1"
+KVP_ROOT = r"SOFTWARE\Microsoft\Virtual Machine"
+REPORT_NAMES = ("vm-last-run.json", "vm-last-skip.json", "daily-last-run.json",
+                "daily-verification.json", "daily-incomplete.json", "helper-status.json", "installation.json")
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def is_hyperv_guest():
     if os.name != "nt":
         return False
     import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\BIOS") as key:
-            product = winreg.QueryValueEx(key, "SystemProductName")[0]
-            manufacturer = winreg.QueryValueEx(key, "SystemManufacturer")[0]
-        return product == "Virtual Machine" and manufacturer == "Microsoft Corporation"
-    except OSError:
-        return False
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\BIOS") as key:
+        return (winreg.QueryValueEx(key, "SystemProductName")[0] == "Virtual Machine"
+                and winreg.QueryValueEx(key, "SystemManufacturer")[0] == "Microsoft Corporation")
 
 
 def write_report(path, value):
-    temporary = path.with_suffix(".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
-def in_run_window(start_at, now):
-    hour, minute = map(int, start_at.split(":"))
-    start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return start - timedelta(minutes=15) <= now <= start + timedelta(hours=3)
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def browser_window_open(edge_path):
-    """Read-only check of visible Edge windows in this interactive session."""
-    if os.name != "nt" or not edge_path:
-        return True
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    found = [False]
-    expected = os.path.normcase(os.path.abspath(edge_path))
+def read_request():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, KVP_ROOT + r"\External") as key:
+            value = json.loads(winreg.QueryValueEx(key, "Goodreads.Request")[0])
+    except FileNotFoundError:
+        return None
+    if (value.get("schema") != 1 or not re.fullmatch(r"[a-f0-9]{32}", value.get("runId", ""))
+            or value.get("mode") not in {"scheduled", "repeat", "verify"}
+            or value.get("entryLimit") is not None and
+            (type(value["entryLimit"]) is not int or not 1 <= value["entryLimit"] <= 10)):
+        raise ValueError("Invalid host Goodreads request")
+    return value
 
-    @callback_type
-    def visit(window, _):
-        if not user32.IsWindowVisible(window):
-            return True
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
-        process = kernel32.OpenProcess(0x1000, False, pid.value)
-        if process:
+
+def encode_bundle(bundle):
+    raw = json.dumps(bundle, separators=(",", ":")).encode("utf-8")
+    encoded = base64.b64encode(gzip.compress(raw)).decode("ascii")
+    if len(encoded) > 800 * 128:
+        raise ValueError("Guest report exceeds the KVP export bound")
+    return encoded, hashlib.sha256(raw).hexdigest()
+
+
+def publish(output, report, *, eligibility=None):
+    import winreg
+    files = {"vm-last-run.json": report}
+    warnings = []
+    for name in REPORT_NAMES[1:]:
+        path = output / name
+        if path.is_file():
             try:
-                path = ctypes.create_unicode_buffer(32768)
-                size = wintypes.DWORD(len(path))
-                if (kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size))
-                        and os.path.normcase(os.path.abspath(path.value)) == expected):
-                    found[0] = True
-            finally:
-                kernel32.CloseHandle(process)
-        else:
-            # Without the process identity, do not assume a visible window is safe.
-            found[0] = True
-        return True
+                files[name] = read_json(path)
+            except (OSError, ValueError) as error:
+                warnings.append({"file": name, "reason": str(error)})
+    helper = Path(os.environ.get("LOCALAPPDATA", "")) / "GoodreadsKeyfireCompanion"
+    if (helper / "helper-status.json").is_file():
+        try:
+            files["helper-status.json"] = read_json(helper / "helper-status.json")
+        except (OSError, ValueError) as error:
+            warnings.append({"file": "helper-status.json", "reason": str(error)})
+    for name, path in (("daily.log", output / "daily.log"),
+                       ("vm-runner.log", output / "vm-runner.log"), ("helper.log", helper / "helper.log")):
+        if path.is_file():
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 12000))
+                files[name] = handle.read().decode("utf-8", errors="replace")
+    bundle = {"schema": 1, "runId": report.get("runId"), "at": utc_now(),
+              "adapterVersion": VERSION, "files": files, "shutdown": eligibility, "exportWarnings": warnings}
+    encoded, digest = encode_bundle(bundle)
+    chunks = [encoded[i:i + 800] for i in range(0, len(encoded), 800)]
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, KVP_ROOT + r"\Guest", 0, winreg.KEY_SET_VALUE) as key:
+        for index, chunk in enumerate(chunks):
+            winreg.SetValueEx(key, f"Goodreads.Report.{index}", 0, winreg.REG_SZ, chunk)
+        manifest = {"count": len(chunks), "sha256": digest, "runId": report.get("runId"), "at": bundle["at"]}
+        # The host accepts only a complete snapshot matching this digest.
+        winreg.SetValueEx(key, "Goodreads.Report", 0, winreg.REG_SZ, json.dumps(manifest))
 
-    return not user32.EnumWindows(visit, 0) or found[0]
 
-
-def verification_can_retry(output, edge_path=None):
-    """Retry setup only after proof that no submission work can be left open."""
+def shutdown_eligibility(settings, task_states=None):
+    if settings.get("jobInventoryVerified") is not True or not isinstance(settings.get("otherJobTasks"), list):
+        return {"eligible": False, "reason": "Other VM automation jobs have not been inventoried."}
     try:
-        pending = json.loads((output / "daily-incomplete.json").read_text(encoding="utf-8-sig"))
-        report = json.loads((output / "daily-verification.json").read_text(encoding="utf-8-sig"))
-        started = datetime.fromisoformat(report["startedAt"])
-        pending_started = datetime.fromisoformat(pending["startedAt"])
-        profiles = report["profiles"]
-        paired = (report.get("verificationOnly") is True and bool(report.get("endedAt"))
-                and 0 <= (datetime.now(timezone.utc) - started).total_seconds() <= 60 * 60
-                and abs((started - pending_started).total_seconds()) <= 5
-                and pending.get("reason") in {"The giveaway queue did not finish; see the daily report",
-                                               "The scheduled window has not been confirmed closed."}
-                and bool(profiles)
-                and any(p.get("state") == "failed" for p in profiles)
-                and all(p.get("state") in {"verified", "failed", "skipped"}
-                        and p.get("progress") in {None, "0/0;0 open;claiming"} for p in profiles))
-        if not paired:
-            return False
-        locked_without_window = (profiles[0].get("reason") == "Windows is locked or has no interactive desktop."
-                                 and all(not p.get("startedAt") for p in profiles))
-        return locked_without_window or not browser_window_open(edge_path)
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
+        names = settings["otherJobTasks"]
+        if names and task_states is None:
+            command = "$names=@(" + ",".join("'" + name.replace("'", "''") + "'" for name in names) + "); @($names|ForEach-Object{Get-ScheduledTask -TaskName $_ -ErrorAction Stop|Select-Object TaskName,@{n='State';e={[string]$_.State}}})|ConvertTo-Json -Compress"
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                                    capture_output=True, text=True, check=True, timeout=30,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+            task_states = json.loads(result.stdout.lstrip("\ufeff"))
+            if isinstance(task_states, dict):
+                task_states = [task_states]
+        task_states = task_states or []
+        if len(task_states) != len(names):
+            raise ValueError("A designated task could not be inspected")
+        if any(task.get("State") not in {"Ready", "Disabled", "Running", "Queued"} for task in task_states):
+            raise ValueError("Unknown designated task state")
+        blocked = [task["TaskName"] for task in task_states if task["State"] in {"Running", "Queued"}]
+        if settings.get("activeJobsFile"):
+            jobs = read_json(Path(settings["activeJobsFile"]))["jobs"]
+            if not isinstance(jobs, list):
+                raise ValueError("Invalid active-job inventory")
+            for job in jobs:
+                if job["state"] in {"queued", "running"}:
+                    blocked.append(job["name"])
+                elif job["state"] not in {"finished", "failed", "cancelled", "idle"}:
+                    raise ValueError("Unknown designated job state")
+        return {"eligible": not blocked, "reason": ("Other jobs need the VM: " + ", ".join(blocked))
+                if blocked else "All designated guest jobs are idle.", "jobs": task_states}
+    except Exception as error:
+        return {"eligible": False, "reason": "Cannot establish guest shutdown eligibility: " + str(error)}
 
 
-def recover_previous_day(output, daily_settings, command):
-    """Archive an ended old failure only after a fresh guest has no Edge windows."""
-    pending = output / "daily-incomplete.json"
-    if not pending.exists():
-        return False
-    marker = json.loads(pending.read_text(encoding="utf-8-sig"))
-    report = json.loads((output / "daily-last-run.json").read_text(encoding="utf-8-sig"))
-    began = datetime.fromisoformat(report["startedAt"])
-    expected = {(p["name"], p["directory"]) for p in daily_settings["profiles"]}
-    actual = {(p["name"], p["directory"]) for p in report["profiles"] if p.get("startedAt")}
-    if (not report.get("endedAt") or report.get("verificationOnly") is not False
-            or began.astimezone().date() >= datetime.now().date()
-            or abs((datetime.fromisoformat(marker["startedAt"]) - began).total_seconds()) > 5
-            or not report["profiles"] or not any(p.get("state") == "failed" for p in report["profiles"])
-            or not actual.issubset(expected)
-            or browser_window_open(daily_settings.get("edgePath"))):
-        raise RuntimeError("Unfinished work could not be safely retired after the guest restart")
-    archive = output / "history" / ("retired-" + began.strftime("%Y%m%d-%H%M%S"))
-    archive.mkdir(parents=True, exist_ok=True)
-    for name in ("daily-incomplete.json", "daily-last-run.json", "vm-last-run.json"):
-        source = output / name
-        if source.exists():
-            shutil.copyfile(source, archive / name)
-    subprocess.run(command + ["--clear-pending"], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   creationflags=subprocess.CREATE_NO_WINDOW)
-    return True
-
-
-def warmup_userscript_updates(daily_settings, wait_seconds=45):
-    """Wake each profile's extension on a listing in verification-only mode."""
-    if not is_hyperv_guest():
-        raise RuntimeError("Userscript update preflight is limited to the dedicated Hyper-V guest")
-    from DailyGiveaways import ListingWindow, Server, Handler, PORT
-    windows = []
-    tokens = {}
-    ready_at = time.monotonic() + min(20, wait_seconds / 2)
-    class Preflight:
-        def event(self, value):
-            token = value.get("token")
-            if not isinstance(token, str) or token not in tokens or value.get("windowTag") != tokens[token]:
-                raise ValueError("Unknown update preflight")
-            return {"protocol": 1, "mode": "wait" if time.monotonic() < ready_at else "verify",
-                    "cancel": False, "closeListing": False}
-    server = Server(("127.0.0.1", PORT), Handler)
-    server.session = Preflight()
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    helper = Path(__file__).resolve().parents[1] / "KeyfireGiveaways.py"
-    try:
-        subprocess.Popen([str(Path(sys.executable).with_name("pythonw.exe")), str(helper),
-                          "--config", daily_settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
-        return _warmup_profile_windows(daily_settings, wait_seconds, windows, tokens, ListingWindow)
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
-def _warmup_profile_windows(daily_settings, wait_seconds, windows, tokens, window_type):
-    for profile in daily_settings["profiles"]:
-        tag = secrets.token_hex(16)
-        token = secrets.token_hex(32)
-        tokens[token] = tag
-        # This filter cannot auto-open entries. The temporary authenticated
-        # coordinator only returns verify/wait, never a run instruction.
-        url = ("https://www.goodreads.com/giveaway?sort=recently_listed&format=kindle"
-               f"#grDailyToken={token}&grDailyWindow={tag}")
-        window = window_type(tag, daily_settings["edgePath"])
-        windows.append(window)
-        subprocess.Popen([daily_settings["edgePath"], f'--user-data-dir={daily_settings["userDataDirectory"]}',
-                          f'--profile-directory={profile["directory"]}', "--new-window", url],
-                         creationflags=subprocess.CREATE_NO_WINDOW)
-    time.sleep(wait_seconds)
-    for window in windows:
-        if not window.bind():
-            raise RuntimeError("Could not identify an update preflight window")
-        deadline = time.monotonic() + 15
-        while not window.closed() and time.monotonic() < deadline:
-            if not window.request_close():
-                raise RuntimeError("An update preflight window changed identity")
-            time.sleep(0.25)
-        if not window.closed():
-            raise RuntimeError("An update preflight window did not close")
-    return {"profiles": [p["name"] for p in daily_settings["profiles"]], "waitSeconds": wait_seconds}
-
-
-def run(settings, *, verify_only=False, keep_running=False, run_now=False):
-    # The VM workflow must never run browser automation on the physical host.
-    if not is_hyperv_guest():
-        raise RuntimeError("This wrapper runs only inside a Microsoft Hyper-V guest")
-    if not settings.get("enabled") and not verify_only:
-        return 0
-    config = Path(settings["dailySettings"])
-    output = config.parent
+def run(settings, *, verify_only=False, keep_running=False, run_now=False, request=None, publisher=None):
+    output = Path(settings["dailySettings"]).parent
     output.mkdir(parents=True, exist_ok=True)
-    daily_settings = json.loads(config.read_text(encoding="utf-8-sig"))
+    request = request or {"runId": uuid.uuid4().hex, "mode": "verify" if verify_only else "repeat" if run_now else "scheduled"}
+    report = {"runId": request["runId"], "startedAt": utc_now(), "state": "starting", "adapterVersion": VERSION,
+              "verificationOnly": verify_only, "manualRun": run_now, "entryLimit": request.get("entryLimit"),
+              "note": "Processed entries are not independently confirmed as accepted by Goodreads."}
+    report_path = output / "vm-last-run.json"
     success_path = output / "vm-last-success.json"
     today = datetime.now().date().isoformat()
-    if not verify_only and not run_now:
-        reason = None
-        if not in_run_window(daily_settings["startAt"], datetime.now()):
-            reason = "Outside the morning window"
-        elif success_path.exists() and json.loads(success_path.read_text(encoding="utf-8-sig")).get("localDate") == today:
-            reason = "Already finished today's queue"
-        if reason:
-            write_report(output / "vm-last-skip.json", {"state": "skipped", "at": datetime.now(timezone.utc).isoformat(), "reason": reason})
-            return 0
-    started = datetime.now(timezone.utc)
-    report = {"startedAt": started.isoformat(), "state": "starting", "verificationOnly": verify_only, "manualRun": run_now,
-              "note": "Finished means the giveaway tab queue closed; entry acceptance is not independently verified."}
-    report_path = output / "vm-last-run.json"
     child = None
-    power_set = False
+    def emit():
+        report["updatedAt"] = utc_now()
+        write_report(report_path, report)
+        if publisher:
+            publisher(output, report, eligibility=report.get("shutdown"))
     try:
-        if not daily_settings.get("closeCompletedListings"):
-            raise RuntimeError("Enable closeCompletedListings in this guest before running unattended")
-        if not ctypes.windll.kernel32.SetThreadExecutionState(0x80000001):
-            raise RuntimeError("Could not keep the guest awake during the run")
-        power_set = True
-        if settings.get("preflightUserScriptUpdates") is True:
-            report["updatesPreflight"] = warmup_userscript_updates(daily_settings)
-        command = [sys.executable, settings["dailyRunner"], "--config", str(config)]
-        if run_now:
-            # Only an explicit manual invocation bypasses the clock and daily
-            # success marker. Existing locks and unfinished-work checks remain.
-            command.append("--now")
-        if settings.get("recoverFailedProfiles") is True:
-            command.append("--vm-recover-failures")
-            if not verify_only:
-                report["retiredPreviousFailure"] = recover_previous_day(output, daily_settings, command)
-        if verify_only:
-            if verification_can_retry(output, daily_settings.get("edgePath")):
-                # The runner takes daily.lock before clearing; never clear an active run.
-                subprocess.run(command + ["--clear-pending"], check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
-            command.append("--verify-only")
-        write_report(report_path, report)
-        with (output / "vm-runner.log").open("a", encoding="utf-8") as log:
-            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                     creationflags=subprocess.CREATE_NO_WINDOW)
-            result = child.wait(timeout=180 * 60)
-        report_name = "daily-verification.json" if verify_only else "daily-last-run.json"
-        daily_report = json.loads((output / report_name).read_text(encoding="utf-8-sig"))
-        profiles = daily_report.get("profiles", [])
-        expected = "verified" if verify_only else "finished"
-        if (result != 0 or not profiles or len(profiles) != len(daily_settings["profiles"])
-                or any(p.get("state") != expected or p.get("listingClosed") is not True for p in profiles)
-                or datetime.fromisoformat(daily_report["startedAt"]) < started - timedelta(seconds=5)
-                or not daily_report.get("endedAt")):
-            raise RuntimeError("The giveaway queue did not finish; see the daily report")
-        report["state"] = expected
-        if not verify_only:
-            write_report(success_path, {"localDate": today, "finishedAt": datetime.now(timezone.utc).isoformat()})
+        if not is_hyperv_guest():
+            raise RuntimeError("This wrapper runs only inside a Microsoft Hyper-V guest")
+        session_id = ctypes.c_ulong()
+        if ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session_id)):
+            report["interactiveSessionId"] = session_id.value
+        report["interactiveUser"] = os.environ.get("USERNAME")
+        if settings.get("enabled") is not True and not verify_only:
+            report.update(state="skipped", reason="Guest workflow is disabled in guest-settings.json")
+        elif (not verify_only and not run_now and success_path.exists()
+              and read_json(success_path).get("localDate") == today):
+            report.update(state="skipped", reason="Already completed today's queue")
+        else:
+            daily_settings = read_json(Path(settings["dailySettings"]))
+            if daily_settings.get("closeCompletedListings") is not True:
+                raise RuntimeError("Safe listing cleanup must be enabled")
+            command = [sys.executable, settings["dailyRunner"], "--config", settings["dailySettings"],
+                       "--requested", "--run-id", report["runId"]]
+            if verify_only:
+                command.append("--verify-only")
+            if settings.get("recoverFailedProfiles") is True:
+                command.append("--recover-failures")
+            if request.get("entryLimit"):
+                command += ["--entry-limit", str(request["entryLimit"])]
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+            report["state"] = "running"
+            emit()
+            with (output / "vm-runner.log").open("a", encoding="utf-8") as log:
+                child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                         creationflags=subprocess.CREATE_NO_WINDOW)
+                launch_clock = time.monotonic()
+                while child.poll() is None:
+                    # The generic queue owns inactivity and safe cleanup.
+                    daily_path = output / ("daily-verification.json" if verify_only else "daily-last-run.json")
+                    try:
+                        current = read_json(daily_path)
+                        current_queue = current.get("runId") == report["runId"]
+                    except (OSError, ValueError):
+                        current_queue = False
+                    if not current_queue and time.monotonic() - launch_clock > 120:
+                        raise RuntimeError("The child queue did not establish current reporting; it was left running for diagnosis.")
+                    if current_queue and time.time() - daily_path.stat().st_mtime > daily_settings.get("inactivityMinutes", 15) * 60:
+                        raise RuntimeError("Queue monitoring stopped updating. This does not prove a website stall; the child and VM were preserved.")
+                    emit()
+                    time.sleep(5)
+                result = child.wait()
+            daily = read_json(output / ("daily-verification.json" if verify_only else "daily-last-run.json"))
+            profiles = daily.get("profiles", [])
+            if (not daily.get("endedAt") or datetime.fromisoformat(daily["startedAt"]) < datetime.fromisoformat(report["startedAt"])
+                    or len(profiles) != len(daily_settings["profiles"])):
+                raise RuntimeError(daily.get("reason") or "The queue did not produce a current complete profile report")
+            expected = "verified" if verify_only else "finished"
+            closed = all(p.get("listingClosed") is True for p in profiles) and not (output / "daily-incomplete.json").exists()
+            if result == 0 and closed and all(p.get("state") == expected for p in profiles):
+                report["state"] = expected
+                if not verify_only and not request.get("entryLimit"):
+                    write_report(success_path, {"localDate": today, "runId": report["runId"], "finishedAt": utc_now()})
+            else:
+                report.update(state="failed-cleaned" if closed else "failed", reason=daily.get("reason") or "One or more profiles failed; see the current queue report.")
+            report["queueClosed"] = closed
+        if report["state"] == "skipped":
+            write_report(output / "vm-last-skip.json", {**report, "endedAt": utc_now()})
     except Exception as error:
-        report.update(state="failed", reason=str(error))
-        # A failed account is still a failure, but a fully closed VM queue must
-        # not leave the machine saved and block every following morning.
-        if settings.get("recoverFailedProfiles") is True and child is not None and child.poll() is not None:
-            try:
-                failed_daily = json.loads((output / "daily-last-run.json").read_text(encoding="utf-8-sig"))
-                closed_profiles = failed_daily["profiles"]
-                if (not verify_only and len(closed_profiles) == len(daily_settings["profiles"])
-                        and failed_daily.get("endedAt")
-                        and datetime.fromisoformat(failed_daily["startedAt"]) >= started - timedelta(seconds=5)
-                        and all(p.get("listingClosed") is True and p.get("state") in {"finished", "failed"}
-                                for p in closed_profiles)
-                        and not (output / "daily-incomplete.json").exists()):
-                    report["state"] = "failed-cleaned"
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
-        # Leave the VM and its unfinished tabs available for inspection.
-        pending = output / "daily-incomplete.json"
-        if report["state"] != "failed-cleaned" and not pending.exists():
-            write_report(pending, {"startedAt": started.isoformat(), "reason": str(error)})
+        report.update(state="failed", reason=str(error), queueStillActive=child is not None and child.poll() is None)
     finally:
-        if power_set:
+        if os.name == "nt":
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
-        report["endedAt"] = datetime.now(timezone.utc).isoformat()
-        write_report(report_path, report)
-    if (settings.get("shutdownAfterSuccess") is True and not keep_running
-            and report["state"] in {"finished", "verified", "failed-cleaned"}):
-        result = subprocess.run([str(Path(os.environ["SystemRoot"]) / "System32" / "shutdown.exe"),
-                                 "/s", "/t", "0"], check=False,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
-        if result.returncode != 0:
-            report.update(state="failed", reason="The guest could not shut down after its completed run")
-            write_report(report_path, report)
-    return 0 if report["state"] in {"finished", "verified"} else 1
+        report["endedAt"] = utc_now()
+        report["shutdown"] = shutdown_eligibility(settings)
+        if keep_running or not report.get("queueClosed"):
+            report["shutdown"] = {"eligible": False, "reason": "Requested to stay running or the queue has not proved safe cleanup."}
+        emit()
+        write_report(output / "requests" / (report["runId"] + ".json"), report)
+    return 0 if report["state"] in {"finished", "verified", "skipped"} else 1
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--settings", type=Path, required=True)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--verify-only", action="store_true")
-    mode.add_argument("--run-now", action="store_true", help="Explicitly repeat all configured profiles now, even after today's success")
-    parser.add_argument("--keep-running", action="store_true", help="Leave the guest running after a setup check")
+    parser.add_argument("--listen", action="store_true")
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--run-now", action="store_true")
+    parser.add_argument("--keep-running", action="store_true")
     args = parser.parse_args()
-    settings = json.loads(args.settings.read_text(encoding="utf-8-sig"))
-    # The logon task and a manual verification must not run competing wrappers.
-    if not is_hyperv_guest():
-        raise RuntimeError("This wrapper runs only inside a Microsoft Hyper-V guest")
-    import msvcrt
-    with (Path(settings["dailySettings"]).parent / "vm-workflow.lock").open("a+b") as lock:
-        lock.seek(0)
-        if not lock.read(1):
-            lock.write(b"0")
-            lock.flush()
-        lock.seek(0)
+    output = args.settings.parent / "output"
+    request = None
+    try:
+        request = None if args.verify_only or args.run_now else read_request()
+        settings = read_json(args.settings)
+        output = Path(settings["dailySettings"]).parent
+        migration = output / "migration-request.json"
+        if migration.exists():
+            installer = args.settings.parent / "Goodreads" / "VM" / "Install-VMGuest.ps1"
+            migration_command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                 "-File", str(installer), "-Migrate", "-Enable"]
+            retirement = read_json(migration).get("retiredRestoreSha256")
+            if retirement:
+                if not re.fullmatch(r"[a-fA-F0-9]{64}", retirement):
+                    raise ValueError("Invalid audited restore retirement fingerprint")
+                migration_command += ["-RetiredRestoreSha256", retirement]
+            migration_result = subprocess.run(migration_command,
+                                              capture_output=True, text=True, timeout=120,
+                                              creationflags=subprocess.CREATE_NO_WINDOW)
+            if migration_result.returncode:
+                raise RuntimeError("Guest task migration failed: " + (migration_result.stderr or migration_result.stdout)[-2500:])
+            migration.rename(output / "migration-completed.json")
+            settings = read_json(args.settings)
+        request = None if args.verify_only or args.run_now else read_request()
+        if not request and not args.verify_only and not args.run_now:
+            return 0
+        import msvcrt
+        output.mkdir(parents=True, exist_ok=True)
+        with (output / "vm-workflow.lock").open("a+b") as lock:
+            lock.seek(0)
+            if not lock.read(1):
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return 0
+            previous = output / "requests" / (request["runId"] + ".json") if request else None
+            if previous and previous.exists():
+                report = read_json(previous)
+                report["shutdown"] = shutdown_eligibility(settings)
+                publish(output, report, eligibility=report["shutdown"])
+                return 0
+            return run(settings, verify_only=args.verify_only or bool(request and request["mode"] == "verify"),
+                       run_now=args.run_now or bool(request and request["mode"] == "repeat"), request=request,
+                       keep_running=args.keep_running, publisher=publish)
+    except Exception as error:
+        report = {"runId": request.get("runId") if request else None, "state": "failed", "startedAt": utc_now(),
+                  "endedAt": utc_now(), "reason": str(error), "adapterVersion": VERSION}
+        write_report(output / "vm-last-run.json", report)
+        if request and re.fullmatch(r"[a-f0-9]{32}", request.get("runId", "")):
+            write_report(output / "requests" / (request["runId"] + ".json"), report)
         try:
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
-            raise RuntimeError("Another VM workflow is already running") from None
-        return run(settings, verify_only=args.verify_only, keep_running=args.keep_running, run_now=args.run_now)
+            publish(output, report, eligibility={"eligible": False, "reason": "Guest startup failed"})
+        except Exception as export_error:
+            write_report(output / "vm-export-error.json", {"at": utc_now(), "reason": str(export_error)})
+        return 1
 
 
 if __name__ == "__main__":

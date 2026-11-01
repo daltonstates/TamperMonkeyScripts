@@ -31,8 +31,7 @@ try {
         @{ field = 'storageRoot'; value = '\\server\share'; error = 'absolute local' },
         @{ field = 'vmId'; value = 'invalid'; error = 'identity' },
         @{ field = 'processors'; value = 0; error = 'Invalid VM settings' },
-        @{ field = 'processors'; value = 2.5; error = 'whole numbers' },
-        @{ field = 'maximumRuntimeMinutes'; value = 10000; error = 'Invalid VM settings' }
+        @{ field = 'processors'; value = 2.5; error = 'whole numbers' }
     )) {
         $candidate = $settings | ConvertTo-Json | ConvertFrom-Json
         $candidate.($change.field) = $change.value
@@ -46,15 +45,15 @@ try {
     $script:starts = $script:resumes = 0
     function Start-VM { param($VM) $script:starts++ }
     function Resume-VM { param($VM) $script:resumes++ }
-    foreach ($state in @('Running', 'Off')) {
+    foreach ($state in @('Running', 'Off', 'Saved')) {
         $script:fakeVM.State = $state
         $script:starts = $script:resumes = 0
         $wake = Start-GiveawaysMorningVM $settings
         Assert-Check ($wake.previousState -eq $state) 'VM wake report lost the original state.'
-        Assert-Check ($script:starts -eq [int]($state -eq 'Off')) 'VM was started in an unexpected state.'
+        Assert-Check ($script:starts -eq [int]($state -in @('Off','Saved'))) 'VM was started in an unexpected state.'
         Assert-Check ($script:resumes -eq 0) 'VM was resumed in an unexpected state.'
     }
-    foreach ($state in @('Saved', 'Paused')) {
+    foreach ($state in @('Paused')) {
         $script:fakeVM.State = $state
         $script:starts = $script:resumes = 0
         Assert-Rejected { Start-GiveawaysMorningVM $settings } 'left alone'
@@ -64,39 +63,6 @@ try {
     Assert-Rejected { Start-GiveawaysMorningVM $settings } 'left alone'
     $script:fakeVM.State = 'Off'
     Assert-Check ((Get-OwnedGiveawaysVM $settings).Id -eq $settings.vmId) 'Owned VM was not selected.'
-    $originalDiskPath = $settings.diskPath
-    $originalReportDirectory = $settings.reportDirectory
-    $settings.diskPath = Join-Path $scratch 'failure.vhdx'
-    $script:fakeDisks = @([pscustomobject]@{ Path = $settings.diskPath })
-    [IO.File]::WriteAllText($settings.diskPath, 'unchanged disk sentinel')
-    $settings.reportDirectory = $scratch
-    $settings | Add-Member -Force NoteProperty recoverSavedFailures $true
-    $proofPath = Join-Path $scratch 'host-saved-failure.json'
-    $disk = Get-Item -LiteralPath $settings.diskPath
-    $proof = @{vmId=$settings.vmId;vmName=$settings.vmName;savedAt=[DateTimeOffset]::Now.AddDays(-1).ToString('o');diskLength=$disk.Length;diskLastWriteUtc=$disk.LastWriteTimeUtc.ToString('o')}
-    Write-VMJson $proofPath $proof
-    $script:fakeVM.State = 'Saved'
-    $proof.diskLength++
-    Write-VMJson $proofPath $proof
-    Assert-Rejected { Start-GiveawaysMorningVM $settings } 'unchanged previous-day'
-    $proof.diskLength--
-    $proof.savedAt = [DateTimeOffset]::Now.ToString('o')
-    Write-VMJson $proofPath $proof
-    Assert-Rejected { Start-GiveawaysMorningVM $settings } 'unchanged previous-day'
-    $proof.savedAt = [DateTimeOffset]::Now.AddDays(-1).ToString('o')
-    Write-VMJson $proofPath $proof
-    function Stop-VM { param($VM,[switch]$AsJob,[switch]$Save,[switch]$Confirm) $script:fakeVM.State = 'Off'; return [pscustomobject]@{Id=999} }
-    function Wait-Job { param($Job,$Timeout) return $Job }
-    function Receive-Job { [CmdletBinding()]param($Job) }
-    function Remove-Job { [CmdletBinding()]param($Job,[switch]$Force) }
-    $recovered = Start-GiveawaysMorningVM $settings
-    Assert-Check ($recovered.action -eq 'recovered-started') 'A proven previous-day failure did not cold-start.'
-    Assert-Check (-not (Test-Path -LiteralPath $proofPath)) 'Recovered proof must be archived.'
-    Get-ChildItem -LiteralPath (Join-Path $scratch 'history') -File | Remove-Item
-    [IO.Directory]::Delete((Join-Path $scratch 'history'))
-    $settings.diskPath = $originalDiskPath
-    $settings.reportDirectory = $originalReportDirectory
-    $script:fakeDisks = @([pscustomobject]@{ Path = $settings.diskPath })
     $script:fakeVM.Name = 'AnotherVM'
     Assert-Rejected { Get-OwnedGiveawaysVM $settings } 'ownership marker'
     $script:fakeVM.Name = $settings.vmName

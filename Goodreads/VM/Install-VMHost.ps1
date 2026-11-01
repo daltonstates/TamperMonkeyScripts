@@ -22,7 +22,7 @@ foreach ($sidText in @('S-1-5-18', 'S-1-5-32-544')) {
 }
 $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($operator, 'ReadAndExecute', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
 Set-Acl -LiteralPath $runtime -AclObject $acl
-foreach ($name in @('VM.Common.ps1', 'Invoke-VMWorkflow.ps1', 'New-GiveawaysVM.ps1', 'Read-GuestReports.py')) {
+foreach ($name in @('VM.Common.ps1', 'VM.Transport.ps1', 'Invoke-VMWorkflow.ps1', 'New-GiveawaysVM.ps1', 'Read-GuestReports.py', 'Run-VMNow.ps1')) {
     $source = Join-Path $PSScriptRoot $name
     $target = Join-Path $runtime $name
     if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($target)) { Copy-Item -LiteralPath $source -Destination $target -Force }
@@ -40,13 +40,6 @@ $runner = Join-Path $runtime 'Invoke-VMWorkflow.ps1'
 if ($existing -and @($existing.Actions | Where-Object { $_.Arguments -like ('*' + $runner + '*') }).Count -ne 1) {
     throw 'An unrelated scheduled task already uses this name. It was not changed.'
 }
-if ($Enable) {
-    Import-Module Hyper-V -ErrorAction Stop
-    $guest = Export-VMGuestReports $settings
-    if ($guest.state -ne 'verified' -or -not $guest.endedAt -or [DateTimeOffset]::Parse($guest.endedAt) -lt [DateTimeOffset]::Now.AddDays(-1)) {
-        throw 'Complete a recent guest verification before enabling the host schedule.'
-    }
-}
 $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + $runner + '"') -WorkingDirectory $runtime
 $startAt = [DateTime]::ParseExact($settings.hostStartAt, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
 $trigger = New-ScheduledTaskTrigger -Daily -At $startAt
@@ -55,9 +48,9 @@ $trigger = New-ScheduledTaskTrigger -Daily -At $startAt
 # https://learn.microsoft.com/windows/win32/api/taskschd/nf-taskschd-itrigger-put_startboundary
 $trigger.StartBoundary = $startAt.ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description 'Boot the giveaway VM each morning and wait for its guest job to shut it down. Save a stalled VM at the time limit to release RAM; saved failures require inspection.' -Force | Out-Null
-Disable-ScheduledTask -TaskName $taskName | Out-Null
+$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description 'Request the Goodreads queue at 04:00 Eastern, including an already-running VM. Export reports live and shut down only after report delivery and designated-job checks.' -Force | Out-Null
+if (-not $Enable -and (-not $existing -or [string]$existing.State -eq 'Disabled')) { Disable-ScheduledTask -TaskName $taskName | Out-Null }
 if ($Enable) {
     $oldTask = Get-ScheduledTask -TaskName 'Goodreads daily profiles' -ErrorAction SilentlyContinue
     if ($oldTask) {

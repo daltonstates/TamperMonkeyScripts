@@ -2451,6 +2451,28 @@ test("daily completion waits for the final Keyfire tab to close", async () => {
   );
 });
 
+test("a controlled scheduled request stops after one processing result", async () => {
+  const page = dailyPage({ dailyResponse: () => ({ entryLimit: 1 }) });
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length, 1);
+  page.openedTabs[0].close();
+  await page.advanceAsync(0);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.dailyRequests.at(-1).state, "finished");
+  assert.equal(page.dailyRequests.at(-1).metrics.processed, 1);
+  assert.equal(page.dailyRequests.at(-1).metrics.unconfirmed, 1);
+  assert.equal(page.dailyRequests.at(-1).metrics.accepted, undefined);
+  const next = dailyPage({ stored: page.stored, dailyResponse: () => ({ entryLimit: 1 }) });
+  await next.advanceAsync(1500);
+  assert.equal(next.openedTabs.length, 1);
+  assert.notEqual(next.openedTabs[0].href, page.openedTabs[0].href);
+  assert.equal(new URL(next.openedTabs[0].href).pathname.split('/').pop(), '456');
+  next.openedTabs[0].close();
+  await next.advanceAsync(0);
+  assert.equal(next.dailyRequests.at(-1).metrics.processed, 1);
+  assert.equal(next.dailyRequests.at(-1).metrics.processedToday, 2);
+});
+
 test("a scheduled entry awaiting its response cannot finish the daily run", async () => {
   const page = dailyPage({ listing: { pages: [[123]] } });
   await page.advanceAsync(1500);
@@ -2643,6 +2665,12 @@ test("capped daily batches refresh with their token without reporting completion
     page.dailyRequests.some((r) => r.state === "finished"),
     false,
   );
+  // An older userscript saved opened IDs only, after all tabs in the batch
+  // closed. Upgrading between batches must retain that useful progress.
+  const continuation = JSON.parse(page.sessionStored.get('gr_giveaway_continuation'));
+  delete continuation.processedIds;
+  delete continuation.baselineProcessed;
+  page.sessionStored.set('gr_giveaway_continuation', JSON.stringify(continuation));
   const resumed = dailyPage({
     href: page.navigations[0],
     dailyCloseListing: true,
@@ -2655,6 +2683,7 @@ test("capped daily batches refresh with their token without reporting completion
   resumed.openedTabs[0].close();
   await resumed.advanceAsync(0);
   assert.equal(resumed.dailyRequests.at(-1).state, "finished");
+  assert.equal(resumed.dailyRequests.at(-1).metrics.processed, 101);
   assert.equal(resumed.closeCount, 1);
 });
 

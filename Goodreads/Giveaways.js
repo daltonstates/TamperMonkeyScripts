@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.35
+// @version      4.37
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -58,6 +58,7 @@
   const DAILY_HELPER_URL = "http://127.0.0.1:17385/v1/daily";
   const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
   const SS_GIVEAWAY_CONTINUATION = "gr_giveaway_continuation";
+  const LS_DAILY_PROCESSED = "gr_daily_processed";
   const PROGRESS_HASH_INDEX = "grGiveawayIndex";
   const PROGRESS_HASH_TOTAL = "grGiveawayTotal";
   const PROGRESS_HASH_ID = "grGiveawayId";
@@ -358,6 +359,31 @@
     return `${dailyRun?.baseOpened + giveawayBatchOpened || 0}/${giveawayBatchTotal};${trackedGiveawayTabs.size} open;${loadingGiveaways ? "loading" : "claiming"}`;
   }
 
+  function dailyMetrics() {
+    if (!dailyRun) return undefined;
+    for (const link of document.querySelectorAll('a[href*="/giveaway/enter_"]')) {
+      const id = getGiveawayId(link.href);
+      if (id) dailyRun.loadedIds.add(id);
+    }
+    return {
+      processed: dailyRun.processedIds.size - dailyRun.baselineProcessed,
+      processedToday: dailyRun.processedIds.size,
+      loaded: dailyRun.loadedIds.size,
+      opened: dailyRun.baseOpened + giveawayBatchOpened,
+      open: trackedGiveawayTabs.size,
+      unconfirmed: dailyRun.processedIds.size - dailyRun.baselineProcessed,
+      waitSeconds: Math.max(0, Math.min(60, ((giveawayPacingUntil ?? 0) - Date.now()) / 1000)),
+    };
+  }
+
+  function savedDailyProcessed() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(LS_DAILY_PROCESSED));
+      return saved?.day === new Date().toLocaleDateString("en-CA") && Array.isArray(saved.ids)
+        ? saved.ids.filter((id) => typeof id === "string" && /^\d+$/.test(id)) : [];
+    } catch { return []; }
+  }
+
   function stopDailyTitleRetention(run = dailyRun) {
     if (!run) return;
     clearInterval(run.titleTimer);
@@ -443,9 +469,12 @@
               typeof GM_info === "undefined" ? null : GM_info.script.version,
             addressSubmitRetrySupported: true,
             failureCleanupSupported: true,
+            controlledEntryLimitSupported: true,
+            workflow: keyfireSettings,
             windowTag: dailyRun?.windowTag,
             reason: reason.slice(0, 300),
             progress: dailyProgress(),
+            metrics: dailyMetrics(),
           }),
           onerror: () =>
             finish(new Error("The daily runner connection failed.")),
@@ -519,6 +548,10 @@
       timer: null,
       titleTimer: null,
       baseOpened: continuation?.openedIds.length ?? 0,
+      processedIds: new Set(continuation?.processedIds ?? continuation?.openedIds ?? savedDailyProcessed()),
+      baselineProcessed: continuation?.baselineProcessed ?? (continuation ? 0 : savedDailyProcessed().length),
+      loadedIds: new Set(continuation?.loadedIds ?? []),
+      entryLimit: null,
     };
     keepDailyTitle();
     try {
@@ -540,6 +573,8 @@
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
       dailyRun.waitingForWindow = false;
+      if (Number.isInteger(response.entryLimit) && response.entryLimit > 0)
+        dailyRun.entryLimit = response.entryLimit;
       if (!keyfireEnabled || !isKeyfireConfigured(keyfireSettings))
         throw new Error(
           "Save Keyfire setup and enable Use Keyfire workflow in this Edge profile.",
@@ -969,7 +1004,9 @@
     // React can briefly remove both the status and button between pages.
     // Keep the last known total until the entire list has loaded.
     const pagination = { total: null };
-    const previouslyOpenedIds = new Set(continuation?.openedIds ?? []);
+    const previouslyOpenedIds = new Set([
+      ...(continuation?.openedIds ?? []), ...(dailyRun?.processedIds ?? []),
+    ]);
     restoreGiveawayPacing(continuation);
     let capped = false;
     let preparedWorkflow = null;
@@ -1046,7 +1083,7 @@
         waitForAll: capped,
         workflow: preparedWorkflow,
       });
-      if (controller.signal.aborted || !capped || !result || result.failed)
+      if (controller.signal.aborted || !capped || !result || result.failed || dailyRun?.entryLimit)
         return;
       if (result.openedIds.length === 0) {
         giveawayError(
@@ -1065,6 +1102,9 @@
             workflow: keyfireEnabled ? JSON.stringify(keyfireSettings) : null,
             createdAt: Date.now(),
             openedIds: [...previouslyOpenedIds],
+            processedIds: [...(dailyRun?.processedIds ?? [])],
+            baselineProcessed: dailyRun?.baselineProcessed ?? 0,
+            loadedIds: [...(dailyRun?.loadedIds ?? [])],
             pacing: giveawayPacing,
           }),
         );
@@ -1114,6 +1154,13 @@
       const settle = () => {
         if (settled) return;
         settled = true;
+        if (dailyRun && !dailyRun.stopped && !recovery.controller.signal.aborted) {
+          const id = getGiveawayId(link);
+          if (id) dailyRun.processedIds.add(id);
+          localStorage.setItem(LS_DAILY_PROCESSED, JSON.stringify({
+            day: new Date().toLocaleDateString("en-CA"), ids: [...dailyRun.processedIds],
+          }));
+        }
         if (recovery.pacing) recovery.pacing.lastClosedAt = Date.now();
         stopRecovery();
         if (pollId !== null) clearInterval(pollId);
@@ -1226,6 +1273,7 @@
       try {
         watchClose();
       } catch {
+        if (dailyRun) giveawayError("The giveaway tab's closure could not be observed safely.");
         settle();
       }
       if (!settled) pollId = setInterval(checkTab, 500);
@@ -1281,6 +1329,7 @@
         workflow = options.workflow ?? (await startKeyfireRun(signal));
       }
       for (const [linkIndex, link] of links.entries()) {
+        if (dailyRun?.entryLimit && opened >= dailyRun.entryLimit) break;
         await waitForOpenTabSlot(signal);
         await waitForGiveawayPacing(workflow, signal);
         // Settings may lower the background tab limit during a pacing wait.

@@ -13,6 +13,7 @@ import base64
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import hashlib
 import hmac
@@ -26,6 +27,7 @@ import threading
 import time
 
 
+VERSION = "2026.11.01.1"
 MARKER = re.compile(
     r"^\[GR Keyfire ([a-f0-9]{32}) ([a-f0-9]{64}) ([A-Za-z0-9_-]{1,2048}) (\d+) (address|entry) (\d+)\] "
 )
@@ -419,6 +421,7 @@ class NativeDesktop:
         return cancel
 
     def target(self):
+        self.target_status = {"reason": "No foreground window"}
         window = self.user32.GetForegroundWindow()
         if not window:
             return None
@@ -426,6 +429,7 @@ class NativeDesktop:
         self.user32.GetWindowTextW(window, title, len(title))
         marker = MARKER.match(title.value)
         if not marker:
+            self.target_status = {"reason": "Foreground window has no authenticated entry marker"}
             return None
         process_id = wintypes.DWORD()
         self.user32.GetWindowThreadProcessId(window, ctypes.byref(process_id))
@@ -442,7 +446,10 @@ class NativeDesktop:
                 return None
         finally:
             self.kernel32.CloseHandle(process)
-        return parse_target(window, title.value, process_name, time.time() * 1000, self.secret)
+        target = parse_target(window, title.value, process_name, time.time() * 1000, self.secret)
+        self.target_status = {"reason": "Authenticated foreground entry" if target else "Entry marker failed freshness, browser, or authentication checks",
+                              "browser": process_name, "stage": marker[5]}
+        return target
 
     def modifiers_down(self):
         return any(self.user32.GetAsyncKeyState(key) & 0x8000
@@ -478,6 +485,7 @@ class NativeDesktop:
         self.user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int]
         if self.user32.SendInput(2, inputs, ctypes.sizeof(Input)) != 2:
             raise RuntimeError("Windows could not send the giveaway key; helper stopped")
+        logging.info("Sent %s to authenticated giveaway %s %s window", key, target.giveaway, target.stage)
         return True
 
     def close(self):
@@ -531,6 +539,8 @@ def main():
     last_run = None
     rejected_run = None
     server = None
+    last_status = 0
+    previous_target = None
     try:
         server = start_workflow_server(args.config, secret)
         logging.info("Automatic workflow connection ready on loopback port %s", server.server_port)
@@ -538,6 +548,18 @@ def main():
         while args.seconds is None or time.monotonic() - started < args.seconds:
             cancel = desktop.pump_events()
             target = desktop.target()
+            identity = (target.giveaway, target.stage) if target else None
+            if identity and identity != previous_target:
+                logging.info("Foreground target: giveaway %s, %s", *identity)
+            previous_target = identity
+            if time.monotonic() - last_status >= 5:
+                status = {"version": VERSION, "at": datetime.now().astimezone().isoformat(), "pid": os.getpid(),
+                          "target": desktop.target_status, "macroPrepared": runner is not None,
+                          "modifiersDown": desktop.modifiers_down()}
+                temporary = log_dir / 'helper-status.tmp'
+                temporary.write_text(json.dumps(status, indent=2), encoding='utf-8')
+                temporary.replace(log_dir / 'helper-status.json')
+                last_status = time.monotonic()
             if target and target.run != last_run:
                 last_run = target.run
                 try:

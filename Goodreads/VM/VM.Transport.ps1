@@ -1,0 +1,97 @@
+# Hyper-V KVP transport. Only this adapter depends on the virtualization API.
+# https://learn.microsoft.com/windows-server/virtualization/hyper-v/integration-services-data-exchange
+function Get-GiveawaysKvpVM($Settings) {
+    [void](Get-OwnedGiveawaysVM $Settings)
+    Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter ("Name='" + $Settings.vmId + "'") -ErrorAction Stop
+}
+
+function Set-GiveawaysRequest($Settings, $Request) {
+    $vm = Get-GiveawaysKvpVM $Settings
+    $service = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+    $item = ([wmiclass]'\\.\root\virtualization\v2:Msvm_KvpExchangeDataItem').CreateInstance()
+    $item.Name = 'Goodreads.Request'
+    $item.Data = $Request | ConvertTo-Json -Compress
+    $item.Source = 0
+    $component = @($vm.GetRelated('Msvm_KvpExchangeComponent'))[0]
+    $existing = @($component.GetRelated('Msvm_KvpExchangeComponentSettingData'))[0].HostExchangeItems
+    $present = @($existing | Where-Object { ([xml]$_).SelectSingleNode("/INSTANCE/PROPERTY[@NAME='Name']/VALUE").InnerText -eq $item.Name }).Count -gt 0
+    $result = if ($present) { $service.ModifyKvpItems($vm, @($item.PSBase.GetText(1))) } else { $service.AddKvpItems($vm, @($item.PSBase.GetText(1))) }
+    if ($result.ReturnValue -eq 4096) {
+        $job = [wmi]$result.Job
+        $deadline = [DateTimeOffset]::Now.AddSeconds(30)
+        while ($job.JobState -in @(3,4)) {
+            if ([DateTimeOffset]::Now -gt $deadline) { throw 'Hyper-V could not deliver the job request within 30 seconds.' }
+            Start-Sleep -Milliseconds 250
+            $job.Get()
+        }
+        if ($job.JobState -ne 7) { throw "Hyper-V request delivery failed: $($job.ErrorDescription)" }
+    } elseif ($result.ReturnValue -ne 0) { throw "Hyper-V request delivery failed: $($result.ReturnValue)" }
+}
+
+function Read-GiveawaysLiveReport($Settings) {
+    $vm = Get-GiveawaysKvpVM $Settings
+    $items = @{}
+    @($vm.GetRelated('Msvm_KvpExchangeComponent'))[0].GuestExchangeItems | ForEach-Object {
+        [xml]$xml = $_
+        $name = $xml.SelectSingleNode("/INSTANCE/PROPERTY[@NAME='Name']/VALUE").InnerText
+        if ($name -like 'Goodreads.Report*') { $items[$name] = $xml.SelectSingleNode("/INSTANCE/PROPERTY[@NAME='Data']/VALUE").InnerText }
+    }
+    if (-not $items.ContainsKey('Goodreads.Report')) { return $null }
+    $manifest = $items['Goodreads.Report'] | ConvertFrom-Json
+    if ($manifest.count -lt 1 -or $manifest.count -gt 128 -or $manifest.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Invalid guest report manifest.' }
+    $encoded = ''
+    for ($index=0; $index -lt $manifest.count; $index++) {
+        $chunk = $items["Goodreads.Report.$index"]
+        if (-not $chunk -or $chunk.Length -gt 800) { return $null }
+        $encoded += $chunk
+    }
+    $inputStream = [IO.MemoryStream]::new([Convert]::FromBase64String($encoded))
+    $stream = [IO.Compression.GZipStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
+    $outputStream = [IO.MemoryStream]::new()
+    try {
+        $buffer = New-Object byte[] 8192
+        while (($count = $stream.Read($buffer,0,$buffer.Length)) -gt 0) {
+            $outputStream.Write($buffer,0,$count)
+            if ($outputStream.Length -gt 1MB) { throw 'Oversized guest report.' }
+        }
+        $raw = $outputStream.ToArray()
+        $hash = [Security.Cryptography.SHA256]::Create()
+        try { $digest = [BitConverter]::ToString($hash.ComputeHash($raw)).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
+        if ($digest -ne $manifest.sha256) { return $null } # KVP propagation in progress; retry.
+        $bundle = [Text.Encoding]::UTF8.GetString($raw) | ConvertFrom-Json
+        if ($bundle.schema -ne 1 -or $bundle.runId -ne $manifest.runId) { throw 'Invalid guest report identity.' }
+        return $bundle
+    } finally { $stream.Dispose(); $inputStream.Dispose(); $outputStream.Dispose() }
+}
+
+function Export-GiveawaysLiveReport($Settings, $Bundle) {
+    foreach ($name in @('vm-last-run.json','vm-last-skip.json','daily-last-run.json','daily-verification.json','daily-incomplete.json','helper-status.json','installation.json','daily.log','vm-runner.log','helper.log')) {
+        if ($Bundle.files.PSObject.Properties.Name -contains $name) {
+            $path = Join-Path $Settings.reportDirectory $name
+            if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Host report paths must not be links.' }
+            if ($name.EndsWith('.json')) { Write-VMJson $path $Bundle.files.$name }
+            else { [IO.File]::WriteAllText($path, [string]$Bundle.files.$name, [Text.UTF8Encoding]::new($false)) }
+        }
+    }
+}
+
+function Get-GiveawaysHostShutdownEligibility($Settings) {
+    if ($Settings.jobInventoryVerified -ne $true -or $null -eq $Settings.otherJobTasks) { return @{eligible=$false;reason='Other host jobs using this VM have not been inventoried.'} }
+    try {
+        $blocked = @()
+        foreach ($name in $Settings.otherJobTasks) {
+            $task = Get-ScheduledTask -TaskName $name -ErrorAction Stop
+            if ([string]$task.State -notin @('Ready','Disabled','Running','Queued')) { throw 'Unknown designated task state.' }
+            if ([string]$task.State -in @('Running','Queued')) { $blocked += $name }
+        }
+        if ($Settings.activeJobsFile) {
+            $jobs = (Get-Content -LiteralPath $Settings.activeJobsFile -Raw | ConvertFrom-Json).jobs
+            if ($null -eq $jobs) { throw 'Missing active job inventory.' }
+            foreach ($job in $jobs) {
+                if ($job.state -in @('queued','running')) { $blocked += $job.name }
+                elseif ($job.state -notin @('finished','failed','cancelled','idle')) { throw 'Unknown designated job state.' }
+            }
+        }
+        return @{eligible=($blocked.Count -eq 0); reason=$(if ($blocked.Count) { 'Other jobs need the VM: ' + ($blocked -join ', ') } else { 'All designated host jobs are idle.' })}
+    } catch { return @{eligible=$false;reason=('Cannot establish host shutdown eligibility: ' + $_.Exception.Message)} }
+}

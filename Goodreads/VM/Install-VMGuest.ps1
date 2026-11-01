@@ -1,125 +1,129 @@
 param(
-    [string]$PackagePath = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
+    [string]$PackagePath = 'C:\GoodreadsVM',
+    [switch]$Migrate,
     [switch]$VerifyOnly,
     [switch]$Enable,
-    [switch]$ClearPending
+    [switch]$ClearPending,
+    [string]$RetiredRestoreSha256
 )
-
-$ErrorActionPreference = 'Stop'
-$computer = Get-CimInstance Win32_ComputerSystem
-if ($computer.Manufacturer -ne 'Microsoft Corporation' -or $computer.Model -ne 'Virtual Machine') {
-    throw 'This installer changes only the dedicated Hyper-V guest. Do not run it on your physical PC.'
-}
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Run the guest installer as Administrator under the guest account that will run the giveaways.'
-}
-$root = 'C:\GoodreadsVM'
-if ([IO.Path]::GetFullPath($PackagePath).TrimEnd('\') -ne $root) {
-    New-Item -ItemType Directory -Path $root -Force | Out-Null
-    foreach ($name in @('Goodreads', 'runtime', 'keyfire-config.json', 'daily-settings.template.json')) {
-        Copy-Item -LiteralPath (Join-Path $PackagePath $name) -Destination $root -Recurse -Force
+$ErrorActionPreference='Stop'
+$computer=Get-CimInstance Win32_ComputerSystem
+if($computer.Manufacturer -ne 'Microsoft Corporation' -or $computer.Model -ne 'Virtual Machine'){throw 'Install only in the dedicated Hyper-V guest.'}
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+$admin=([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $Migrate -and -not $admin){throw 'Initial installation requires an elevated guest PowerShell. Migration can use the existing task owner.'}
+if($ClearPending){throw 'Installation never clears unfinished work. Inspect and recover the owned run before clearing its marker explicitly.'}
+$root='C:\GoodreadsVM'
+$output=Join-Path $root 'output'
+New-Item -ItemType Directory -Path $output -Force|Out-Null
+$archive=Join-Path $output ('history\install-'+(Get-Date -Format 'yyyyMMdd-HHmmss-ffff'))
+New-Item -ItemType Directory -Path $archive -Force|Out-Null
+if([IO.Path]::GetFullPath($PackagePath).TrimEnd('\') -ne $root){
+    foreach($name in @('Goodreads','runtime')){Copy-Item -LiteralPath (Join-Path $PackagePath $name) -Destination $root -Recurse -Force}
+    foreach($name in @('keyfire-config.json','daily-settings.template.json')){
+        if(-not (Test-Path -LiteralPath (Join-Path $root $name))){Copy-Item -LiteralPath (Join-Path $PackagePath $name) -Destination $root}
     }
 }
-$python = Join-Path $root 'runtime\python.exe'
-$pythonw = Join-Path $root 'runtime\pythonw.exe'
-if (-not (Test-Path -LiteralPath $pythonw)) { throw 'The guest package is missing its Python runtime.' }
-$output = Join-Path $root 'output'
-New-Item -ItemType Directory -Path $output -Force | Out-Null
-$outputAcl = Get-Acl -LiteralPath $output
-$outputAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
-Set-Acl -LiteralPath $output -AclObject $outputAcl
-$companionRoot = Join-Path $env:LOCALAPPDATA 'GoodreadsKeyfireCompanion'
-New-Item -ItemType Directory -Path $companionRoot -Force | Out-Null
-if ((Get-Item -LiteralPath $companionRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The guest companion folder must not be a link.' }
-$companionAcl = [Security.AccessControl.DirectorySecurity]::new()
-$companionAcl.SetAccessRuleProtection($true, $false)
-foreach ($sid in @($identity.User, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
-    $companionAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
-}
-Set-Acl -LiteralPath $companionRoot -AclObject $companionAcl
-$pairingPath = Join-Path $companionRoot 'pairing-key.txt'
-if (Test-Path -LiteralPath $pairingPath) {
-    if ((Get-Item -LiteralPath $pairingPath).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The guest helper key must not be a link.' }
-    if (([IO.File]::ReadAllText($pairingPath)).Trim() -notmatch '^[a-f0-9]{64}$') { throw 'The existing guest helper key is invalid.' }
-} else {
-    $randomBytes = New-Object byte[] 32
-    $random = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $random.GetBytes($randomBytes) } finally { $random.Dispose() }
-    $pairingKey = [BitConverter]::ToString($randomBytes).Replace('-', '').ToLowerInvariant()
-    [IO.File]::WriteAllText($pairingPath, $pairingKey, [Text.UTF8Encoding]::new($false))
-    $pairingKey = $null
-}
-$template = Get-Content -LiteralPath (Join-Path $root 'daily-settings.template.json') -Raw | ConvertFrom-Json
-$edge = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
-if (-not (Test-Path -LiteralPath $edge)) { $edge = Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe' }
-$template | Add-Member -Force NoteProperty edgePath $edge
-$template | Add-Member -Force NoteProperty userDataDirectory (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data')
-$localState = Get-Content -LiteralPath (Join-Path $template.userDataDirectory 'Local State') -Raw | ConvertFrom-Json
-foreach ($profile in $template.profiles) {
-    # Guest profile directories need not have the same numbers as on the host.
-    $matches = @($localState.profile.info_cache.PSObject.Properties | Where-Object {
-        $_.Value.name -eq $profile.name -and $_.Name -match '^(Default|Profile \d+)$' -and
-        (Test-Path -LiteralPath (Join-Path $template.userDataDirectory $_.Name) -PathType Container)
-    })
-    if ($matches.Count -ne 1) { throw "Name exactly one guest Edge profile '$($profile.name)' before installing the workflow." }
-    $profile.directory = $matches[0].Name
-}
-$template | Add-Member -Force NoteProperty keyfireConfig (Join-Path $root 'keyfire-config.json')
-$template | Add-Member -Force NoteProperty closeCompletedListings $true
-$dailySettings = Join-Path $output 'daily-settings.json'
-[IO.File]::WriteAllText($dailySettings, ($template | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
-$dailyRunner = Join-Path $root 'Goodreads\DailyGiveaways.py'
-& $python $dailyRunner --config $dailySettings --check
-if ($LASTEXITCODE -ne 0) { throw 'Finish the Edge profiles and macro setup in this guest before installing the logon workflow.' }
-if ($ClearPending) {
-    & $python $dailyRunner --config $dailySettings --clear-pending
-    if ($LASTEXITCODE -ne 0) { throw 'Could not clear the unfinished-work marker; check for a running queue.' }
-}
-$wrapper = Join-Path $root 'Goodreads\VM\GuestWorkflow.py'
-$guestSettings = Join-Path $root 'guest-settings.json'
-$settings = @{ enabled = $false; dailyRunner = $dailyRunner; dailySettings = $dailySettings; shutdownAfterSuccess = $true; recoverFailedProfiles = $true }
-if ($Enable) {
-    $verificationPath = Join-Path $output 'daily-verification.json'
-    $verification = Get-Content -LiteralPath $verificationPath -Raw | ConvertFrom-Json
-    if (-not $verification.endedAt -or -not $verification.verificationOnly -or
-        @($verification.profiles).Count -ne @($template.profiles).Count -or
-        @($verification.profiles | Where-Object { $_.state -ne 'verified' -or $_.listingClosed -ne $true }).Count -gt 0 -or
-        @($verification.profiles | Where-Object { $_.capabilities.addressSubmitRetrySupported -ne $true -or $_.capabilities.failureCleanupSupported -ne $true }).Count -gt 0 -or
-        [DateTimeOffset]::Parse($verification.endedAt) -lt [DateTimeOffset]::Now.AddDays(-1)) {
-        throw 'Verify every guest profile successfully before enabling the guest workflow.'
+$python=Join-Path $root 'runtime\python.exe'
+$pythonw=Join-Path $root 'runtime\pythonw.exe'
+if(-not (Test-Path -LiteralPath $pythonw)){throw 'Missing guest Python runtime.'}
+$dailyPath=Join-Path $output 'daily-settings.json'
+$settingsPath=Join-Path $root 'guest-settings.json'
+foreach($path in @($dailyPath,$settingsPath)){if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination $archive}}
+# Retire obsolete controls before they can overwrite migrated settings. Active
+# queues remain intact; an audited settings-only restore has an explicit plan.
+foreach($name in @('Goodreads acceptance restore','Goodreads maintenance catch-up','Goodreads manual run','Goodreads Profile 3 recovery','Goodreads empty result live check','Goodreads workflow maintenance')){
+    $old=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if($old){
+        if(($old.Actions.Arguments -join ' ') -notmatch 'C:\\GoodreadsVM\\'){throw "Unexpected action in '$name'; left alone."}
+        if([string]$old.State -eq 'Running'){
+            # An explicitly audited obsolete settings writer can be retired.
+            # Never stop a profile queue or an unidentified maintenance action.
+            $restoreScript=Join-Path $output 'Restore-NormalAfterAcceptance.ps1'
+            if($name -ne 'Goodreads acceptance restore' -or $RetiredRestoreSha256 -notmatch '^[a-fA-F0-9]{64}$' -or
+               ($old.Actions.Arguments -join ' ') -notlike ('*'+$restoreScript+'*') -or
+               (Get-FileHash -LiteralPath $restoreScript).Hash -ne $RetiredRestoreSha256){throw "Wait for the active task '$name' before migrating; no matching audited retirement was provided."}
+            Export-ScheduledTask -TaskName $name|Set-Content -LiteralPath (Join-Path $archive 'retired-configuration-restore.xml')
+            Disable-ScheduledTask -TaskName $name|Out-Null
+            Stop-ScheduledTask -TaskName $name
+            $stopDeadline=[DateTimeOffset]::Now.AddSeconds(15)
+            do{
+                $old=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+                if(-not $old -or [string]$old.State -ne 'Running'){break}
+                if([DateTimeOffset]::Now -ge $stopDeadline){throw 'The audited obsolete settings writer did not stop.'}
+                Start-Sleep -Milliseconds 250
+            }while($true)
+        }
+        if($old){Disable-ScheduledTask -TaskName $name|Out-Null}
     }
-    $autoLogon = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-    if ($autoLogon.AutoAdminLogon -ne '1' -or $autoLogon.DefaultUserName -ne $env:USERNAME) {
-        throw 'Configure Sysinternals Autologon for this guest account, then rerun with -Enable.'
-    }
-    $settings.enabled = $true
 }
-[IO.File]::WriteAllText($guestSettings, ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-$taskName = 'Goodreads VM workflow'
-$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($existing -and @($existing.Actions | Where-Object { $_.Arguments -like ('*' + $wrapper + '*') }).Count -ne 1) {
-    throw 'An unrelated task already uses this name. It was not changed.'
+$daily=if(Test-Path -LiteralPath $dailyPath){Get-Content -LiteralPath $dailyPath -Raw|ConvertFrom-Json}else{Get-Content -LiteralPath (Join-Path $root 'daily-settings.template.json') -Raw|ConvertFrom-Json}
+if(-not $daily.edgePath){$daily|Add-Member NoteProperty edgePath (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe')}
+if(-not $daily.userDataDirectory){$daily|Add-Member NoteProperty userDataDirectory (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data')}
+if(-not $daily.keyfireConfig){$daily|Add-Member NoteProperty keyfireConfig (Join-Path $root 'keyfire-config.json')}
+$localState=Get-Content -LiteralPath (Join-Path $daily.userDataDirectory 'Local State') -Raw|ConvertFrom-Json
+foreach($profile in $daily.profiles){
+    $matches=@($localState.profile.info_cache.PSObject.Properties|Where-Object{$_.Value.name -eq $profile.name -and $_.Name -match '^(Default|Profile \d+)$'})
+    if($matches.Count -ne 1){throw "Expected exactly one existing Edge profile '$($profile.name)'."}
+    if($profile.directory -and $profile.directory -ne $matches[0].Name){throw "Configured profile directory changed for '$($profile.name)'; inspect before migrating."}
+    $profile.directory=$matches[0].Name
+    $profile.offsetMinutes=0
 }
-$action = New-ScheduledTaskAction -Execute $pythonw -Argument ('"' + $wrapper + '" --settings "' + $guestSettings + '"') -WorkingDirectory $root
-$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
-$logonTrigger.Delay = 'PT45S'
-if ($Enable) { Set-TimeZone -Id 'Eastern Standard Time'; [TimeZoneInfo]::ClearCachedData() }
-$principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
-$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4)
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $logonTrigger -Principal $principal -Settings $taskSettings -Description 'After the scheduled VM boot and automatic sign-in, run the morning giveaway queue once, close its windows, and shut down this VM after success.' -Force | Out-Null
-Disable-ScheduledTask -TaskName $taskName | Out-Null
-if ($Enable) {
-    # Apply power and idle settings only inside the guest, never on the host.
-    & powercfg.exe /change standby-timeout-ac 0
-    if ($LASTEXITCODE -ne 0) { throw 'Could not set the guest sleep timeout.' }
-    & powercfg.exe /change hibernate-timeout-ac 0
-    if ($LASTEXITCODE -ne 0) { throw 'Could not set the guest hibernation timeout.' }
-    Set-ItemProperty -LiteralPath 'HKCU:\Control Panel\Desktop' -Name ScreenSaveActive -Value '0'
-    Enable-ScheduledTask -TaskName $taskName | Out-Null
+$daily|Add-Member -Force NoteProperty profileStartPolicy 'completion'
+$daily|Add-Member -Force NoteProperty closeCompletedListings $true
+if($null -eq $daily.inactivityMinutes){$daily|Add-Member NoteProperty inactivityMinutes 15}
+[IO.File]::WriteAllText($dailyPath,($daily|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+$dailyRunner=Join-Path $root 'Goodreads\DailyGiveaways.py'
+& $python $dailyRunner --config $dailyPath --check
+if($LASTEXITCODE -ne 0){throw 'Guest queue settings or selected macro failed validation.'}
+$companion=Join-Path $env:LOCALAPPDATA 'GoodreadsKeyfireCompanion'
+$pairing=Join-Path $companion 'pairing-key.txt'
+if(-not (Test-Path -LiteralPath $pairing)){throw 'Set up the existing local Keyfire helper in this account before enabling the VM adapter.'}
+$settings=if(Test-Path -LiteralPath $settingsPath){Get-Content -LiteralPath $settingsPath -Raw|ConvertFrom-Json}else{[pscustomobject]@{enabled=$false}}
+foreach($entry in @{dailyRunner=$dailyRunner;dailySettings=$dailyPath;recoverFailedProfiles=$true;adapterVersion='2026.11.01.1';interactiveUserSid=$identity.User.Value}.GetEnumerator()){$settings|Add-Member -Force NoteProperty $entry.Key $entry.Value}
+# The host owns shutdown and report delivery; the guest never powers off itself.
+$settings|Add-Member -Force NoteProperty shutdownAfterSuccess $false
+$settings|Add-Member -Force NoteProperty preflightUserScriptUpdates $false
+if($Enable){
+    if((Get-TimeZone).Id -ne 'Eastern Standard Time'){if($admin){Set-TimeZone -Id 'Eastern Standard Time'}else{throw 'Guest time zone must be Eastern Standard Time.'}}
+    $autologon=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    if($autologon.AutoAdminLogon -ne '1' -or $autologon.DefaultUserName -ne $env:USERNAME){throw 'The configured interactive account does not have the existing unattended console sign-in.'}
+    $settings.enabled=$true
 }
-if ($VerifyOnly) {
-    & $python $wrapper --settings $guestSettings --verify-only --keep-running
-    if ($LASTEXITCODE -ne 0) { throw 'Guest verification failed. The guest will stay running for inspection.' }
+$kvp='HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest'
+if($admin){
+    $registryKey=[Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Microsoft\Virtual Machine\Guest')
+    try{
+        $acl=$registryKey.GetAccessControl()
+        $rule=[Security.AccessControl.RegistryAccessRule]::new($identity.User,([Security.AccessControl.RegistryRights]::SetValue -bor [Security.AccessControl.RegistryRights]::QueryValues),'Allow')
+        $acl.SetAccessRule($rule)
+        $registryKey.SetAccessControl($acl)
+    }finally{$registryKey.Dispose()}
 }
-Write-Output "Guest workflow installed. Enabled: $Enable. Install Giveaways.js and sign into Goodreads in every Edge profile."
+$kvpKey=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Virtual Machine\Guest',[Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,[Security.AccessControl.RegistryRights]::SetValue)
+try{$kvpKey.SetValue('Goodreads.InstallVersion','2026.11.01.1',[Microsoft.Win32.RegistryValueKind]::String)}finally{$kvpKey.Dispose()}
+$wrapper=Join-Path $root 'Goodreads\VM\GuestWorkflow.py'
+$taskName='Goodreads VM workflow'
+$existing=Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if($existing){
+    if(@($existing.Actions).Count -ne 1 -or $existing.Actions.Arguments -notlike ('*'+$wrapper+'*')){throw 'An unrelated task uses the guest workflow name.'}
+    Export-ScheduledTask -TaskName $taskName|Set-Content -LiteralPath (Join-Path $archive 'guest-task.xml')
+}
+[IO.File]::WriteAllText($settingsPath,($settings|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+if($admin){
+    $acl=Get-Acl -LiteralPath $settingsPath
+    $acl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User,'Modify','Allow'))
+    Set-Acl -LiteralPath $settingsPath -AclObject $acl
+}
+$action=New-ScheduledTaskAction -Execute $pythonw -Argument ('"'+$wrapper+'" --settings "'+$settingsPath+'" --listen') -WorkingDirectory $root
+$logon=New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
+$poll=New-ScheduledTaskTrigger -Once -At ([DateTime]::Today) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$poll.StartBoundary=[DateTime]::Today.ToString("yyyy-MM-dd'T'HH:mm:ss")
+$principal=New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
+$taskSettings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon,$poll) -Principal $principal -Settings $taskSettings -Description 'Poll for a Hyper-V host request in the signed-in interactive console. Run one completion-ordered queue; the host receives reports before deciding shutdown.' -Force|Out-Null
+if($settings.enabled){Enable-ScheduledTask -TaskName $taskName|Out-Null}else{Disable-ScheduledTask -TaskName $taskName|Out-Null}
+$taskInfo=Get-ScheduledTaskInfo -TaskName $taskName
+@{state='installed';version='2026.11.01.1';at=[DateTimeOffset]::Now.ToString('o');timeZone=(Get-TimeZone).Id;identity=$identity.Name;taskState=[string](Get-ScheduledTask -TaskName $taskName).State;taskXml=(Export-ScheduledTask -TaskName $taskName);lastRunTime=$taskInfo.LastRunTime.ToString('o');lastTaskResult=$taskInfo.LastTaskResult;profiles=$daily.profiles}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $output 'installation.json') -Encoding UTF8
+if($VerifyOnly){& $python $wrapper --settings $settingsPath --verify-only --keep-running;if($LASTEXITCODE -ne 0){throw 'Guest setup verification failed.'}}
+Write-Output "Installed guest adapter 2026.11.01.1; task enabled: $($settings.enabled). Existing browser and macro settings preserved."

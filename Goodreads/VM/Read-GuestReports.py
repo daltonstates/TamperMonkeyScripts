@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 
 NAMES = ("vm-last-run.json", "daily-last-run.json", "daily-verification.json",
-         "daily-incomplete.json", "daily.log", "vm-runner.log")
+         "daily-incomplete.json", "vm-last-skip.json", "daily.log", "vm-runner.log")
 MAXIMUM_BYTES = 10 * 1024 * 1024
 
 

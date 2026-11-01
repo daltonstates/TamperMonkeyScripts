@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ import time
 from KeyfireGiveaways import Settings, read_workflow
 
 PORT = 17385
+VERSION = "2026.11.01.1"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
@@ -45,6 +47,12 @@ def read_settings(path):
     if not Path(value["edgePath"]).is_file():
         raise ValueError("Microsoft Edge was not found at the configured path")
     seen = set()
+    sequential = value.get("profileStartPolicy", "paced") == "completion"
+    if value.get("profileStartPolicy", "paced") not in {"paced", "completion"}:
+        raise ValueError("profileStartPolicy must be paced or completion")
+    inactivity = value.get("inactivityMinutes", 15)
+    if type(inactivity) not in {int, float} or not 1 <= inactivity <= 1440:
+        raise ValueError("inactivityMinutes must be between 1 and 1440")
     previous_offset = -1
     for profile in profiles:
         directory, name = profile.get("directory"), profile.get("name")
@@ -52,12 +60,13 @@ def read_settings(path):
         if (not isinstance(directory, str) or not re.fullmatch(r"Default|Profile \d+", directory)
                 or directory.casefold() in seen or not (root / directory).is_dir()
                 or not isinstance(name, str) or not 1 <= len(name) <= 100
-                or type(offset) is not int or not previous_offset < offset <= 180):
+                or type(offset) is not int or not 0 <= offset <= 180
+                or (not sequential and offset <= previous_offset)):
             raise ValueError("Invalid, missing, duplicated, or out-of-order Edge profile")
         seen.add(directory.casefold())
         previous_offset = offset
     offsets = [profile["offsetMinutes"] for profile in profiles]
-    if len(offsets) > 1 and jitter >= min(b - a for a, b in zip(offsets, offsets[1:])):
+    if not sequential and len(offsets) > 1 and jitter >= min(b - a for a, b in zip(offsets, offsets[1:])):
         raise ValueError("Random start delay must be smaller than the spacing between profiles")
     read_workflow(Path(value["keyfireConfig"]), Settings(value["macroName"], value.get("macroProfile", "")))
     return value
@@ -70,6 +79,11 @@ def planned_starts(settings, now, immediate=False, *, randbelow=None):
     base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     jitter_seconds = settings.get("startJitterMinutes", 0) * 60
     choose = randbelow if randbelow is not None else secrets.randbelow
+    if settings.get("profileStartPolicy") == "completion":
+        # Apply the user's start jitter once. Later profiles follow cleanup,
+        # never a second minimum clock time.
+        first = base + timedelta(seconds=choose(jitter_seconds + 1) if jitter_seconds else 0)
+        return [first] * len(settings["profiles"])
     return [base + timedelta(minutes=p["offsetMinutes"],
                              seconds=choose(jitter_seconds + 1) if jitter_seconds else 0)
             for p in settings["profiles"]]
@@ -205,7 +219,7 @@ class ListingWindow:
 
 class Session:
     def __init__(self, profile, verify=False, clock=time.monotonic, *, listing=None, window_tag=None,
-                 recover_failures=False):
+                 recover_failures=False, inactivity_minutes=15, entry_limit=None, keyfire_config=None):
         self.profile = profile
         self.verify = verify
         self.clock = clock
@@ -228,6 +242,50 @@ class Session:
         self.cleanup_ready_at = None
         self.capabilities = {}
         self.userscript_version = None
+        self.inactivity_seconds = inactivity_minutes * 60
+        self.counters = {"processed": 0, "loaded": 0}
+        self.last_useful_at = datetime.now().astimezone().isoformat()
+        self.wait_allowance = 0
+        self.wait_accounted = False
+        self.entry_limit = entry_limit
+        self.keyfire_config = keyfire_config
+        self.macro_wait_seconds = 0
+
+    def observe_progress(self, value, now):
+        """Only new processed entries or newly loaded rows renew the deadline."""
+        metrics = value.get("metrics")
+        if metrics is None:
+            # Compatibility with desktop users who have not updated yet. Text
+            # changes, open/retry counts and phase changes are never progress.
+            match = re.fullmatch(r"(\d+)/(\d+);(\d+) open;(loading|claiming)", value.get("progress") or "")
+            metrics = ({"processed": max(0, int(match[1]) - int(match[3])), "loaded": int(match[2])}
+                       if match else {})
+        if not isinstance(metrics, dict):
+            raise ValueError("Invalid progress counters")
+        advanced = False
+        for name in ("processed", "loaded"):
+            number = metrics.get(name, 0)
+            if type(number) is not int or not 0 <= number <= 10000000:
+                raise ValueError("Invalid progress counter")
+            if number > self.counters[name]:
+                self.counters[name] = number
+                advanced = True
+        if advanced:
+            self.last_progress = now
+            self.last_useful_at = datetime.now().astimezone().isoformat()
+            self.wait_allowance = self.macro_wait_seconds
+            self.wait_accounted = False
+        for name in ("opened", "open", "accepted", "unconfirmed", "processedToday"):
+            number = metrics.get(name)
+            if type(number) is int and 0 <= number <= 10000000:
+                self.counters[name] = number
+        remaining = metrics.get("waitSeconds", 0)
+        if type(remaining) in {int, float} and 0 < remaining <= 60 and not self.wait_accounted:
+            # A pacing wait can be credited only once per useful milestone.
+            # Repeated polling/retry cannot move this absolute deadline.
+            self.wait_allowance = self.macro_wait_seconds + remaining
+            self.wait_accounted = True
+        self.progress = value.get("progress", self.progress)
 
     def cleanup_response(self):
         """Return the same cancellation without restarting any cleanup deadline."""
@@ -312,17 +370,26 @@ class Session:
                                        "See windowBinding in the daily report."
                                        + (" Update Giveaways.js to 4.30 or later for startup retries."
                                           if value.get("windowWaitSupported") is not True else ""))
+                if not failure and self.entry_limit and value.get("controlledEntryLimitSupported") is not True:
+                    failure = "Update Giveaways.js before a controlled entry-limited check; no entries were started."
                 if failure:
                     self.state, self.reason = "failed", failure
                     return {"protocol": 1, "cancel": True, "error": self.reason}
+                selection = value.get("workflow")
+                if self.keyfire_config and isinstance(selection, dict):
+                    macro = read_workflow(Path(self.keyfire_config), Settings(
+                        selection.get("macroName", ""), selection.get("profile", ""), selection.get("browser", "edge")))
+                    # Credit the selected macro's intentional waits once per
+                    # useful milestone, never once per loop/retry/keystroke.
+                    self.macro_wait_seconds = sum(step.value for step in macro.steps if step.kind == "wait") / 1000
+                    self.wait_allowance = max(self.wait_allowance, self.macro_wait_seconds)
             if self.listing and state == "running" and self.state == "waiting":
                 raise ValueError("The scheduled Edge window has not been identified")
             if self.listing and state in {"finished", "verified"}:
                 if self.state not in {"ready", "running", "closing"}:
                     raise ValueError("The listing has not connected")
                 self.last_seen = self.clock()
-                if progress is not None and progress != self.progress:
-                    self.last_progress, self.progress = self.last_seen, progress
+                self.observe_progress(value, self.last_seen)
                 self.completed_state = state
                 if self.closing_started is None:
                     self.closing_started = self.clock()
@@ -332,12 +399,12 @@ class Session:
                 return {"protocol": 1, "cancel": False}
             now = self.clock()
             self.last_seen = now
-            if progress is not None and progress != self.progress:
-                self.last_progress, self.progress = now, progress
+            self.observe_progress(value, now)
             self.state, self.reason = state, reason
             if state == "failed" and self.recover_failures and self.cleanup_supported:
                 return self.cleanup_response()
-            return {"protocol": 1, "mode": "verify" if self.verify else "run", "cancel": False}
+            return {"protocol": 1, "mode": "verify" if self.verify else "run", "cancel": False,
+                    "entryLimit": self.entry_limit}
 
     def check_deadlines(self):
         with self.lock:
@@ -361,13 +428,10 @@ class Session:
                 return
             if self.state == "waiting" and now - self.started > 120:
                 self.state, self.reason = "failed", "Userscript did not connect; check its installation and Goodreads sign-in."
-            elif now - self.last_seen > 120:
+            elif now - self.last_seen > self.inactivity_seconds:
                 self.state, self.reason = "failed", "Lost contact with the giveaway listing."
-            elif now - self.last_progress > 180:
-                self.state, self.reason = "failed", ("No giveaway progress for three minutes."
-                    if self.recover_failures else "No giveaway progress for three minutes; the remaining profiles were stopped.")
-            elif now - self.started > 45 * 60:
-                self.state, self.reason = "failed", "Account reached the 45-minute time limit."
+            elif now - self.last_progress > self.inactivity_seconds + self.wait_allowance:
+                self.state, self.reason = "failed", f"No useful giveaway progress for {self.inactivity_seconds / 60:g} minutes. Last useful progress: {self.counters}."
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -495,22 +559,32 @@ def recover_failed_listing(session):
     return diagnostics
 
 
-def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False):
+def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False, entry_limit=None, requested=False, run_id=None):
     run_started = datetime.now()
     base_starts = planned_starts(settings, run_started, immediate, randbelow=lambda _: 0)
     starts = planned_starts(settings, run_started, immediate)
+    if requested and not immediate:
+        delay = secrets.randbelow(settings.get("startJitterMinutes", 0) * 60 + 1)
+        starts = [run_started + timedelta(seconds=delay)] * len(settings["profiles"])
+        base_starts = [run_started] * len(settings["profiles"])
     plan = [{"name": profile["name"], "plannedAt": start.isoformat(),
              "delaySeconds": int((start - base).total_seconds())}
             for profile, start, base in zip(settings["profiles"], starts, base_starts)]
     report = {"startedAt": run_started.astimezone().isoformat(), "verificationOnly": verify,
-              "plannedStarts": plan, "profiles": [],
+              "plannedStarts": plan, "profiles": [], "entryLimit": entry_limit, "runId": run_id, "runnerVersion": VERSION,
               "note": "Finished means the tab queue closed; it does not prove Goodreads accepted every entry."}
     output.mkdir(parents=True, exist_ok=True)
     pending_path = output / "daily-incomplete.json"
-    if settings.get("closeCompletedListings") and pending_path.exists():
-        logging.error("Unfinished scheduled work exists. Inspect the tabs, then use --clear-pending to resume.")
-        return 1
     report_path = output / ("daily-verification.json" if verify else "daily-last-run.json")
+    if settings.get("closeCompletedListings") and pending_path.exists():
+        history = output / "history"
+        history.mkdir(exist_ok=True)
+        if report_path.exists():
+            shutil.copyfile(report_path, history / ("blocked-previous-" + run_started.strftime("%Y%m%d-%H%M%S-%f") + ".json"))
+        report.update(state="blocked", reason="Unfinished scheduled work exists; inspect its owned windows before recovery.",
+                      endedAt=datetime.now().astimezone().isoformat())
+        save_report(report_path, report)
+        return 1
     save_report(report_path, report)
     for item in plan:
         logging.info("Planned %s at %s (random delay %s seconds)",
@@ -521,7 +595,11 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
     try:
         for profile, start in zip(settings["profiles"], starts):
             while datetime.now() < start:
+                report["updatedAt"] = datetime.now().astimezone().isoformat()
+                report["waitingUntil"] = start.astimezone().isoformat()
+                save_report(report_path, report)
                 time.sleep(max(0, min(5, (start - datetime.now()).total_seconds())))
+            report.pop("waitingUntil", None)
             item = {"name": profile["name"], "directory": profile["directory"],
                     "plannedAt": start.isoformat(), "state": "waiting"}
             report["profiles"].append(item)
@@ -529,36 +607,39 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
                 item.update(state="failed", reason="Windows is locked or has no interactive desktop.")
                 save_report(report_path, report)
                 break
-            if not immediate and datetime.now() > base_starts[0] + timedelta(hours=3):
-                item.update(state="failed", reason="Outside the three-hour morning run window.")
-                save_report(report_path, report)
-                break
             tag = secrets.token_hex(16) if settings.get("closeCompletedListings") else None
             listing = ListingWindow(tag, settings["edgePath"]) if tag else None
             session = Session(profile, verify, listing=listing, window_tag=tag,
-                              recover_failures=recover_failures)
+                              recover_failures=recover_failures,
+                              inactivity_minutes=settings.get("inactivityMinutes", 15), entry_limit=entry_limit,
+                              keyfire_config=settings.get("keyfireConfig"))
             server.session = session
             if listing:
                 save_report(pending_path, {"startedAt": report["startedAt"], "profile": profile["name"],
+                                           "runId": run_id, "windowTag": tag,
                                            "reason": "The scheduled window has not been confirmed closed."})
             logging.info("Starting %s (%s)", profile["name"], profile["directory"])
+            item["startedAt"] = datetime.now().astimezone().isoformat()
+            save_report(report_path, report)
             subprocess.Popen([settings["edgePath"], f'--user-data-dir={settings["userDataDirectory"]}',
                               f'--profile-directory={profile["directory"]}', "--new-window",
                               LIST_URL + "#grDailyToken=" + session.token
                               + ("&grDailyWindow=" + tag if tag else "")])
-            item["startedAt"] = datetime.now().astimezone().isoformat()
-            save_report(report_path, report)
             while session.state not in TERMINAL:
                 session.check_deadlines()
-                if session.state not in TERMINAL and not immediate and datetime.now() > base_starts[0] + timedelta(hours=3):
-                    with session.lock:
-                        session.state, session.reason = "failed", "The morning run window ended; automatic runs are paused."
                 if session.state not in TERMINAL and not desktop_available():
                     with session.lock:
                         session.state, session.reason = "failed", "Windows was locked during the run."
+                with session.lock:
+                    item.update(state=session.state, progress=session.progress, counters=dict(session.counters),
+                                lastUsefulAt=session.last_useful_at,
+                                inactivitySeconds=round(max(0, session.clock() - session.last_progress), 1))
+                report["updatedAt"] = datetime.now().astimezone().isoformat()
+                save_report(report_path, report)
                 time.sleep(1)
             item.update(state=session.state, reason=session.reason, progress=session.progress,
-                        endedAt=datetime.now().astimezone().isoformat())
+                        endedAt=datetime.now().astimezone().isoformat(), counters=dict(session.counters),
+                        lastUsefulAt=session.last_useful_at)
             if session.window_binding is not None:
                 item["windowBinding"] = {k: v for k, v in session.window_binding.items() if k != "started"}
             item["capabilities"] = session.capabilities
@@ -607,15 +688,16 @@ def main():
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--verify-only", action="store_true", help="Check each profile without opening entry tabs or sending keys")
     parser.add_argument("--now", action="store_true", help="Ignore the planned start times and random delays")
+    parser.add_argument("--requested", action="store_true", help="Start the completion-ordered queue on request, retaining its start jitter")
     parser.add_argument("--clear-pending", action="store_true", help="After inspecting and closing unfinished giveaway tabs, allow future scheduled runs")
-    parser.add_argument("--vm-recover-failures", action="store_true",
-                        help="In the dedicated VM, close authenticated failed runs before continuing later profiles")
+    parser.add_argument("--entry-limit", type=int, help="Controlled live check: process at most this many entries per profile")
+    parser.add_argument("--run-id", help="Request identity for correlated reports")
+    parser.add_argument("--recover-failures", "--vm-recover-failures", dest="recover_failures", action="store_true",
+                        help="Close only authenticated failed-run windows before continuing later profiles")
     args = parser.parse_args()
+    if args.entry_limit is not None and not 1 <= args.entry_limit <= 10:
+        parser.error("Controlled checks allow 1 to 10 entries per profile")
     settings = read_settings(args.config)
-    if args.vm_recover_failures:
-        from VM.GuestWorkflow import is_hyperv_guest
-        if not is_hyperv_guest():
-            raise RuntimeError("Automatic failure cleanup is limited to the dedicated Hyper-V guest")
     if args.check:
         jitter = settings.get("startJitterMinutes", 0)
         for profile, start in zip(settings["profiles"], planned_starts(settings, datetime.now(), randbelow=lambda _: 0)):
@@ -652,7 +734,7 @@ def main():
         subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
                           "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
         return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
-                         recover_failures=args.vm_recover_failures)
+                         recover_failures=args.recover_failures, entry_limit=args.entry_limit, requested=args.requested, run_id=args.run_id)
     except Exception:
         logging.exception("Daily giveaway runner failed")
         raise

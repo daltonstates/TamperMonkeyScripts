@@ -101,22 +101,25 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.session.state, "waiting")
 
     def test_same_heartbeat_does_not_hide_a_stall(self):
-        for now in range(0, 200, 5):
+        for now in range(0, 1000, 5):
             self.now = now
-            self.event("running", progress="1/4;1 open")
+            self.event("running", progress=f"retry {now}")
             self.session.check_deadlines()
-            if self.session.state == "failed":
-                break
+            if self.session.state == "failed": break
         self.assertEqual(self.session.state, "failed")
-        self.assertIn("No giveaway progress", self.session.reason)
+        self.assertIn("No useful giveaway progress", self.session.reason)
 
-    def test_new_progress_keeps_run_alive_but_account_limit_still_applies(self):
-        for now in range(0, 2801, 50):
-            self.now = now
-            self.event("running", progress=str(now))
-            self.session.check_deadlines()
-        self.assertEqual(self.session.state, "failed")
-        self.assertIn("45-minute", self.session.reason)
+    def test_660_entries_with_useful_progress_cross_every_former_limit(self):
+        for profile in range(3):
+            self.setUp()
+            for entry in range(221):
+                self.now = entry * 60
+                self.event("running", metrics={"processed":entry,"loaded":220}, progress=f"{entry}/220;0 open;claiming")
+                self.session.check_deadlines()
+                self.assertEqual(self.session.state, "running")
+            self.assertGreater(self.now, 3 * 3600)
+            self.event("finished")
+            self.assertEqual(self.session.state, "finished")
 
     def test_missing_userscript_and_lost_contact_are_failures(self):
         self.now = 121
@@ -124,7 +127,7 @@ class SessionTests(unittest.TestCase):
         self.assertIn("Userscript did not connect", self.session.reason)
         self.setUp()
         self.event("ready")
-        self.now = 121
+        self.now = 901
         self.session.check_deadlines()
         self.assertIn("Lost contact", self.session.reason)
 
@@ -213,6 +216,20 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(session.state, "failed")
         self.assertEqual(session.window_binding["diagnostics"]["inspectionError"], "Enumeration failed")
         listing.request_close.assert_not_called()
+
+    def test_controlled_check_declines_old_script_after_binding_for_safe_cleanup(self):
+        listing = MagicMock()
+        listing.bind.return_value = True
+        listing.diagnostics = {"matchingEdgeWindows": 1}
+        session = daily.Session({"name": "A"}, listing=listing, window_tag="a" * 32,
+                                recover_failures=True, entry_limit=1)
+        reply = session.event({"token": session.token, "state": "ready", "windowTag": session.window_tag,
+                               "closeListingSupported": True, "windowWaitSupported": True,
+                               "failureCleanupSupported": True, "addressSubmitRetrySupported": True})
+        self.assertTrue(reply["cancel"])
+        self.assertIn("no entries were started", reply["error"])
+        listing.bind.assert_called_once()
+        self.assertTrue(session.cleanup_supported)
 
     def test_window_title_can_appear_after_the_old_two_second_limit(self):
         now = [0]
@@ -395,7 +412,8 @@ class QueueTests(unittest.TestCase):
                 settings = {"startAt": "04:00", "closeCompletedListings": True,
                             "profiles": [{"name": "A", "offsetMinutes": 0}]}
                 self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
-                self.assertEqual((output / "daily-last-run.json").read_text(), '{"state":"failed"}')
+                self.assertEqual(json.loads((output / "daily-last-run.json").read_text())["state"], "blocked")
+                self.assertEqual(next((output / "history").glob("blocked-previous-*.json")).read_text(), '{"state":"failed"}')
                 launch.assert_not_called()
                 server.assert_not_called()
 
@@ -453,31 +471,19 @@ class QueueTests(unittest.TestCase):
                 self.assertTrue((output / "daily-incomplete.json").exists())
                 self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
                 self.assertEqual(opened.call_count, 1)
-            report = json.loads((output / "daily-last-run.json").read_text())
+            report = json.loads(next((output / "history").glob("blocked-previous-*.json")).read_text())
             self.assertEqual([p["state"] for p in report["profiles"]], ["failed", "skipped", "skipped"])
             self.assertIn("did not close", report["profiles"][0]["reason"])
 
-    def test_an_old_run_resumed_the_next_day_stops_before_more_keys_or_profiles(self):
-        with tempfile.TemporaryDirectory() as folder:
-            now = [datetime(2026, 10, 25, 4)]
-            server = MagicMock()
-            class Clock(datetime):
-                @classmethod
-                def now(cls):
-                    return now[0]
-            def launch(arguments):
-                session = server.session
-                session.event({"token": session.token, "state": "running"})
-                now[0] += timedelta(days=1)
-            settings = {"startAt": "04:00", "edgePath": "edge.exe", "userDataDirectory": folder,
-                        "profiles": [{"name": str(i), "directory": f"Profile {i}", "offsetMinutes": i * 30}
-                                     for i in range(2)]}
-            with patch.object(daily, "datetime", Clock), patch.object(daily, "Server", return_value=server), \
-                 patch.object(daily, "desktop_available", return_value=True), \
-                 patch.object(daily.subprocess, "Popen", side_effect=launch) as opened, patch.object(daily.time, "sleep"):
-                self.assertEqual(daily.run_queue(settings, Path(folder)), 1)
-                self.assertEqual(opened.call_count, 1)
-                self.assertEqual(server.session.event({"token": server.session.token, "state": "running"})["cancel"], True)
+    def test_an_active_queue_can_continue_after_midnight_with_useful_progress(self):
+        self.clock = 0
+        session = daily.Session({"name":"A"}, clock=lambda: self.clock)
+        for step in range(2000):
+            self.clock = step * 60
+            session.event({"token":session.token,"state":"running","metrics":{"processed":step,"loaded":2000}})
+            session.check_deadlines()
+            self.assertEqual(session.state,"running")
+        self.assertGreater(self.clock,24 * 3600)
 
     def test_queue_waits_for_drawn_times_and_does_not_overlap_a_long_account(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -513,22 +519,17 @@ class QueueTests(unittest.TestCase):
             self.assertEqual([plan["delaySeconds"] for plan in report["plannedStarts"]], [300, 0, 137])
             self.assertEqual([p["state"] for p in report["profiles"]], ["finished"] * 3)
 
-    def test_random_delay_does_not_extend_the_morning_run_window(self):
-        class Clock(datetime):
-            @classmethod
-            def now(cls):
-                return datetime(2026, 10, 25, 7, 1)
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(daily, "datetime", Clock), \
-             patch.object(daily, "Server"), patch.object(daily, "desktop_available", return_value=True), \
-             patch.object(daily.secrets, "randbelow", return_value=300), \
-             patch.object(daily.subprocess, "Popen") as launch:
-            settings = {"startAt": "04:00", "startJitterMinutes": 5,
-                        "profiles": [{"name": "Dalton", "directory": "Default", "offsetMinutes": 0}]}
-            self.assertEqual(daily.run_queue(settings, Path(folder)), 1)
-            launch.assert_not_called()
-            report = json.loads((Path(folder) / "daily-last-run.json").read_text())
-            self.assertIn("Outside the three-hour", report["profiles"][0]["reason"])
+    def test_a_queue_requested_after_the_old_morning_window_still_starts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server=MagicMock()
+            settings={"startAt":"04:00","edgePath":"edge.exe","userDataDirectory":folder,
+                      "profiles":[{"name":"A","directory":"Default","offsetMinutes":0}]}
+            def launch(args):
+                server.session.event({"token":server.session.token,"state":"finished"})
+            with patch.object(daily,"Server",return_value=server), patch.object(daily,"desktop_available",return_value=True), \
+                 patch.object(daily.subprocess,"Popen",side_effect=launch) as opened:
+                self.assertEqual(daily.run_queue(settings,Path(folder),requested=True),0)
+                opened.assert_called_once()
 
     def test_long_account_delays_next_profile_and_failure_stops_the_queue(self):
         for fail in (False, True):
@@ -561,6 +562,55 @@ class QueueTests(unittest.TestCase):
                     self.assertEqual(launches[1][1].strftime("%H:%M"), "04:35")
                 report = json.loads((Path(folder) / "daily-last-run.json").read_text())
                 self.assertNotIn("grDailyToken", json.dumps(report))
+
+    def test_full_660_entry_queue_crosses_all_former_cutoffs_and_sequences_closed_windows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            elapsed=[0.0]
+            server=MagicMock()
+            windows=[]
+            starts=[]
+            class Clock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return datetime(2026,11,1,4) + timedelta(seconds=elapsed[0])
+            def window_factory(*args):
+                window=MagicMock()
+                window.is_closed=False
+                window.closed.side_effect=lambda: window.is_closed
+                window.diagnostics={"matchingEdgeWindows":1}
+                windows.append(window)
+                return window
+            def launch(arguments):
+                self.assertTrue(all(window.is_closed for window in windows[:-1]))
+                starts.append(elapsed[0])
+                session=server.session
+                session.clock=lambda:elapsed[0]
+                session.started=session.last_seen=session.last_progress=elapsed[0]
+                session.event({"token":session.token,"state":"ready","windowTag":session.window_tag,
+                               "closeListingSupported":True,"failureCleanupSupported":True,
+                               "addressSubmitRetrySupported":True})
+                for entry in range(1,221):
+                    elapsed[0]+=60
+                    session.event({"token":session.token,"state":"running",
+                                   "metrics":{"processed":entry,"loaded":220,"open":0}})
+                    session.check_deadlines()
+                    self.assertEqual(session.state,"running")
+                session.event({"token":session.token,"state":"finished"})
+                windows[-1].is_closed=True
+                session.check_deadlines()
+            settings={"startAt":"04:00","startJitterMinutes":0,"profileStartPolicy":"completion",
+                      "closeCompletedListings":True,"edgePath":"edge.exe","userDataDirectory":folder,
+                      "profiles":[{"name":str(i),"directory":f"Profile {i}","offsetMinutes":0} for i in range(3)]}
+            with patch.object(daily,"datetime",Clock), patch.object(daily,"Server",return_value=server), \
+                 patch.object(daily,"ListingWindow",side_effect=window_factory), \
+                 patch.object(daily,"desktop_available",return_value=True), \
+                 patch.object(daily.subprocess,"Popen",side_effect=launch):
+                self.assertEqual(daily.run_queue(settings,Path(folder)),0)
+            report=json.loads((Path(folder)/"daily-last-run.json").read_text())
+            self.assertEqual(sum(p["counters"]["processed"] for p in report["profiles"]),660)
+            self.assertEqual(starts,[0,220*60,440*60])
+            self.assertTrue(all(p["listingClosed"] for p in report["profiles"]))
+            self.assertFalse((Path(folder)/"daily-incomplete.json").exists())
 
     def test_locked_desktop_opens_no_profiles(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(daily, "Server"), \
@@ -606,9 +656,9 @@ class FailureRecoveryTests(unittest.TestCase):
                 if len(launches) == 1:
                     # The queue has stalled while its authenticated listing is
                     # still reachable. Cancellation awaits a future heartbeat.
-                    session.last_progress = now[0] - 181
+                    session.last_progress = now[0] - 901
                     session.check_deadlines()
-                    self.assertIn("No giveaway progress", session.reason)
+                    self.assertIn("No useful giveaway progress", session.reason)
                 else:
                     session.event({"token": session.token, "state": "finished", "progress": "1/1;0 open;claiming"})
 

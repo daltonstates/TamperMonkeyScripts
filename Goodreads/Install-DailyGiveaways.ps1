@@ -70,7 +70,8 @@ if ($existing -and @($existing.Actions | Where-Object { $_.Arguments -like '*Dai
 $action = New-ScheduledTaskAction -Execute $pythonwPath -Argument ('"' + $runnerPath + '" --config "' + $settingsPath + '"') -WorkingDirectory $PSScriptRoot
 $trigger = New-ScheduledTaskTrigger -Daily -At $parsedTime
 $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
-$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+$trigger.StartBoundary = $parsedTime.ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
 $scheduleText = (@(for ($i = 0; $i -lt $ProfileNames.Count; $i++) {
     $ProfileNames[$i] + ' ' + $parsedTime.AddMinutes($i * $SpacingMinutes).ToString('HH:mm')
 }) -join ', ')
