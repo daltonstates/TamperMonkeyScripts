@@ -100,6 +100,20 @@ class DesktopStatusTests(unittest.TestCase):
         self.assertNotIn("<img", html)
         self.assertIn("&lt;script&gt;", html)
 
+    def test_host_delivery_receipt_never_precedes_current_html(self):
+        host, daily = completed()
+        summary = status.summarize(host, daily)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = status.write_json
+            def observe_receipt(path, value):
+                if path.name == "latest-report.json":
+                    self.assertIn(summary["endedAt"], (root / "report.html").read_text())
+                    self.assertIn(summary["title"], (root / "history" / (summary["id"] + ".html")).read_text())
+                original(path, value)
+            with patch.object(status, "write_json", side_effect=observe_receipt):
+                status.publish(root, summary)
+
     def test_useful_active_queue_can_continue_overnight_without_a_missing_alert(self):
         host, _ = completed()
         host.update(state="running", updatedAt="2026-10-31T08:00:00-04:00")

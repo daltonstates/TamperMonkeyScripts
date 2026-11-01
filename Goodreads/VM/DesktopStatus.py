@@ -189,10 +189,11 @@ th,td{{padding:12px;text-align:left;border-bottom:1px solid #e2e3de;vertical-ali
 
 
 def publish(root, summary):
-    write_json(root / "latest-report.json", summary)
     html = render_html(summary)
     write_text(root / "report.html", html)
     write_text(root / "history" / (summary["id"] + ".html"), html)
+    # Publish the delivery receipt last: the host may act on its request ID.
+    write_json(root / "latest-report.json", summary)
 
 
 def notify(root, summary):
