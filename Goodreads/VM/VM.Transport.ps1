@@ -91,18 +91,23 @@ function Read-GiveawaysLiveReport($Settings) {
 }
 
 function Export-GiveawaysLiveReport($Settings, $Bundle) {
+    $runId=[string]$Bundle.runId
+    if($runId -notmatch '^[a-f0-9]{32}$'){throw 'Invalid report request identity.'}
+    $runDirectory=Join-Path $Settings.reportDirectory ('runs\'+$runId)
+    New-Item -ItemType Directory -Path $runDirectory -Force|Out-Null
     foreach ($name in @('vm-last-run.json','vm-last-skip.json','daily-last-run.json','daily-verification.json','daily-incomplete.json','helper-status.json','installation.json','daily.log','vm-runner.log','helper.log')) {
         if ($Bundle.files.PSObject.Properties.Name -contains $name) {
-            $path = Join-Path $Settings.reportDirectory $name
-            if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Host report paths must not be links.' }
-            if ($name.EndsWith('.json')) { Write-VMJson $path $Bundle.files.$name }
-            else { [IO.File]::WriteAllText($path, [string]$Bundle.files.$name, [Text.UTF8Encoding]::new($false)) }
+            foreach($directory in @($runDirectory,$Settings.reportDirectory)){
+                $path = Join-Path $directory $name
+                if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Host report paths must not be links.' }
+                if ($name.EndsWith('.json')) { Write-VMJson $path $Bundle.files.$name }
+                else { [IO.File]::WriteAllText($path, [string]$Bundle.files.$name, [Text.UTF8Encoding]::new($false)) }
+            }
         }
     }
     # This file is an exported snapshot, never a guest control marker. Once the
     # same guest run proves every owned window closed, archive its old snapshot
     # so a completed host report does not still appear to have unfinished work.
-    $runId=[string]$Bundle.runId
     $guest=$Bundle.files.'vm-last-run.json'
     if($runId -match '^[a-f0-9]{32}$' -and $guest.queueClosed -eq $true -and
        $Bundle.files.PSObject.Properties.Name -notcontains 'daily-incomplete.json'){

@@ -83,6 +83,12 @@ try{
     Write-VMJson (Join-Path $reports 'daily-incomplete.json') @{runId=('b'*32);profile='B'}
     Export-GiveawaysLiveReport $settings $completed
     Check (-not(Test-Path (Join-Path $reports 'daily-incomplete.json'))) 'An authenticated next-cycle recovery must retire the matching old exported marker.'
+    $firstReport=Join-Path $reports ('runs\'+('a'*32)+'\vm-last-run.json')
+    $firstBytes=[IO.File]::ReadAllBytes($firstReport)
+    $second=[pscustomobject]@{runId=('b'*32);files=[pscustomobject]@{'vm-last-run.json'=[pscustomobject]@{runId=('b'*32);queueClosed=$false}}}
+    Export-GiveawaysLiveReport $settings $second
+    Check (([Convert]::ToBase64String([IO.File]::ReadAllBytes($firstReport))) -eq [Convert]::ToBase64String($firstBytes)) 'A later request must preserve the earlier exported guest result.'
+    Check (Test-Path (Join-Path $reports ('runs\'+('b'*32)+'\vm-last-run.json'))) 'Each request needs its own exported guest report.'
 
     $worker=Get-Process -Id $PID
     $queuedPath=Join-Path $reports ('queued\'+('c'*32)+'.json')
