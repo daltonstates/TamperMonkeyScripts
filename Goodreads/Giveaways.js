@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.39
+// @version      4.40
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -1071,10 +1071,20 @@
       } catch (error) {
         if (controller.signal.aborted) return;
         console.error("Could not load all Goodreads giveaways", error);
+        if (dailyRun && continuation && preparedWorkflow && !dailyRun.stopped && !leavingPage &&
+            error?.message === "Timed out waiting for Goodreads to load more giveaways." &&
+            (continuation?.listingLoadRetries ?? 0) < 1 && trackedGiveawayTabs.size === 0 && isAutoOpenPage()) {
+          // Retry only this blocked listing operation, with no entry tabs open.
+          // Keep the same queue/token/dedup state; a retry is not useful progress.
+          saveGiveawayContinuation(previouslyOpenedIds, 1);
+          refreshingGiveaways = true;
+          window.location.reload();
+          return;
+        }
         giveawayError(
           keyfireEnabled && !preparedWorkflow
             ? error.message
-            : "Could not load all giveaways. Check the page and try again. No giveaways were opened.",
+            : `Could not load all giveaways. ${error?.message || "The listing did not become ready."} No entries from this batch were opened.`,
         );
         return;
       } finally {
@@ -1104,24 +1114,7 @@
       if (!isAutoOpenPage()) return;
       result.openedIds.forEach((id) => previouslyOpenedIds.add(id));
       try {
-        // React can clean launch metadata long after DOMContentLoaded. Restore
-        // it before saving the page key and reloading, so the next batch keeps
-        // the same authenticated queue, window identity and URL-only autoload.
-        restoreLaunchRequest();
-        sessionStorage.setItem(
-          SS_GIVEAWAY_CONTINUATION,
-          JSON.stringify({
-            page: giveawayListPageKey(),
-            auto: autoOpenAllEnabled,
-            workflow: keyfireEnabled ? JSON.stringify(keyfireSettings) : null,
-            createdAt: Date.now(),
-            openedIds: [...previouslyOpenedIds],
-            processedIds: [...(dailyRun?.processedIds ?? [])],
-            baselineProcessed: dailyRun?.baselineProcessed ?? 0,
-            loadedIds: [...(dailyRun?.loadedIds ?? [])],
-            pacing: giveawayPacing,
-          }),
-        );
+        saveGiveawayContinuation(previouslyOpenedIds);
       } catch (error) {
         console.error("Could not save the next Goodreads batch", error);
         giveawayError(
@@ -1136,6 +1129,21 @@
       preparedWorkflow?.stop();
       finishGiveawayRun(controller);
     }
+  }
+
+  function saveGiveawayContinuation(openedIds, listingLoadRetries = 0) {
+    // React can clean launch metadata long after startup. Restore it before
+    // saving the page key, both for ordinary batches and a bounded load retry.
+    restoreLaunchRequest();
+    sessionStorage.setItem(SS_GIVEAWAY_CONTINUATION, JSON.stringify({
+      page: giveawayListPageKey(), auto: autoOpenAllEnabled,
+      workflow: keyfireEnabled ? JSON.stringify(keyfireSettings) : null,
+      createdAt: Date.now(), openedIds: [...openedIds],
+      processedIds: [...(dailyRun?.processedIds ?? [])],
+      baselineProcessed: dailyRun?.baselineProcessed ?? 0,
+      loadedIds: [...(dailyRun?.loadedIds ?? [])], pacing: giveawayPacing,
+      listingLoadRetries,
+    }));
   }
 
   function trackGiveawayTab(tab, link, workflow, recovery) {

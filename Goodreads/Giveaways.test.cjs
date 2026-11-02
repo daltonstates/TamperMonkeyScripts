@@ -2812,6 +2812,51 @@ test("a five-entry controlled request crosses 2+2+1 batches without counting ear
   assert.equal(new Set(ids).size, 5);
 });
 
+async function smallBatchBeforeLoadFailure() {
+  const response = () => ({ entryLimit: 5, batchEntryLimit: 2 });
+  const first = dailyPage({ dailyCloseListing: true, dailyResponse: response, listing: { pages: [[1,2,3,4,5,6]] } });
+  await first.advanceAsync(1500);
+  for (let index = 0; index < 2; index++) { first.openedTabs[index].close(); await first.flush(); }
+  await first.advanceAsync(0);
+  assert.equal(first.navigations.length, 1);
+  const failed = dailyPage({ href: first.navigations[0], stored: first.stored, sessionStored: first.sessionStored,
+    startTime: first.now, dailyCloseListing: true, dailyResponse: response, listing: { pages: [[3],[4,5,6]], stalled: true } });
+  await failed.advanceAsync(35000);
+  assert.equal(failed.openedTabs.length, 0);
+  assert.equal(failed.navigations.length, 1);
+  assert.equal(JSON.parse(failed.sessionStored.get("gr_giveaway_continuation")).listingLoadRetries, 1);
+  return { failed, response };
+}
+
+test("a timed-out refreshed listing retries once and keeps the five-entry quota and deduplication", async () => {
+  const { failed, response } = await smallBatchBeforeLoadFailure();
+  const recovered = dailyPage({ href: failed.navigations[0], stored: failed.stored, sessionStored: failed.sessionStored,
+    startTime: failed.now, dailyCloseListing: true, dailyResponse: response, listing: { pages: [[1,2,3,4,5,6]] } });
+  await recovered.advanceAsync(1500);
+  for (let index=0;index<2;index++){assert.ok(recovered.openedTabs[index]);recovered.openedTabs[index].close();await recovered.flush();}
+  await recovered.advanceAsync(0);
+  assert.equal(recovered.openedTabs.length,2);
+  assert.equal(JSON.parse(recovered.sessionStored.get("gr_giveaway_continuation")).listingLoadRetries,0);
+  const last=dailyPage({href:recovered.navigations[0],stored:recovered.stored,sessionStored:recovered.sessionStored,
+    startTime:recovered.now,dailyCloseListing:true,dailyResponse:response,listing:{pages:[[1,2,3,4,5,6]]}});
+  await last.advanceAsync(1500);last.openedTabs[0].close();await last.flush();await last.advanceAsync(0);
+  assert.equal(last.openedTabs.length,1);
+  assert.equal(last.dailyRequests.at(-1).metrics.processed,5);
+  assert.equal(last.closeCount,1);
+});
+
+test("a second timeout of the same refreshed listing fails with its actual load error", async () => {
+  const { failed, response } = await smallBatchBeforeLoadFailure();
+  const repeated=dailyPage({href:failed.navigations[0],stored:failed.stored,sessionStored:failed.sessionStored,
+    startTime:failed.now,dailyCloseListing:true,dailyResponse:response,listing:{pages:[[3],[4,5,6]],stalled:true}});
+  await repeated.advanceAsync(35000);
+  assert.equal(repeated.navigations.length,0);
+  assert.equal(repeated.openedTabs.length,0);
+  assert.equal(repeated.dailyRequests.at(-1).state,"failed");
+  assert.match(repeated.dailyRequests.at(-1).reason,/Timed out waiting for Goodreads to load more giveaways/);
+  assert.equal(repeated.dailyRequests.at(-1).metrics.processed,2);
+});
+
 test("a saved macro connects automatically without a browser pairing key", async () => {
   const page = createPage({
     pathname: automaticListPath,
