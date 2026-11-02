@@ -72,7 +72,7 @@ class GuestTests(unittest.TestCase):
                 self.assertIn('--recover-failures',command)
                 self.assertIn('--requested',command)
                 self.assertEqual(command[command.index('--batch-entry-limit')+1],'1')
-                guest.write_report(root/'daily-last-run.json',{'runId':'d'*32,'startedAt':guest.utc_now(),'endedAt':guest.utc_now(),
+                guest.write_report(Path(command[command.index('--output-directory')+1])/'daily-last-run.json',{'runId':'d'*32,'startedAt':guest.utc_now(),'endedAt':guest.utc_now(),
                     'profiles':[{'state':'finished','listingClosed':True} for _ in range(3)]})
                 return child
             publish=MagicMock()
@@ -99,13 +99,13 @@ class GuestTests(unittest.TestCase):
                 polls[0]+=1
                 if polls[0] <= 240:
                     return None
-                current=original_read(root/'daily-last-run.json')
+                current=original_read(root/'runs'/run_id/'daily-last-run.json')
                 current.update(endedAt=guest.utc_now(),profiles=[{'state':'finished','listingClosed':True} for _ in range(3)])
-                guest.write_report(root/'daily-last-run.json',current)
+                guest.write_report(root/'runs'/run_id/'daily-last-run.json',current)
                 return 0
             child.poll.side_effect=poll; child.wait.return_value=0
             def launch(command, **kwargs):
-                guest.write_report(root/'daily-last-run.json',{'runId':run_id,'startedAt':guest.utc_now(),'profiles':[]})
+                guest.write_report(root/'runs'/run_id/'daily-last-run.json',{'runId':run_id,'startedAt':guest.utc_now(),'profiles':[]})
                 return child
             def read(path):
                 if path.name=='daily-last-run.json':
@@ -151,7 +151,7 @@ class GuestTests(unittest.TestCase):
             child=MagicMock(); child.poll.return_value=None
             original_read=guest.read_json
             def launch(command, **kwargs):
-                guest.write_report(root/'daily-last-run.json',{'runId':'a'*32,'startedAt':guest.utc_now(),'profiles':[]})
+                guest.write_report(root/'runs'/('a'*32)/'daily-last-run.json',{'runId':'a'*32,'startedAt':guest.utc_now(),'profiles':[]})
                 return child
             def read(path):
                 if path.name=='daily-last-run.json':
@@ -195,6 +195,50 @@ class GuestTests(unittest.TestCase):
         import secrets
         with self.assertRaisesRegex(ValueError,'bound'):
             guest.encode_bundle({'noise':secrets.token_hex(200000)})
+
+    def test_scheduled_cycles_on_the_same_day_are_independent_and_duplicate_ids_do_not_repeat(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(guest,'is_hyperv_guest',return_value=True):
+            root=Path(folder);settings=self.settings(root)
+            child=MagicMock();child.poll.return_value=0;child.wait.return_value=0
+            def launch(command,**kwargs):
+                target=Path(command[command.index('--output-directory')+1]);run_id=command[command.index('--run-id')+1]
+                guest.write_report(target/'daily-last-run.json',{'runId':run_id,'startedAt':guest.utc_now(),'endedAt':guest.utc_now(),
+                    'profiles':[{'state':'finished','listingClosed':True} for _ in range(3)]})
+                return child
+            with patch.object(guest.subprocess,'Popen',side_effect=launch) as opened:
+                self.assertEqual(guest.run(settings,request={'runId':'a'*32}),0)
+                original=(root/'runs'/('a'*32)/'vm-last-run.json').read_bytes()
+                self.assertTrue((root/'vm-last-success.json').exists())
+                self.assertEqual(guest.run(settings,request={'runId':'b'*32}),0)
+                self.assertEqual((root/'runs'/('a'*32)/'vm-last-run.json').read_bytes(),original)
+                self.assertEqual(guest.run(settings,request={'runId':'a'*32}),0)
+                self.assertEqual(opened.call_count,2)
+
+    def test_a_single_profile_request_does_not_rewrite_the_profile_catalog(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(guest,'is_hyperv_guest',return_value=True):
+            root=Path(folder);settings=self.settings(root)
+            catalog={'closeCompletedListings':True,'profiles':[{'name':str(i),'directory':directory} for i,directory in enumerate(('Default','Profile 1','Profile 2'))]}
+            guest.write_report(Path(settings['dailySettings']),catalog);before=Path(settings['dailySettings']).read_bytes()
+            child=MagicMock();child.poll.return_value=0;child.wait.return_value=0
+            def launch(command,**kwargs):
+                self.assertEqual(command[command.index('--profile-directory')+1],'Profile 1')
+                target=Path(command[command.index('--output-directory')+1])
+                guest.write_report(target/'daily-last-run.json',{'runId':'c'*32,'startedAt':guest.utc_now(),'endedAt':guest.utc_now(),
+                    'profiles':[{'state':'finished','listingClosed':True}]})
+                return child
+            with patch.object(guest.subprocess,'Popen',side_effect=launch):
+                self.assertEqual(guest.run(settings,request={'runId':'c'*32,'profileDirectories':['Profile 1'],'entryLimit':1}),0)
+            self.assertEqual(Path(settings['dailySettings']).read_bytes(),before)
+
+    def test_a_cached_failure_remains_a_failure_without_starting_another_child(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings=self.settings(root)
+            previous={'runId':'d'*32,'state':'failed','endedAt':guest.utc_now(),'reason':'preserved'}
+            guest.write_report(root/'requests'/('d'*32+'.json'),previous)
+            with patch.object(guest.subprocess,'Popen') as opened:
+                self.assertEqual(guest.run(settings,request={'runId':'d'*32}),1)
+                opened.assert_not_called()
+            self.assertEqual(guest.read_json(root/'requests'/('d'*32+'.json')),previous)
 
 
 if __name__=='__main__': unittest.main()

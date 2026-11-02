@@ -110,7 +110,8 @@ function Export-GiveawaysLiveReport($Settings, $Bundle) {
         if(Test-Path -LiteralPath $pending){
             if((Get-Item -LiteralPath $pending).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Host report paths must not be links.'}
             $previous=Get-Content -LiteralPath $pending -Raw|ConvertFrom-Json
-            if($previous.runId -eq $runId){
+            $recovered=@($Bundle.files.'daily-last-run.json'.recoveries|Where-Object{$_.recovered -eq $true}|ForEach-Object{$_.previousRunId})
+            if($previous.runId -eq $runId -or $previous.runId -in $recovered){
                 $history=Join-Path $Settings.reportDirectory 'history'
                 New-Item -ItemType Directory -Path $history -Force|Out-Null
                 $deadline=[DateTimeOffset]::Now.AddSeconds(5)
@@ -126,10 +127,40 @@ function Export-GiveawaysLiveReport($Settings, $Bundle) {
     }
 }
 
+function Get-GiveawaysQueuedRequests($Settings) {
+    if(-not $Settings.reportDirectory){return @()}
+    $directory=Join-Path $Settings.reportDirectory 'queued'
+    if(-not(Test-Path -LiteralPath $directory)){return @()}
+    $active=@()
+    foreach($file in Get-ChildItem -LiteralPath $directory -Filter '*.json' -File){
+        $entry=Get-Content -LiteralPath $file.FullName -Raw|ConvertFrom-Json
+        if($entry.runId -notmatch '^[a-f0-9]{32}$' -or $entry.state -ne 'queued' -or -not $entry.worker.pid -or -not $entry.worker.startedAt){throw 'Unrecognized queued request was preserved.'}
+        $worker=Get-Process -Id $entry.worker.pid -ErrorAction SilentlyContinue
+        $expectedStart=if($entry.worker.startedAt -is [DateTime]){[DateTimeOffset]$entry.worker.startedAt}else{[DateTimeOffset]::Parse([string]$entry.worker.startedAt,[Globalization.CultureInfo]::InvariantCulture)}
+        if($worker -and ([DateTimeOffset]$worker.StartTime.ToUniversalTime()).UtcTicks -eq $expectedStart.UtcTicks -and $worker.Path -eq $entry.worker.exe){
+            $active+=,$entry
+        }else{
+            # A dead waiting process never owned the VM or browser. Preserve its
+            # request as interrupted; the next cycle still resumes account work.
+            $entry.state='interrupted'
+            $entry|Add-Member -Force NoteProperty endedAt ([DateTimeOffset]::Now.ToString('o'))
+            $entry|Add-Member -Force NoteProperty reason 'The waiting host process ended before admission. Account work is retained for the next scheduled cycle.'
+            $target=Join-Path $Settings.reportDirectory ('runs\'+$entry.runId+'\host-last-run.json')
+            Write-VMJson $target $entry
+            $history=Join-Path $Settings.reportDirectory 'history'
+            New-Item -ItemType Directory -Path $history -Force|Out-Null
+            Write-VMJson (Join-Path $history ('queued-'+$entry.runId+'.json')) $entry
+            Remove-Item -LiteralPath $file.FullName
+        }
+    }
+    return $active
+}
+
 function Get-GiveawaysHostShutdownEligibility($Settings) {
     if ($Settings.jobInventoryVerified -ne $true -or $null -eq $Settings.otherJobTasks) { return @{eligible=$false;reason='Other host jobs using this VM have not been inventoried.'} }
     try {
         $blocked = @()
+        foreach($request in @(Get-GiveawaysQueuedRequests $Settings)){$blocked+='queued request '+$request.runId}
         foreach ($name in $Settings.otherJobTasks) {
             $task = Get-ScheduledTask -TaskName $name -ErrorAction Stop
             if ([string]$task.State -notin @('Ready','Disabled','Running','Queued')) { throw 'Unknown designated task state.' }

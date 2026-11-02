@@ -78,6 +78,25 @@ try{
     Export-GiveawaysLiveReport $settings $completed
     Check (Test-Path (Join-Path $reports 'daily-incomplete.json')) 'An active queue must preserve its exported unfinished-work evidence.'
 
+    $completed.files.'vm-last-run.json'.queueClosed=$true
+    $completed.files|Add-Member NoteProperty 'daily-last-run.json' ([pscustomobject]@{recoveries=@(@{previousRunId=('b'*32);recovered=$true})})
+    Write-VMJson (Join-Path $reports 'daily-incomplete.json') @{runId=('b'*32);profile='B'}
+    Export-GiveawaysLiveReport $settings $completed
+    Check (-not(Test-Path (Join-Path $reports 'daily-incomplete.json'))) 'An authenticated next-cycle recovery must retire the matching old exported marker.'
+
+    $worker=Get-Process -Id $PID
+    $queuedPath=Join-Path $reports ('queued\'+('c'*32)+'.json')
+    Write-VMJson $queuedPath @{runId=('c'*32);state='queued';worker=@{pid=$PID;startedAt=$worker.StartTime.ToUniversalTime().ToString('o');exe=$worker.Path}}
+    $settings.otherJobTasks=@();Write-VMJson $settings.activeJobsFile @{jobs=@()}
+    Check (-not (Get-GiveawaysHostShutdownEligibility $settings).eligible) 'An independently queued request must keep the VM running.'
+    Check (Test-Path $queuedPath) 'A living queued worker must never be retired because of elapsed time.'
+    $old=[DateTimeOffset]::Now.AddDays(-90).ToString('o')
+    Write-VMJson $queuedPath @{runId=('c'*32);state='queued';worker=@{pid=$PID;startedAt=$old;exe=$worker.Path}}
+    Check (Get-GiveawaysHostShutdownEligibility $settings).eligible 'A reused PID must not preserve a dead request forever.'
+    Check (-not(Test-Path $queuedPath)) 'A dead waiting owner should be retired automatically.'
+    $retired=Get-Content (Join-Path $reports ('runs\'+('c'*32)+'\host-last-run.json')) -Raw|ConvertFrom-Json
+    Check ($retired.state -eq 'interrupted' -and $retired.endedAt) 'A retired request must retain its independent result.'
+
     $previousProgramData=$env:ProgramData
     try{
         $env:ProgramData=$scratch

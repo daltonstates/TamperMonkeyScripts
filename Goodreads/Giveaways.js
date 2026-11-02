@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.42
+// @version      4.43
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -59,6 +59,7 @@
   const SS_GIVEAWAY_PROGRESS = "gr_giveaway_progress";
   const SS_GIVEAWAY_CONTINUATION = "gr_giveaway_continuation";
   const LS_DAILY_PROCESSED = "gr_daily_processed";
+  const LS_GIVEAWAY_WORK = "gr_giveaway_work";
   const PROGRESS_HASH_INDEX = "grGiveawayIndex";
   const PROGRESS_HASH_TOTAL = "grGiveawayTotal";
   const PROGRESS_HASH_ID = "grGiveawayId";
@@ -220,6 +221,7 @@
   let openAllButton = null;
   let workflowStatus = null;
   let dailyRun = null;
+  let initialGiveawayAttempts = null;
   let giveawayPacing = null;
   let giveawayPacingUntil = null;
 
@@ -364,7 +366,7 @@
     }
     return {
       processed: dailyRun.processedIds.size - dailyRun.baselineProcessed,
-      processedToday: dailyRun.processedIds.size,
+      processedToday: savedGiveawayWork().today.ids.length,
       loaded: dailyRun.loadedIds.size,
       opened: dailyRun.baseOpened + giveawayBatchOpened,
       open: trackedGiveawayTabs.size,
@@ -374,11 +376,74 @@
   }
 
   function savedDailyProcessed() {
+    return savedGiveawayWork().processed;
+  }
+
+  function savedGiveawayWork() {
+    const day = new Date().toLocaleDateString("en-CA");
+    const validId = (id) => typeof id === "string" && /^\d+$/.test(id);
+    let legacy = null;
+    try { legacy = JSON.parse(localStorage.getItem(LS_DAILY_PROCESSED)); } catch {}
+    const legacyIds = Array.isArray(legacy?.ids) ? legacy.ids.filter(validId) : [];
     try {
-      const saved = JSON.parse(localStorage.getItem(LS_DAILY_PROCESSED));
-      return saved?.day === new Date().toLocaleDateString("en-CA") && Array.isArray(saved.ids)
-        ? saved.ids.filter((id) => typeof id === "string" && /^\d+$/.test(id)) : [];
-    } catch { return []; }
+      const raw = localStorage.getItem(LS_GIVEAWAY_WORK);
+      const saved = raw === null ? null : JSON.parse(raw);
+      if (saved && (saved.schema !== 1 || !Array.isArray(saved.processed) || !Array.isArray(saved.pending)))
+        throw new Error("Unsupported saved giveaway work");
+      if (saved && (!saved.processed.every(validId) || !saved.pending.every(item => validId(item?.id) &&
+          /^(enter_choose_address|enter_print_giveaway)$/.test(item.page))))
+        throw new Error("Incomplete saved giveaway work");
+      const processed = [...new Set([...(saved?.processed ?? []).filter(validId), ...legacyIds])];
+      const done = new Set(processed);
+      const pending = (saved?.pending ?? []).filter((item) => validId(item?.id) &&
+        /^(enter_choose_address|enter_print_giveaway)$/.test(item.page) && !done.has(item.id))
+        .map((item) => ({id:item.id, page:item.page, attempts:Number.isSafeInteger(item.attempts) && item.attempts >= 0 ? item.attempts : 0}));
+      const todayIds = saved?.today?.day === day && Array.isArray(saved.today.ids) ? saved.today.ids.filter(validId) : [];
+      if (legacy?.day === day) todayIds.push(...legacyIds);
+      return {schema:1, processed, pending, today:{day, ids:[...new Set(todayIds)]}};
+    } catch {
+      // Preserve unreadable data. Starting a fresh queue would silently repeat
+      // previously processed entries and lose unfinished work.
+      return {schema:1, processed:legacyIds, pending:[], today:{day,ids:[]}, unreadable:true};
+    }
+  }
+
+  function saveGiveawayWork(work) {
+    if (work.unreadable) throw new Error("Saved giveaway work is unreadable; it has been preserved.");
+    localStorage.setItem(LS_GIVEAWAY_WORK, JSON.stringify(work));
+  }
+
+  function rememberGiveawayQueue(links) {
+    const work = savedGiveawayWork();
+    const known = new Set([...work.processed, ...work.pending.map((item) => item.id)]);
+    for (const link of links) {
+      const url = new URL(link);
+      const match = url.pathname.match(/^\/giveaway\/(enter_choose_address|enter_print_giveaway)\/(\d+)$/);
+      if (url.origin !== "https://www.goodreads.com" || !match || known.has(match[2])) continue;
+      known.add(match[2]);
+      work.pending.push({id:match[2],page:match[1],attempts:0});
+    }
+    saveGiveawayWork(work); // Persist discovery before any browser tab opens.
+    initialGiveawayAttempts ??= new Map(work.pending.map((item) => [item.id,item.attempts]));
+    return [...work.pending].sort((a,b) => (initialGiveawayAttempts.get(a.id) ?? 0)-(initialGiveawayAttempts.get(b.id) ?? 0))
+      .map((item) => `https://www.goodreads.com/giveaway/${item.page}/${item.id}`)
+      .filter((link) => !openedGiveawayLinks.has(link));
+  }
+
+  function rememberGiveawayAttempt(link) {
+    const work = savedGiveawayWork();
+    const item = work.pending.find((entry) => entry.id === getGiveawayId(link));
+    if (item) { item.attempts++; saveGiveawayWork(work); }
+  }
+
+  function rememberProcessedGiveaway(link) {
+    const id = getGiveawayId(link);
+    if (!id) return;
+    const work = savedGiveawayWork();
+    if (!work.processed.includes(id)) work.processed.push(id);
+    if (!work.today.ids.includes(id)) work.today.ids.push(id);
+    work.pending = work.pending.filter((item) => item.id !== id);
+    saveGiveawayWork(work);
   }
 
   function stopDailyTitleRetention(run = dailyRun) {
@@ -392,7 +457,7 @@
       !run?.windowTag ||
       run !== dailyRun ||
       leavingPage ||
-      (run.stopped && !run.closing)
+      (run.stopped && !run.closing && !run.cleanupTimer)
     ) return false;
     const prefix = `[GR Daily ${run.windowTag}] `;
     if (!document.title.startsWith(prefix))
@@ -429,7 +494,8 @@
         retainDailyTitle(run);
         window.close();
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => { run.cleanupPromise = null; run.closing = false; });
     return run.cleanupPromise;
   }
 
@@ -524,7 +590,19 @@
     dailyRun.waitingForWindow = false;
     dailyRun.message = `Daily run stopped: ${message}`;
     clearInterval(dailyRun.timer);
-    if (!dailyRun.closing) stopDailyTitleRetention();
+    if (dailyRun.windowTag) {
+      // A crashed coordinator may return on the next schedule. Keep only a
+      // cleanup channel alive; this never restarts claiming or keyboard input.
+      keepDailyTitle();
+      if (!dailyRun.cleanupTimer) {
+        const run = dailyRun;
+        run.cleanupTimer = setInterval(() => {
+          if (!leavingPage && dailyRun === run && !run.closing)
+            void dailyRequest(run.token, "failed", message).catch(() => {});
+        }, 30000);
+        window.addEventListener("pagehide", () => clearInterval(run.cleanupTimer), {once:true});
+      }
+    } else if (!dailyRun.closing) stopDailyTitleRetention();
     giveawayRunController?.abort();
     sessionStorage.removeItem(SS_GIVEAWAY_CONTINUATION);
     void dailyRequest(dailyRun.token, "failed", message).catch(() => {});
@@ -718,6 +796,7 @@
   function getVisibleGiveawayLinks({
     rowLimit = Infinity,
     skippedIds = new Set(),
+    linkLimit = Infinity,
   } = {}) {
     const rows = new Set(
       [...document.querySelectorAll("article.BookListItem")].slice(0, rowLimit),
@@ -738,7 +817,8 @@
       .filter(isGiveawayEntryLink)
       .filter((href, i, arr) => arr.indexOf(href) === i)
       .filter((href) => !skippedIds.has(getGiveawayId(href)))
-      .filter((href) => !openedGiveawayLinks.has(href));
+      .filter((href) => !openedGiveawayLinks.has(href))
+      .slice(0, linkLimit);
   }
 
   function setOpenButtonLabel(text) {
@@ -971,7 +1051,6 @@
         initialPageReady &&
         (previousCount === null || count > previousCount)
       ) {
-        if (count >= MAX_GIVEAWAY_ROWS) return button ?? null;
         if (button) {
           noButtonSince = null;
           if (
@@ -1018,7 +1097,7 @@
     // Keep the last known total until the entire list has loaded.
     const pagination = { total: null };
     const previouslyOpenedIds = new Set([
-      ...(continuation?.openedIds ?? []), ...(dailyRun?.processedIds ?? []),
+      ...(continuation?.openedIds ?? []), ...(dailyRun?.processedIds ?? []), ...savedDailyProcessed(),
     ]);
     restoreGiveawayPacing(continuation);
     let capped = false;
@@ -1050,9 +1129,11 @@
                   Math.max(1, pageSize),
                   pagination.total - previousCount,
                 );
+          runFilter();
+          const unfinishedCount = getVisibleGiveawayLinks({skippedIds:previouslyOpenedIds}).length;
           if (
-            previousCount >= MAX_GIVEAWAY_ROWS ||
-            previousCount + nextPageSize > MAX_GIVEAWAY_ROWS
+            unfinishedCount >= MAX_GIVEAWAY_ROWS ||
+            unfinishedCount + nextPageSize > MAX_GIVEAWAY_ROWS
           ) {
             capped = true;
             break;
@@ -1069,11 +1150,8 @@
               previousCount,
           );
         }
-        capped ||=
-          document.querySelectorAll("article.BookListItem").length >=
-          MAX_GIVEAWAY_ROWS;
-
         runFilter();
+        capped ||= getVisibleGiveawayLinks({skippedIds:previouslyOpenedIds}).length >= MAX_GIVEAWAY_ROWS;
         updateCounts();
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -1101,10 +1179,11 @@
 
       if (controller.signal.aborted) return;
       const result = await openVisibleGiveaways(controller, {
-        rowLimit: MAX_GIVEAWAY_ROWS,
+        linkLimit: MAX_GIVEAWAY_ROWS,
         skippedIds: previouslyOpenedIds,
         waitForAll: capped || Boolean(dailyRun?.batchEntryLimit),
         workflow: preparedWorkflow,
+        resumeSaved: true,
       });
       if (controller.signal.aborted || !result || result.failed) return;
       if (dailyRun?.entryLimit &&
@@ -1183,12 +1262,12 @@
       const settle = () => {
         if (settled) return;
         settled = true;
-        if (dailyRun && !dailyRun.stopped && !recovery.controller.signal.aborted) {
-          const id = getGiveawayId(link);
-          if (id) dailyRun.processedIds.add(id);
-          localStorage.setItem(LS_DAILY_PROCESSED, JSON.stringify({
-            day: new Date().toLocaleDateString("en-CA"), ids: [...dailyRun.processedIds],
-          }));
+        if (!recovery.controller.signal.aborted && !dailyRun?.stopped) {
+          try {
+            rememberProcessedGiveaway(link);
+            const id = getGiveawayId(link);
+            if (id && dailyRun) dailyRun.processedIds.add(id);
+          } catch (error) { giveawayError(error.message); }
         }
         if (recovery.pacing) recovery.pacing.lastClosedAt = Date.now();
         stopRecovery();
@@ -1332,7 +1411,10 @@
     if (openingGiveaways || loadingGiveaways) return;
     if (!keyfireReadyToStart()) return;
 
-    const links = getVisibleGiveawayLinks(options);
+    let links = getVisibleGiveawayLinks(options);
+    try {
+      if (options.resumeSaved) links = rememberGiveawayQueue(links);
+    } catch (error) { giveawayError(error.message); return {openedIds:[],failed:1}; }
     const openedIds = [];
     if (links.length === 0) {
       refreshOpenButton();
@@ -1378,6 +1460,7 @@
             tabId,
           );
           localStorage.setItem(tabKey, "waiting");
+          rememberGiveawayAttempt(link);
           const tab = GM_openInTab(numberedLink, { active: Boolean(workflow) });
           if (
             (workflow || options.waitForAll) &&

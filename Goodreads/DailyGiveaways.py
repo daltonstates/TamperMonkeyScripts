@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 from ctypes import wintypes
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -19,11 +21,12 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
-from KeyfireGiveaways import Settings, read_workflow
+from KeyfireGiveaways import Settings, read_config, read_workflow
 
 PORT = 17385
-VERSION = "2026.11.02.2"
+VERSION = "2026.11.02.3"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
@@ -31,6 +34,89 @@ WINDOW_BIND_TIMEOUT = "The scheduled Edge window was not identified and brought 
 # Background listing timers may run only once a minute. Leave time for the
 # next authenticated heartbeat to receive cancellation and then close its tabs.
 FAILED_CLEANUP_SECONDS = 90
+
+
+def process_identity(pid):
+    """A PID alone can be reused after a reboot; include its creation time."""
+    if os.name != "nt" or type(pid) is not int or pid <= 0:
+        return None
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error in {0, 87, 1168}:
+            return None
+        raise OSError(error, "Cannot inspect the previous automation process")
+    try:
+        code = wintypes.DWORD()
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise OSError("Cannot establish whether the previous automation process ended")
+        if code.value != 259:
+            return None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        path, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)) or not kernel.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
+            raise OSError("Cannot verify the previous automation process identity")
+        return {"pid": pid, "created": (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime,
+                "exe": os.path.normcase(os.path.abspath(path.value))}
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def profile_job_key(settings, profile):
+    identity = os.path.normcase(os.path.abspath(settings.get("userDataDirectory", ""))) + "\\" + profile["directory"].casefold()
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def profile_job_directory(settings, profile, state_root):
+    return state_root / "jobs" / profile_job_key(settings, profile)
+
+
+def archive_job_checkpoint(path, result):
+    """Retain recovery evidence before retiring this job's active checkpoint."""
+    value = json.loads(path.read_text(encoding="utf-8-sig"))
+    value.update(recovery=result, retiredAt=datetime.now().astimezone().isoformat())
+    run_id = value.get("runId", "")
+    key = run_id if re.fullmatch(r"[a-f0-9]{32}", run_id) else hashlib.sha256(str(run_id).encode()).hexdigest()[:32]
+    save_report(path.parent / "history" / (key + "-recovery.json"), value)
+    path.unlink()
+
+
+@contextmanager
+def foreground_queue_lock(path, waiting_report, run_id, verify=False):
+    """Independent schedules queue for the same keyboard instead of colliding."""
+    import msvcrt
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock:
+        lock.seek(0)
+        if not lock.read(1):
+            lock.write(b"0")
+            lock.flush()
+        queued = {"runId": run_id, "state": "queued", "profiles": [], "verificationOnly": verify,
+                  "startedAt": datetime.now().astimezone().isoformat(), "runnerVersion": VERSION,
+                  "reason": "Another browser job owns the interactive keyboard."}
+        while True:
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} and getattr(error, "winerror", None) not in {33, 36}:
+                    raise
+                queued["updatedAt"] = datetime.now().astimezone().isoformat()
+                save_report(waiting_report, queued)
+                time.sleep(1)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 @contextmanager
@@ -45,11 +131,17 @@ def desktop_power_request():
         kernel.SetThreadExecutionState(0x80000000)
 
 
-def read_settings(path):
+def read_settings(path, selected_profiles=None):
     value = json.loads(path.read_text(encoding="utf-8-sig"))
     profiles = value.get("profiles")
     if not isinstance(profiles, list) or not 1 <= len(profiles) <= 20:
         raise ValueError("Choose between 1 and 20 Edge profiles")
+    if selected_profiles:
+        selected = set(selected_profiles)
+        if not selected.issubset({profile.get("directory") for profile in profiles if isinstance(profile, dict)}):
+            raise ValueError("Select only profile directories already configured for this job")
+        profiles = [profile for profile in profiles if profile.get("directory") in selected]
+        value = {**value, "profiles": profiles}
     datetime.strptime(value["startAt"], "%H:%M")
     jitter = value.get("startJitterMinutes", 0)
     if type(jitter) is not int or not 0 <= jitter <= 15:
@@ -71,17 +163,21 @@ def read_settings(path):
         directory, name = profile.get("directory"), profile.get("name")
         offset = profile.get("offsetMinutes")
         if (not isinstance(directory, str) or not re.fullmatch(r"Default|Profile \d+", directory)
-                or directory.casefold() in seen or not (root / directory).is_dir()
+                or directory.casefold() in seen
                 or not isinstance(name, str) or not 1 <= len(name) <= 100
                 or type(offset) is not int or not 0 <= offset <= 180
                 or (not sequential and offset <= previous_offset)):
             raise ValueError("Invalid, missing, duplicated, or out-of-order Edge profile")
         seen.add(directory.casefold())
+        if not (root / directory).is_dir():
+            profile["configurationError"] = "The configured browser profile directory is missing."
         previous_offset = offset
     offsets = [profile["offsetMinutes"] for profile in profiles]
     if not sequential and len(offsets) > 1 and jitter >= min(b - a for a, b in zip(offsets, offsets[1:])):
         raise ValueError("Random start delay must be smaller than the spacing between profiles")
-    read_workflow(Path(value["keyfireConfig"]), Settings(value["macroName"], value.get("macroProfile", "")))
+    # Macro selection belongs to the website workflow in each account. A stale
+    # catalog default must not prevent unrelated profile jobs from connecting.
+    read_config(Path(value["keyfireConfig"]))
     return value
 
 
@@ -175,7 +271,7 @@ class ListingWindow:
         self.user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
         return pid.value
 
-    def bind(self):
+    def bind(self, *, activate=True):
         matches = []
         counts = {"visibleEdgeWindows": 0, "markerWindows": 0,
                   "matchingEdgeWindows": 0, "rejectedMarkerWindows": 0}
@@ -217,6 +313,8 @@ class ListingWindow:
         if len(matches) != 1:
             return False
         self.handle, self.pid = matches[0]
+        if not activate:
+            return True
         # An existing Edge process may create its window behind Explorer when
         # launched by a scheduled task. Focus only this nonce- and path-bound
         # window before authorizing the userscript to open keyboard entry tabs.
@@ -259,14 +357,38 @@ class ListingWindow:
                 self.user32.AttachThreadInput(current, thread, False)
 
     def closed(self):
-        return self.handle is not None and (
-            not self.user32.IsWindow(self.handle) or self.window_pid(self.handle) != self.pid
-            or not self.user32.IsWindowVisible(self.handle))
+        if self.handle is None:
+            return False
+        if not self.user32.IsWindow(self.handle) or self.window_pid(self.handle) != self.pid:
+            return True
+        return bool(getattr(self, "process_owner", None) and process_identity(self.pid) != self.process_owner)
+
+    def checkpoint(self):
+        if not self.handle or not self.pid:
+            return None
+        owner = process_identity(self.pid)
+        if owner is None:
+            raise OSError("The browser ended before its ownership checkpoint could be saved")
+        self.process_owner = owner
+        return {**owner, "handle": int(self.handle)}
+
+    def restore_checkpoint(self, owner):
+        if (not isinstance(owner, dict) or type(owner.get("handle")) is not int
+                or type(owner.get("pid")) is not int or type(owner.get("created")) is not int
+                or owner.get("exe") != self.edge_path):
+            return False
+        self.handle, self.pid = owner["handle"], owner["pid"]
+        self.process_owner = {key: owner[key] for key in ("pid", "created", "exe")}
+        # A different process cannot own the old run, even if Windows reused
+        # its numeric PID and window handle.
+        return process_identity(self.pid) != {key: owner[key] for key in ("pid", "created", "exe")}
 
     def request_close(self):
         """Ask only the nonce-bound completed window to close; never kill Edge."""
         if self.closed():
             return True
+        if getattr(self, "process_owner", None) and process_identity(self.pid) != self.process_owner:
+            return False
         title = ctypes.create_unicode_buffer(1024)
         self.user32.GetWindowTextW(self.handle, title, len(title))
         if not title.value.startswith(self.prefix):
@@ -288,7 +410,8 @@ class ListingWindow:
 
 class Session:
     def __init__(self, profile, verify=False, clock=time.monotonic, *, listing=None, window_tag=None,
-                 recover_failures=False, inactivity_minutes=15, entry_limit=None, batch_entry_limit=None, keyfire_config=None):
+                 recover_failures=False, inactivity_minutes=15, entry_limit=None, batch_entry_limit=None, keyfire_config=None,
+                 checkpoint=None):
         self.profile = profile
         self.verify = verify
         self.clock = clock
@@ -320,6 +443,7 @@ class Session:
         self.batch_entry_limit = batch_entry_limit
         self.keyfire_config = keyfire_config
         self.macro_wait_seconds = 0
+        self.checkpoint = checkpoint
 
     def observe_progress(self, value, now):
         """Only new processed entries or newly loaded rows renew the deadline."""
@@ -473,6 +597,10 @@ class Session:
             self.last_seen = now
             self.observe_progress(value, now)
             self.state, self.reason = state, reason
+            if self.checkpoint:
+                # Persist ownership before a ready response can authorize entry
+                # tabs. A later worker can recover exactly this run.
+                self.checkpoint(self)
             if state == "failed" and self.recover_failures and self.cleanup_supported:
                 return self.cleanup_response()
             return {"protocol": 1, "mode": "verify" if self.verify else "run", "cancel": False,
@@ -577,6 +705,7 @@ class Server(ThreadingHTTPServer):
 
 
 def save_report(path, report):
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     deadline = time.monotonic() + 5
@@ -588,6 +717,62 @@ def save_report(path, report):
             if getattr(error, "winerror", None) not in {5, 32, 33} or time.monotonic() >= deadline:
                 raise
             time.sleep(0.05)
+
+
+def recover_profile_jobs(settings, state_root, server):
+    """Retire dead owners or use the previous run's authenticated cleanup channel."""
+    results = []
+    for path in sorted((state_root / "jobs").glob("*/active.json")):
+        saved = json.loads(path.read_text(encoding="utf-8-sig"))
+        profile = saved.get("profile", {})
+        if (not isinstance(profile, dict) or not isinstance(profile.get("directory"), str)
+                or profile_job_directory(settings, profile, state_root) != path.parent
+                or not re.fullmatch(r"[a-f0-9]{64}", saved.get("token", ""))
+                or not re.fullmatch(r"[a-f0-9]{32}", saved.get("windowTag", ""))):
+            raise ValueError("Unrecognized profile checkpoint was preserved")
+        previous_result = path.parent / "last-run.json"
+        if previous_result.exists():
+            result = json.loads(previous_result.read_text(encoding="utf-8-sig"))
+            if (result.get("runId") == saved.get("runId") and result.get("windowTag") == saved.get("windowTag")
+                    and result.get("listingClosed") is True):
+                outcome = {"recovered":True,"previousRunId":saved["runId"],"profile":profile["name"],
+                           "reason":"The previous job durably confirmed closure before its worker stopped."}
+                archive_job_checkpoint(path,outcome)
+                results.append(outcome)
+                continue
+        worker = saved.get("worker")
+        if worker and worker.get("pid") != os.getpid() and process_identity(worker.get("pid")) == worker:
+            raise RuntimeError("A previous profile worker is still alive; it keeps ownership of its work")
+        listing = ListingWindow(saved["windowTag"], settings["edgePath"])
+        owner = saved.get("windowOwner")
+        if owner and listing.restore_checkpoint(owner):
+            outcome = {"state": "recovered", "recovered": True, "previousRunId": saved.get("runId"), "profile": profile["name"], "reason": "The previous browser process ended; its windows cannot still be running."}
+            archive_job_checkpoint(path, outcome)
+            results.append(outcome)
+            continue
+        session = Session(profile, listing=listing, window_tag=saved["windowTag"], recover_failures=True)
+        session.token, session.state, session.cleanup_supported = saved["token"], "failed", True
+        server.session = session
+        started = time.monotonic()
+        # A checkpoint with no admitted browser owner cannot have authorized
+        # entry tabs. Allow a late-created listing to connect and close safely.
+        if not owner:
+            while not listing.bind(activate=False):
+                if time.monotonic() - started >= WINDOW_BIND_SECONDS:
+                    break
+                time.sleep(0.25)
+            if listing.handle is None:
+                outcome = {"state": "recovered", "recovered": True, "previousRunId": saved.get("runId"), "profile": profile["name"], "reason": "No previous listing connected or received entry authorization."}
+                archive_job_checkpoint(path, outcome)
+                results.append(outcome)
+                continue
+        outcome = recover_failed_listing(session)
+        outcome.update(profile=profile["name"], previousRunId=saved.get("runId"))
+        results.append(outcome)
+        if not outcome["recovered"]:
+            raise RuntimeError("Previous profile cleanup remains unconfirmed: " + outcome["reason"])
+        archive_job_checkpoint(path, outcome)
+    return results
 
 
 def recover_failed_listing(session):
@@ -640,7 +825,9 @@ def recover_failed_listing(session):
     return diagnostics
 
 
-def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False, entry_limit=None, batch_entry_limit=None, requested=False, run_id=None):
+def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False, entry_limit=None, batch_entry_limit=None, requested=False, run_id=None, state_root=None):
+    state_root = state_root or output
+    run_id = run_id or uuid.uuid4().hex
     run_started = datetime.now()
     base_starts = planned_starts(settings, run_started, immediate, randbelow=lambda _: 0)
     starts = planned_starts(settings, run_started, immediate)
@@ -655,18 +842,41 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
               "plannedStarts": plan, "profiles": [], "entryLimit": entry_limit, "batchEntryLimit": batch_entry_limit, "runId": run_id, "runnerVersion": VERSION,
               "note": "Finished means the tab queue closed; it does not prove Goodreads accepted every entry."}
     output.mkdir(parents=True, exist_ok=True)
-    pending_path = output / "daily-incomplete.json"
+    pending_path = state_root / "daily-incomplete.json"
     report_path = output / ("daily-verification.json" if verify else "daily-last-run.json")
-    if settings.get("closeCompletedListings") and pending_path.exists():
-        history = output / "history"
-        history.mkdir(exist_ok=True)
-        if report_path.exists():
-            shutil.copyfile(report_path, history / ("blocked-previous-" + run_started.strftime("%Y%m%d-%H%M%S-%f") + ".json"))
-        report.update(state="blocked", reason="Unfinished scheduled work exists; inspect its owned windows before recovery.",
-                      endedAt=datetime.now().astimezone().isoformat())
-        save_report(report_path, report)
-        return 1
-    save_report(report_path, report)
+    run_key = run_id if re.fullmatch(r"[a-f0-9]{32}", run_id) else hashlib.sha256(run_id.encode()).hexdigest()[:32]
+    durable_report = state_root / "runs" / run_key / report_path.name
+    if durable_report.exists():
+        previous = json.loads(durable_report.read_text(encoding="utf-8-sig"))
+        if previous.get("endedAt"):
+            return 0 if len(previous.get("profiles", [])) == len(settings["profiles"]) and all(
+                item.get("state") in {"finished", "verified"} for item in previous["profiles"]) else 1
+        save_report(durable_report.parent / "attempts" / (run_started.strftime("%Y%m%d-%H%M%S-%f") + ".json"), previous)
+    def persist_report():
+        # Only the admitted foreground owner updates the convenience pointer.
+        # Waiting requests write solely inside their own request directory.
+        for target in {durable_report, report_path, state_root / report_path.name}:
+            save_report(target, report)
+    checkpoint_paths = list((state_root / "jobs").glob("*/active.json"))
+    if pending_path.exists() and report_path.exists():
+        archive = output / "history" / ("blocked-previous-" + run_started.strftime("%Y%m%d-%H%M%S-%f") + ".json")
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(report_path, archive)
+    if settings.get("closeCompletedListings") and pending_path.exists() and not checkpoint_paths:
+        marker = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        closure = bool(marker.get("runId") and marker.get("windowTag")) and any(
+                      result.get("runId") == marker.get("runId") and result.get("windowTag") == marker.get("windowTag") and result.get("listingClosed") is True
+                      for result in (json.loads(path.read_text(encoding="utf-8-sig")) for path in (state_root/"jobs").glob("*/last-run.json")))
+        if closure:
+            save_report(state_root/"history"/("closed-index-"+run_key+".json"),marker)
+            pending_path.unlink()
+        else:
+        # Legacy markers lack the authentication needed for unattended cleanup.
+        # Preserve them rather than inventing ownership or deleting evidence.
+            report.update(state="blocked", reason="Legacy unfinished work has no profile ownership checkpoint; inspect it before migration.", endedAt=datetime.now().astimezone().isoformat())
+            persist_report()
+            return 1
+    persist_report()
     for item in plan:
         logging.info("Planned %s at %s (random delay %s seconds)",
                      item["name"], item["plannedAt"], item["delaySeconds"])
@@ -674,34 +884,64 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
+        if checkpoint_paths:
+            report["recoveries"] = recover_profile_jobs(settings, state_root, server)
+            pending_path.unlink(missing_ok=True)
         for profile, start in zip(settings["profiles"], starts):
             while datetime.now() < start:
                 report["updatedAt"] = datetime.now().astimezone().isoformat()
                 report["waitingUntil"] = start.astimezone().isoformat()
-                save_report(report_path, report)
+                persist_report()
                 time.sleep(max(0, min(5, (start - datetime.now()).total_seconds())))
             report.pop("waitingUntil", None)
             item = {"name": profile["name"], "directory": profile["directory"],
                     "plannedAt": start.isoformat(), "state": "waiting"}
             report["profiles"].append(item)
+            if profile.get("configurationError"):
+                item.update(state="failed", reason=profile["configurationError"], listingClosed=True,
+                            startedAt=datetime.now().astimezone().isoformat(), endedAt=datetime.now().astimezone().isoformat(),
+                            counters={"processed":0,"loaded":0})
+                job_directory = profile_job_directory(settings, profile, state_root)
+                save_report(job_directory / "last-run.json", {**item, "runId":run_id})
+                save_report(job_directory / "runs" / (run_key+".json"), {**item, "runId":run_id})
+                persist_report()
+                continue
             if not desktop_available():
                 item.update(state="failed", reason="Windows is locked or has no interactive desktop.")
-                save_report(report_path, report)
+                persist_report()
                 break
             tag = secrets.token_hex(16) if settings.get("closeCompletedListings") else None
+            item["windowTag"] = tag
             listing = ListingWindow(tag, settings["edgePath"]) if tag else None
             session = Session(profile, verify, listing=listing, window_tag=tag,
                               recover_failures=recover_failures,
                               inactivity_minutes=settings.get("inactivityMinutes", 15), entry_limit=entry_limit, batch_entry_limit=batch_entry_limit,
                               keyfire_config=settings.get("keyfireConfig"))
+            job_directory = profile_job_directory(settings, profile, state_root)
+            checkpoint_path = job_directory / "active.json"
+            record = {"schema": 1, "runId": run_id, "profile": dict(profile), "token": session.token,
+                      "windowTag": tag, "worker": process_identity(os.getpid()), "startedAt": report["startedAt"]}
+            checkpoint_lock = threading.Lock()
+            def checkpoint(current, target_listing=listing, target_path=checkpoint_path,
+                           target_record=record, target_lock=checkpoint_lock):
+                if not target_listing:
+                    return
+                with target_lock:
+                    target_record.update(state=current.state, counters=dict(current.counters), updatedAt=datetime.now().astimezone().isoformat())
+                    owner = target_listing.checkpoint() if current.state in {"waiting","ready","running"} and hasattr(target_listing, "checkpoint") else None
+                    if isinstance(owner, dict):
+                        target_record["windowOwner"] = owner
+                    save_report(target_path, target_record)
+            session.checkpoint = checkpoint
             server.session = session
             if listing:
+                checkpoint(session)
                 save_report(pending_path, {"startedAt": report["startedAt"], "profile": profile["name"],
                                            "runId": run_id, "windowTag": tag,
                                            "reason": "The scheduled window has not been confirmed closed."})
             logging.info("Starting %s (%s)", profile["name"], profile["directory"])
             item["startedAt"] = datetime.now().astimezone().isoformat()
-            save_report(report_path, report)
+            persist_report()
             subprocess.Popen([settings["edgePath"], f'--user-data-dir={settings["userDataDirectory"]}',
                               f'--profile-directory={profile["directory"]}', "--new-window",
                               LIST_URL + "#grDailyToken=" + session.token
@@ -715,8 +955,9 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
                     item.update(state=session.state, progress=session.progress, counters=dict(session.counters),
                                 lastUsefulAt=session.last_useful_at,
                                 inactivitySeconds=round(max(0, session.clock() - session.last_progress), 1))
+                    checkpoint(session)
                 report["updatedAt"] = datetime.now().astimezone().isoformat()
-                save_report(report_path, report)
+                persist_report()
                 time.sleep(1)
             item.update(state=session.state, reason=session.reason, progress=session.progress,
                         endedAt=datetime.now().astimezone().isoformat(), counters=dict(session.counters),
@@ -732,11 +973,15 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
                 item["cleanup"] = recover_failed_listing(session)
                 if item["cleanup"]["recovered"]:
                     item.update(listingClosed=True, failureRecovered=True)
-                    pending_path.unlink(missing_ok=True)
             if listing and session.state in {"finished", "verified"}:
                 item["listingClosed"] = True
-                pending_path.unlink()
-            save_report(report_path, report)
+            save_report(job_directory / "last-run.json", {**item, "runId": run_id})
+            run_key = run_id if re.fullmatch(r"[a-f0-9]{32}", run_id) else hashlib.sha256(run_id.encode()).hexdigest()[:32]
+            save_report(job_directory / "runs" / (run_key + ".json"), {**item, "runId": run_id})
+            if item.get("listingClosed"):
+                checkpoint_path.unlink(missing_ok=True)
+                pending_path.unlink(missing_ok=True)
+            persist_report()
             logging.info("%s: %s %s", profile["name"], session.state, session.reason)
             if session.state not in {"finished", "verified"} and not item.get("failureRecovered"):
                 # Keep cancellation available briefly, and never launch another profile.
@@ -756,7 +1001,7 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
                                        "plannedAt": start.isoformat(), "state": "skipped",
                                        "reason": "An earlier account did not finish."})
         report["endedAt"] = datetime.now().astimezone().isoformat()
-        save_report(report_path, report)
+        persist_report()
         history = output / "history"
         history.mkdir(exist_ok=True)
         save_report(history / (run_started.strftime("%Y%m%d-%H%M%S-%f") + ".json"), report)
@@ -775,6 +1020,8 @@ def main():
     parser.add_argument("--entry-limit", type=int, help="Controlled live check: process at most this many entries per profile")
     parser.add_argument("--batch-entry-limit", type=int, help="Controlled live check: refresh after this many entries, within --entry-limit")
     parser.add_argument("--run-id", help="Request identity for correlated reports")
+    parser.add_argument("--output-directory", type=Path, help="This request's independent report directory")
+    parser.add_argument("--profile-directory", action="append", help="Run only this explicitly configured profile; repeat to select more than one")
     parser.add_argument("--recover-failures", "--vm-recover-failures", dest="recover_failures", action="store_true",
                         help="Close only authenticated failed-run windows before continuing later profiles")
     args = parser.parse_args()
@@ -782,7 +1029,7 @@ def main():
         parser.error("Controlled checks allow 1 to 10 entries per profile")
     if args.batch_entry_limit is not None and (args.entry_limit is None or not 1 <= args.batch_entry_limit <= args.entry_limit):
         parser.error("A controlled batch must fit within --entry-limit")
-    settings = read_settings(args.config)
+    settings = read_settings(args.config, args.profile_directory)
     if args.check:
         jitter = settings.get("startJitterMinutes", 0)
         for profile, start in zip(settings["profiles"], planned_starts(settings, datetime.now(), randbelow=lambda _: 0)):
@@ -791,43 +1038,40 @@ def main():
             print(f'{profile["name"]}: {window}, Edge {profile["directory"]}')
         if jitter:
             print("A fresh random start time is chosen for each profile on each scheduled run.")
-        print("Saved macro is valid. Browser sign-ins and installed userscripts still require verification.")
+        print("Helper settings are readable. Each profile's selected macro is validated when that job connects.")
         return 0
-    output = args.config.parent
+    state_root = args.config.parent
+    args.run_id = args.run_id or uuid.uuid4().hex
+    if not re.fullmatch(r"[a-f0-9]{32}", args.run_id):
+        parser.error("--run-id must be a 32-character hexadecimal request identity")
+    output = args.output_directory or state_root / "runs" / args.run_id
     output.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=output / "daily.log", level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    lock = (output / "daily.lock").open("a+b")
-    try:
-        import msvcrt
-        lock.seek(0)
-        if not lock.read(1):
-            lock.write(b"0")
-            lock.flush()
-        lock.seek(0)
-        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-    except (ImportError, OSError):
-        lock.close()
-        raise RuntimeError("Another daily runner is active, or this is not Windows")
+    shared_lock = Path(os.environ["LOCALAPPDATA"]) / "GoodreadsKeyfireCompanion" / "foreground.lock"
+    report_path = output / ("daily-verification.json" if args.verify_only else "daily-last-run.json")
     try:
         if args.clear_pending:
-            (output / "daily-incomplete.json").unlink(missing_ok=True)
+            if list((state_root / "jobs").glob("*/active.json")):
+                raise RuntimeError("Profile ownership checkpoints recover automatically; they cannot be discarded by --clear-pending")
+            (state_root / "daily-incomplete.json").unlink(missing_ok=True)
             print("Unfinished-work marker cleared. No browser was opened or closed.")
             return 0
         # Own this request here: a caller's monitoring failure must not put a
         # still-running browser queue to sleep. The companion's lock prevents
         # competing keyboard helpers.
-        with desktop_power_request():
+        if report_path.exists() and json.loads(report_path.read_text(encoding="utf-8-sig")).get("endedAt"):
+            previous = json.loads(report_path.read_text(encoding="utf-8-sig"))
+            return 0 if all(item.get("state") in {"finished", "verified"} for item in previous.get("profiles", [])) else 1
+        with foreground_queue_lock(shared_lock, report_path, args.run_id, args.verify_only), desktop_power_request():
             pythonw = Path(sys.executable).with_name("pythonw.exe")
             subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
                               "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
             return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
-                             recover_failures=args.recover_failures, entry_limit=args.entry_limit, batch_entry_limit=args.batch_entry_limit, requested=args.requested, run_id=args.run_id)
+                             recover_failures=args.recover_failures, entry_limit=args.entry_limit, batch_entry_limit=args.batch_entry_limit, requested=args.requested, run_id=args.run_id, state_root=state_root)
     except Exception:
         logging.exception("Daily giveaway runner failed")
         raise
-    finally:
-        lock.close()
 
 
 if __name__ == "__main__":

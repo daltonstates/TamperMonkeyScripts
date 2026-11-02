@@ -1,18 +1,31 @@
 param(
     [string]$SettingsPath = "$env:ProgramData\GoodreadsGiveawaysVM\vm-settings.json",
+    [string[]]$ProfileDirectory,
+    [int]$EntryLimit,
+    [int]$BatchEntryLimit,
     [switch]$Repeat,
     [switch]$VerifyOnly
 )
 $ErrorActionPreference='Stop'
 $reportDirectory=Join-Path $env:ProgramData 'GoodreadsGiveawaysVM\reports'
-$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.02.3';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
+$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.02.4';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
 $powerSet=$false
 $mutex=$null
 $ownsLock=$false
+$queuedPath=$null
 function Save-HostResult {
     New-Item -ItemType Directory -Path $reportDirectory -Force|Out-Null
     $report.updatedAt=[DateTimeOffset]::Now.ToString('o')
-    $target=Join-Path $reportDirectory 'host-last-run.json'
+    $runDirectory=Join-Path $reportDirectory ('runs\'+$report.runId)
+    New-Item -ItemType Directory -Path $runDirectory -Force|Out-Null
+    $targets=@((Join-Path $runDirectory 'host-last-run.json'))
+    $publishLatest=$ownsLock
+    if(-not $mutex){
+        $latestPath=Join-Path $reportDirectory 'host-last-run.json'
+        try{$previous=Get-Content -LiteralPath $latestPath -Raw|ConvertFrom-Json;$publishLatest=($previous.endedAt -or $previous.state -notin @('starting','running','queued'))}catch{$publishLatest=$true}
+    }
+    if($publishLatest){$targets+=Join-Path $reportDirectory 'host-last-run.json'}
+    foreach($target in $targets){
     $temporary=$target+'.tmp'
     [IO.File]::WriteAllText($temporary,($report|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
     $deadline=[DateTimeOffset]::Now.AddSeconds(5)
@@ -23,6 +36,7 @@ function Save-HostResult {
             Start-Sleep -Milliseconds 50
         }
     }
+    }
 }
 try {
     . (Join-Path $PSScriptRoot 'VM.Common.ps1')
@@ -31,9 +45,32 @@ try {
     $settings=Read-VMSettings $SettingsPath
     $reportDirectory=$settings.reportDirectory
     $report.vmName=$settings.vmName
+    if($ProfileDirectory -and (@($ProfileDirectory|Where-Object{$_ -notmatch '^(Default|Profile \d+)$'}).Count -or
+       @($ProfileDirectory|Select-Object -Unique).Count -ne $ProfileDirectory.Count)){throw 'Select unique configured Edge profile directories.'}
+    $limit=if($PSBoundParameters.ContainsKey('EntryLimit')){$EntryLimit}else{$settings.requestEntryLimit}
+    $batch=if($PSBoundParameters.ContainsKey('BatchEntryLimit')){$BatchEntryLimit}else{$settings.requestBatchEntryLimit}
+    if($null -ne $limit -and ($limit -lt 1 -or $limit -gt 10)){throw 'Controlled checks allow 1 to 10 entries per profile.'}
+    if($null -ne $batch -and (-not $limit -or $batch -lt 1 -or $batch -gt $limit)){throw 'A controlled batch must fit within the request entry limit.'}
+    if($limit){$report.entryLimit=$limit}
+    if($batch){$report.batchEntryLimit=$batch}
+    if($ProfileDirectory){$report.profileDirectories=@($ProfileDirectory)}
+    $worker=Get-Process -Id $PID
+    $report.worker=@{pid=$PID;startedAt=$worker.StartTime.ToUniversalTime().ToString('o');exe=$worker.Path}
+    $report.state='queued'
+    $queueDirectory=Join-Path $reportDirectory 'queued'
+    New-Item -ItemType Directory -Path $queueDirectory -Force|Out-Null
+    $queuedPath=Join-Path $queueDirectory ($report.runId+'.json')
+    Write-VMJson $queuedPath $report
     $mutex=[Threading.Mutex]::new($false,'Global\GoodreadsVMWorkflow')
     try {$ownsLock=$mutex.WaitOne(0)} catch [Threading.AbandonedMutexException] {$ownsLock=$true}
-    if(-not $ownsLock){throw 'Another host request is active. No second guest queue was launched.'}
+    if(-not $ownsLock){
+        Save-HostResult
+        # A queued request keeps its identity and waits for the shared VM/input
+        # owner. It never replaces that owner's request or latest report.
+        try{$ownsLock=$mutex.WaitOne()}catch [Threading.AbandonedMutexException]{$ownsLock=$true}
+    }
+    Remove-Item -LiteralPath $queuedPath;$queuedPath=$null
+    $report.state='starting'
     Save-HostResult
     Import-Module Hyper-V -ErrorAction Stop
     Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class GoodreadsRequestPower { [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags); }'
@@ -41,8 +78,9 @@ try {
     $powerSet=$true
     $report.vmStart=Start-GiveawaysMorningVM $settings
     $request=@{schema=1;runId=$report.runId;requestedAt=$report.startedAt;mode=$(if($VerifyOnly){'verify'}elseif($Repeat){'repeat'}else{'scheduled'})}
-    if($settings.requestEntryLimit){$request.entryLimit=$settings.requestEntryLimit;$report.entryLimit=$settings.requestEntryLimit}
-    if($settings.requestBatchEntryLimit){$request.batchEntryLimit=$settings.requestBatchEntryLimit;$report.batchEntryLimit=$settings.requestBatchEntryLimit}
+    if($ProfileDirectory){$request.profileDirectories=@($ProfileDirectory)}
+    if($report.entryLimit){$request.entryLimit=$report.entryLimit}
+    if($report.batchEntryLimit){$request.batchEntryLimit=$report.batchEntryLimit}
     $readyDeadline=[DateTimeOffset]::Now.AddMinutes(3)
     do {
         try {Set-GiveawaysRequest $settings $request;break}
@@ -136,11 +174,13 @@ try {
     $report.failureLocation=@{script=(Split-Path -Leaf $_.InvocationInfo.ScriptName);line=$_.InvocationInfo.ScriptLineNumber;stack=$_.ScriptStackTrace}
     $report.shutdownDecision=@{state='deferred';reason='The request failed; guest state was preserved for diagnosis.'}
 } finally {
+    if($queuedPath -and (Test-Path -LiteralPath $queuedPath)){Remove-Item -LiteralPath $queuedPath -ErrorAction SilentlyContinue}
     if($powerSet){[void][GoodreadsRequestPower]::SetThreadExecutionState([uint32]2147483648)}
     $report.endedAt=[DateTimeOffset]::Now.ToString('o')
     if($mutex -and -not $ownsLock){
         Write-VMJson (Join-Path $reportDirectory ('host-request-'+$report.runId+'.json')) $report
-    }else{Save-HostResult}
+    }
+    Save-HostResult
     $history=Join-Path $reportDirectory 'history'
     New-Item -ItemType Directory -Path $history -Force|Out-Null
     $temporary=Join-Path $history ($report.runId+'.json')

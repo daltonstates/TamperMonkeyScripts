@@ -7,6 +7,8 @@ function Assert-VMAdministrator {
 }
 
 function Write-VMJson($Path, $Value) {
+    $parent=Split-Path -Parent $Path
+    if($parent){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
     $temporary = $Path + '.tmp'
     [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
     $deadline=[DateTimeOffset]::Now.AddSeconds(5)

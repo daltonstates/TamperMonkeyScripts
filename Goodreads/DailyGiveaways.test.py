@@ -90,7 +90,7 @@ class ScheduleTests(unittest.TestCase):
                 with self.subTest(jitter=jitter), self.assertRaises(ValueError):
                     daily.read_settings(config)
             config.write_text(json.dumps({**base, "startJitterMinutes": 4}))
-            with patch.object(daily, "read_workflow"):
+            with patch.object(daily, "read_config"):
                 self.assertEqual(daily.read_settings(config)["startJitterMinutes"], 4)
 
     def test_validation_rejects_missing_duplicate_and_traversal_profiles(self):
@@ -100,13 +100,20 @@ class ScheduleTests(unittest.TestCase):
             edge = root / "edge.exe"
             edge.touch()
             config = root / "daily.json"
-            base = {"startAt": "04:00", "edgePath": str(edge), "userDataDirectory": str(root)}
+            base = {"startAt": "04:00", "edgePath": str(edge), "userDataDirectory": str(root), "keyfireConfig":"unused.json"}
             for profiles in ([{"name": "A", "directory": "../Default", "offsetMinutes": 0}],
-                             [{"name": "A", "directory": "Profile 2", "offsetMinutes": 0}],
                              [{"name": "A", "directory": "Default", "offsetMinutes": n} for n in (0, 30)]):
                 config.write_text(json.dumps({**base, "profiles": profiles}))
                 with self.assertRaises(ValueError):
                     daily.read_settings(config)
+            config.write_text(json.dumps({**base,"profiles":[{"name":"A","directory":"Default","offsetMinutes":0},
+                {"name":"B","directory":"Profile 2","offsetMinutes":30}]}))
+            with patch.object(daily,"read_config"):
+                all_jobs=daily.read_settings(config)
+                self.assertIn("configurationError",all_jobs["profiles"][1])
+                selected=daily.read_settings(config,["Default"])
+                self.assertEqual(len(selected["profiles"]),1)
+                self.assertNotIn("configurationError",selected["profiles"][0])
 
 
 class SessionTests(unittest.TestCase):
@@ -594,7 +601,9 @@ class QueueTests(unittest.TestCase):
                  patch.object(daily.subprocess, "Popen", side_effect=launch) as opened, patch.object(daily.time, "sleep"):
                 self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
                 self.assertTrue((output / "daily-incomplete.json").exists())
-                self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
+                with patch.object(daily, "recover_profile_jobs", side_effect=RuntimeError("Cleanup remains unconfirmed")) as recover:
+                    self.assertEqual(daily.run_queue(settings, output, immediate=True), 1)
+                    recover.assert_called_once()
                 self.assertEqual(opened.call_count, 1)
             report = json.loads(next((output / "history").glob("blocked-previous-*.json")).read_text())
             self.assertEqual([p["state"] for p in report["profiles"]], ["failed", "skipped", "skipped"])
@@ -951,6 +960,113 @@ class FailureRecoveryTests(unittest.TestCase):
             self.assertTrue(report["profiles"][0]["failureRecovered"])
             self.assertFalse((output / "daily-incomplete.json").exists())
             self.assertEqual(len(launches), 2)
+
+
+class DurableProfileJobsTests(unittest.TestCase):
+    def fixture(self, root):
+        settings = {"startAt":"04:00", "edgePath":"edge.exe", "userDataDirectory":str(root),
+                    "closeCompletedListings":True, "profiles":[{"name":"Account", "directory":"Default", "offsetMinutes":0}]}
+        profile=settings["profiles"][0]
+        path=daily.profile_job_directory(settings, profile, root)/"active.json"
+        saved={"schema":1,"runId":"a"*32,"token":"b"*64,"windowTag":"c"*32,"profile":profile,
+               "worker":None,"windowOwner":{"handle":123,"pid":456,"created":789,"exe":"edge.exe"}}
+        daily.save_report(path,saved)
+        return settings,path,saved
+
+    def test_dead_browser_owner_retires_only_its_checkpoint_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings,path,saved=self.fixture(root);server=MagicMock();window=MagicMock()
+            window.restore_checkpoint.return_value=True
+            with patch.object(daily,"ListingWindow",return_value=window):
+                result=daily.recover_profile_jobs(settings,root,server)
+            self.assertFalse(path.exists())
+            old=json.loads((path.parent/"history"/("a"*32+"-recovery.json")).read_text())
+            self.assertEqual(old["token"],saved["token"])
+            self.assertEqual(result[0]["previousRunId"],"a"*32)
+            window.request_close.assert_not_called()
+
+    def test_living_previous_worker_keeps_ownership_and_is_never_cancelled(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings,path,saved=self.fixture(root)
+            saved["worker"]={"pid":999999,"created":123,"exe":"python.exe"};daily.save_report(path,saved)
+            with patch.object(daily,"process_identity",return_value=saved["worker"]),patch.object(daily,"ListingWindow") as window:
+                with self.assertRaisesRegex(RuntimeError,"still alive"):
+                    daily.recover_profile_jobs(settings,root,MagicMock())
+                window.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_durable_closure_survives_a_crash_before_checkpoint_retirement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings,path,saved=self.fixture(root)
+            daily.save_report(path.parent/"last-run.json", {"runId":saved["runId"],
+                "windowTag":saved["windowTag"], "listingClosed":True})
+            with patch.object(daily,"ListingWindow") as window:
+                result=daily.recover_profile_jobs(settings,root,MagicMock())
+                window.assert_not_called()
+            self.assertTrue(result[0]["recovered"])
+            self.assertFalse(path.exists())
+            self.assertTrue((path.parent/"history"/(saved["runId"]+"-recovery.json")).exists())
+
+    def test_closure_from_another_window_never_retires_a_current_checkpoint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings,path,saved=self.fixture(root)
+            saved["worker"]={"pid":999999,"created":123,"exe":"python.exe"};daily.save_report(path,saved)
+            daily.save_report(path.parent/"last-run.json", {"runId":saved["runId"],
+                "windowTag":"d"*32, "listingClosed":True})
+            with patch.object(daily,"process_identity",return_value=saved["worker"]):
+                with self.assertRaisesRegex(RuntimeError,"still alive"):
+                    daily.recover_profile_jobs(settings,root,MagicMock())
+            self.assertTrue(path.exists())
+
+    def test_crashed_worker_uses_old_token_for_cleanup_before_new_work(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings,path,saved=self.fixture(root);server=MagicMock();window=MagicMock();closed=[False]
+            window.restore_checkpoint.return_value=False
+            window.closed.side_effect=lambda:closed[0]
+            def heartbeat(seconds):
+                session=server.session
+                with self.assertRaises(ValueError): session.event({"token":"d"*64,"state":"cleanup-ready","windowTag":saved["windowTag"]})
+                response=session.event({"token":saved["token"],"state":"failed","windowTag":saved["windowTag"]})
+                self.assertTrue(response["closeRunTabs"])
+                response=session.event({"token":saved["token"],"state":"cleanup-ready","windowTag":saved["windowTag"]})
+                self.assertTrue(response["closeListing"]);closed[0]=True
+            with patch.object(daily,"ListingWindow",return_value=window),patch.object(daily.time,"sleep",side_effect=heartbeat):
+                result=daily.recover_profile_jobs(settings,root,server)
+            self.assertTrue(result[0]["recovered"])
+            self.assertFalse(path.exists())
+            window.focus.assert_not_called()
+
+    def test_reused_pid_does_not_reuse_the_old_browser_identity(self):
+        window=object.__new__(daily.ListingWindow);window.edge_path="edge.exe"
+        owner={"handle":123,"pid":456,"created":1,"exe":"edge.exe"}
+        with patch.object(daily,"process_identity",return_value={"pid":456,"created":2,"exe":"edge.exe"}):
+            self.assertTrue(window.restore_checkpoint(owner))
+
+    def test_unavailable_process_identity_preserves_recovery_state(self):
+        window=object.__new__(daily.ListingWindow);window.edge_path="edge.exe"
+        with patch.object(daily,"process_identity",side_effect=OSError("access refused")),self.assertRaises(OSError):
+            window.restore_checkpoint({"handle":123,"pid":456,"created":1,"exe":"edge.exe"})
+
+    def test_independent_requests_and_profile_jobs_do_not_overwrite_each_other(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);server=MagicMock();window=MagicMock();window.closed.return_value=True
+            settings={"startAt":"04:00","edgePath":"edge.exe","userDataDirectory":folder,"closeCompletedListings":True,
+                "profiles":[{"name":"One","directory":"Default","offsetMinutes":0}]}
+            def launch(command):
+                session=server.session
+                session.event({"token":session.token,"state":"ready","windowTag":session.window_tag,"closeListingSupported":True})
+                session.event({"token":session.token,"state":"finished","metrics":{"processed":1,"loaded":1,"open":0}})
+            with patch.object(daily,"Server",return_value=server),patch.object(daily,"ListingWindow",return_value=window),\
+                 patch.object(daily,"desktop_available",return_value=True),patch.object(daily.subprocess,"Popen",side_effect=launch) as opened,\
+                 patch.object(daily.time,"sleep"):
+                self.assertEqual(daily.run_queue(settings,root,immediate=True,run_id="a"*32),0)
+                original=(root/"runs"/("a"*32)/"daily-last-run.json").read_bytes()
+                other={**settings,"profiles":[{"name":"Two","directory":"Profile 1","offsetMinutes":0}]}
+                self.assertEqual(daily.run_queue(other,root,immediate=True,run_id="b"*32),0)
+                self.assertEqual((root/"runs"/("a"*32)/"daily-last-run.json").read_bytes(),original)
+                self.assertEqual(len(list((root/"jobs").glob("*/last-run.json"))),2)
+                self.assertEqual(daily.run_queue(settings,root,immediate=True,run_id="a"*32),0)
+                self.assertEqual(opened.call_count,2)
 
 
 if __name__ == "__main__":

@@ -26,11 +26,27 @@ If an earlier or manual queue is still active, the host keeps its new request
 queued while monitoring that queue. The startup acknowledgement deadline does
 not impose a total runtime limit on the existing work.
 
-The queue runs Profile 1, then Profile 2 after safe cleanup, then Profile 3.
+The default request runs Profile 1, then Profile 2 after safe cleanup, then Profile 3.
 The VM installation uses `profileStartPolicy: "completion"`; the former 04:30
 and 05:00 minimum times are removed. Existing start jitter is applied once to
 the beginning of the queue. Browser pacing, filters, cookies, macro selections,
 and actual profile directories remain in place.
+
+Profiles own independent checkpoints under `output/jobs/<profile-key>`; the key
+uses the browser data directory and actual profile directory, not its display
+name. `DailyGiveaways.py --profile-directory "Profile 1"` selects that configured
+profile without rewriting the catalog. `Run-VMNow.ps1 -ProfileDirectory "Profile 1"`
+makes the same selection through the installed VM entry point. Each profile's
+website settings, cookies, macro selection, and saved giveaway work remain in
+that browser storage. The userscript never needs an Edge profile name or VM setup.
+
+Each request owns `output/runs/<request-id>` and per-profile results. Convenience
+`last-run` files are current pointers; they do not replace those records. A new
+scheduled request is not suppressed because an earlier request finished on the
+same day. Overlapping host requests wait for the shared VM mutex, keeping their
+own identities. The host task permits request handlers to start independently;
+the mutex permits only one guest request owner. The generic runner also queues
+independent job configurations behind one foreground lock in the helper folder.
 
 ## Responsibilities
 
@@ -67,12 +83,24 @@ within 90 seconds. Cleanup failure preserves unfinished work and stops later
 profiles. A safely cleaned profile failure is recorded and the next profile
 can run. No browser process is killed and no saved state is discarded.
 
-The userscript keeps batch continuation and same-day processed-ID deduplication
-in the existing profile. Processing completion is **not proof of accepted entry**;
+The userscript durably saves discovered unfinished entries before opening tabs,
+and retains processed IDs across dates, reloads, and later scheduled requests.
+Unfinished entries can resume even when Goodreads has moved them off the first
+listing page. Previously attempted unfinished entries follow entries not yet
+attempted. Loading counts unfinished eligible entries toward the batch limit,
+so old processed rows cannot conceal later work. Processing completion is **not proof of accepted entry**;
 the report labels outcomes without reliable site confirmation as unconfirmed.
-An unfinished marker is never removed by installation or a VM restart. Inspect
-its report and owned windows before explicitly using the generic runner's
-`--clear-pending` after justified recovery.
+The generic runner recovers an interrupted job on the next cycle. It retains the
+old authentication token and verified browser identity before authorizing entry
+tabs. A dead browser owner (including PID reuse after a restart) can be retired
+with preserved evidence. A surviving listing retains a cleanup-only connection,
+stops keyboard authorization, and acknowledges closure of its own tabs before
+the next job starts. Recovery never kills browser processes or adopts ordinary
+windows. Unconfirmed ownership/cleanup remains a reported exception and is
+retried on the next cycle. Legacy markers lacking ownership data require one
+explicit migration review; new job checkpoints cannot be cleared with
+`--clear-pending`. The VM adapter manages readiness/report delivery and leaves
+profile work and recovery to the generic runner.
 
 Lost transport or frozen queue reporting produces a monitoring failure and
 leaves the VM running. It is not treated as elapsed-time proof of a website stall.
@@ -87,7 +115,7 @@ For a small live batch-transition check, temporarily request `entryLimit=5`
 and `batchEntryLimit=2` through the installed entry point (host settings
 `requestEntryLimit` and `requestBatchEntryLimit`). The same userscript then
 processes 2 + 2 + 1 entries per profile, keeping the total limit across refreshes
-and retaining same-day deduplication. It requires userscript 4.39 or later.
+and retaining durable deduplication. It requires userscript 4.39 or later.
 Limited checks never mark the full day's queue complete. Restore both temporary
 host settings after the request is accepted; normal runs retain their full batches.
 
@@ -133,7 +161,7 @@ installation. For an existing installation, `-Migrate -Enable` preserves its
 settings, checks the profile map, retires the obsolete restore/catch-up/manual
 controls, and updates the existing interactive task. It never clears pending
 work. KVP registry access must already be granted, or run the installer elevated
-once. Both normal tasks use `ExecutionTimeLimit=PT0S` and `IgnoreNew`.
+once. Both tasks use `ExecutionTimeLimit=PT0S`. The guest listener uses `IgnoreNew`; host request handlers may start independently and serialize actual VM work with their shared mutex.
 
 For a remote maintenance update, elevated host PowerShell can call
 `Update-VMWorkflow.ps1 -GuestCredential (Get-Credential)` with the dedicated
@@ -188,7 +216,10 @@ Run the Python/Node tests beside each source file, `Test-VMWorkflow.ps1`, and
 past former cutoffs, heartbeat/retry-only stalls, safe sequential transitions,
 startup reporting, transport integrity, and shutdown blockers.
 
-For controlled installed checks, a temporary host setting `requestEntryLimit: 1`
+For controlled installed checks, `Run-VMNow.ps1 -EntryLimit 1` requests at most
+one entry per selected profile without rewriting normal settings. The host
+entry point also accepts `-EntryLimit` and `-BatchEntryLimit` for temporary timed
+task checks. A temporary host setting `requestEntryLimit: 1`
 processes at most one entry per profile. The userscript must explicitly support
 that contract before any entry starts. Limited checks do not mark a full day as
 completed. **Remove this test setting before restoring the recurring schedule.**

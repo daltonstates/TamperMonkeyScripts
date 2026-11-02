@@ -67,11 +67,11 @@ $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($existing -and @($existing.Actions | Where-Object { $_.Arguments -like '*DailyGiveaways.py*' }).Count -eq 0) {
     throw 'An unrelated task already uses this name. It was not changed.'
 }
-$action = New-ScheduledTaskAction -Execute $pythonwPath -Argument ('"' + $runnerPath + '" --config "' + $settingsPath + '"') -WorkingDirectory $PSScriptRoot
+$action = New-ScheduledTaskAction -Execute $pythonwPath -Argument ('"' + $runnerPath + '" --recover-failures --config "' + $settingsPath + '"') -WorkingDirectory $PSScriptRoot
 $trigger = New-ScheduledTaskTrigger -Daily -At $parsedTime
 $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 $trigger.StartBoundary = $parsedTime.ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
-$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances Queue -ExecutionTimeLimit ([TimeSpan]::Zero)
 $scheduleText = (@(for ($i = 0; $i -lt $ProfileNames.Count; $i++) {
     $ProfileNames[$i] + ' ' + $parsedTime.AddMinutes($i * $SpacingMinutes).ToString('HH:mm')
 }) -join ', ')

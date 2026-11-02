@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-VERSION = "2026.11.02.2"
+VERSION = "2026.11.02.3"
 KVP_ROOT = r"SOFTWARE\Microsoft\Virtual Machine"
 REPORT_NAMES = ("vm-last-run.json", "vm-last-skip.json", "daily-last-run.json",
                 "daily-verification.json", "daily-incomplete.json", "helper-status.json", "installation.json")
@@ -73,6 +73,11 @@ def read_request():
             (type(value["batchEntryLimit"]) is not int or type(value.get("entryLimit")) is not int
              or not 1 <= value["batchEntryLimit"] <= value["entryLimit"])):
         raise ValueError("Invalid host Goodreads request")
+    profiles = value.get("profileDirectories")
+    if profiles is not None and (not isinstance(profiles, list) or not 1 <= len(profiles) <= 20
+            or any(not isinstance(item, str) or not re.fullmatch(r"Default|Profile \d+", item) for item in profiles)
+            or len(set(profiles)) != len(profiles)):
+        raise ValueError("Invalid requested profile selection")
     return value
 
 
@@ -89,7 +94,10 @@ def publish(output, report, *, eligibility=None):
     files = {"vm-last-run.json": report}
     warnings = []
     for name in REPORT_NAMES[1:]:
-        path = output / name
+        queue_output = Path(report.get("queueDirectory", output))
+        path = queue_output / name if name.startswith("daily-") else output / name
+        if name == "daily-incomplete.json":
+            path = output / name
         if path.is_file():
             try:
                 files[name] = read_json(path)
@@ -101,8 +109,8 @@ def publish(output, report, *, eligibility=None):
             files["helper-status.json"] = read_json(helper / "helper-status.json")
         except (OSError, ValueError) as error:
             warnings.append({"file": "helper-status.json", "reason": str(error)})
-    for name, path in (("daily.log", output / "daily.log"),
-                       ("vm-runner.log", output / "vm-runner.log"), ("helper.log", helper / "helper.log")):
+    for name, path in (("daily.log", Path(report.get("queueDirectory", output)) / "daily.log"),
+                       ("vm-runner.log", Path(report.get("queueDirectory", output)) / "vm-runner.log"), ("helper.log", helper / "helper.log")):
         if path.is_file():
             with path.open("rb") as handle:
                 handle.seek(max(0, path.stat().st_size - 12000))
@@ -157,8 +165,18 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
     output = Path(settings["dailySettings"]).parent
     output.mkdir(parents=True, exist_ok=True)
     request = request or {"runId": uuid.uuid4().hex, "mode": "verify" if verify_only else "repeat" if run_now else "scheduled"}
+    if not re.fullmatch(r"[a-f0-9]{32}", request.get("runId", "")):
+        raise ValueError("Invalid request identity")
+    previous = output / "requests" / (request["runId"] + ".json")
+    if previous.exists():
+        result = read_json(previous)
+        if publisher:
+            publisher(output, result, eligibility=shutdown_eligibility(settings))
+        return 0 if result["state"] in {"finished", "verified", "skipped"} else 1
+    run_output = output / "runs" / request["runId"]
+    run_output.mkdir(parents=True, exist_ok=True)
     report = {"runId": request["runId"], "startedAt": utc_now(), "state": "starting", "adapterVersion": VERSION,
-              "verificationOnly": verify_only, "manualRun": run_now, "entryLimit": request.get("entryLimit"),
+              "verificationOnly": verify_only, "manualRun": run_now, "entryLimit": request.get("entryLimit"), "queueDirectory": str(run_output),
               "batchEntryLimit": request.get("batchEntryLimit"),
               "note": "Processed entries are not independently confirmed as accepted by Goodreads."}
     report_path = output / "vm-last-run.json"
@@ -167,6 +185,7 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
     child = None
     def emit():
         report["updatedAt"] = utc_now()
+        write_report(run_output / "vm-last-run.json", report)
         write_report(report_path, report)
         if publisher:
             publisher(output, report, eligibility=report.get("shutdown"))
@@ -179,15 +198,19 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
         report["interactiveUser"] = os.environ.get("USERNAME")
         if settings.get("enabled") is not True and not verify_only:
             report.update(state="skipped", reason="Guest workflow is disabled in guest-settings.json")
-        elif (not verify_only and not run_now and success_path.exists()
-              and read_json(success_path).get("localDate") == today):
-            report.update(state="skipped", reason="Already completed today's queue")
         else:
             daily_settings = read_json(Path(settings["dailySettings"]))
+            profiles = request.get("profileDirectories")
+            if profiles:
+                if not set(profiles).issubset({item["directory"] for item in daily_settings["profiles"]}):
+                    raise ValueError("A requested profile is not configured")
+                expected_profiles = [item for item in daily_settings["profiles"] if item["directory"] in profiles]
+            else:
+                expected_profiles = daily_settings["profiles"]
             if daily_settings.get("closeCompletedListings") is not True:
                 raise RuntimeError("Safe listing cleanup must be enabled")
             command = [sys.executable, settings["dailyRunner"], "--config", settings["dailySettings"],
-                       "--requested", "--run-id", report["runId"]]
+                       "--requested", "--run-id", report["runId"], "--output-directory", str(run_output)]
             if verify_only:
                 command.append("--verify-only")
             if settings.get("recoverFailedProfiles") is True:
@@ -196,6 +219,8 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
                 command += ["--entry-limit", str(request["entryLimit"])]
             if request.get("batchEntryLimit"):
                 command += ["--batch-entry-limit", str(request["batchEntryLimit"])]
+            for directory in profiles or []:
+                command += ["--profile-directory", directory]
             # A sleeping guest display hides browser pages and removes their
             # authenticated keyboard target. Keep both display and system awake
             # through queue pacing; restore the power request in finally.
@@ -204,7 +229,7 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
             report["powerRequest"] = {"systemRequired": True, "displayRequired": True}
             report["state"] = "running"
             emit()
-            with (output / "vm-runner.log").open("a", encoding="utf-8") as log:
+            with (run_output / "vm-runner.log").open("a", encoding="utf-8") as log:
                 child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
                                          creationflags=subprocess.CREATE_NO_WINDOW)
                 launch_clock = time.monotonic()
@@ -213,7 +238,7 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
                 monitoring_seconds = daily_settings.get("inactivityMinutes", 15) * 60
                 while child.poll() is None:
                     # The generic queue owns inactivity and safe cleanup.
-                    daily_path = output / ("daily-verification.json" if verify_only else "daily-last-run.json")
+                    daily_path = run_output / ("daily-verification.json" if verify_only else "daily-last-run.json")
                     read_error = None
                     try:
                         current = read_json(daily_path)
@@ -247,11 +272,11 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
                     emit()
                     time.sleep(5)
                 result = child.wait()
-            daily = read_json(output / ("daily-verification.json" if verify_only else "daily-last-run.json"))
+            daily = read_json(run_output / ("daily-verification.json" if verify_only else "daily-last-run.json"))
             profiles = daily.get("profiles", [])
             if (daily.get("runId") != report["runId"] or not daily.get("endedAt")
                     or datetime.fromisoformat(daily["startedAt"]) < datetime.fromisoformat(report["startedAt"])
-                    or len(profiles) != len(daily_settings["profiles"])):
+                    or len(profiles) != len(expected_profiles)):
                 raise RuntimeError(daily.get("reason") or "The queue did not produce a current complete profile report")
             expected = "verified" if verify_only else "finished"
             closed = all(p.get("listingClosed") is True for p in profiles) and not (output / "daily-incomplete.json").exists()
@@ -330,7 +355,7 @@ def main():
                 report = read_json(previous)
                 report["shutdown"] = shutdown_eligibility(settings)
                 publish(output, report, eligibility=report["shutdown"])
-                return 0
+                return 0 if report["state"] in {"finished", "verified", "skipped"} else 1
             return run(settings, verify_only=args.verify_only or bool(request and request["mode"] == "verify"),
                        run_now=args.run_now or bool(request and request["mode"] == "repeat"), request=request,
                        keep_running=args.keep_running, publisher=publish)

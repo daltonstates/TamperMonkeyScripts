@@ -354,7 +354,8 @@ function createPage({
         const value = JSON.parse(options.data);
         dailyRequests.push(value);
         schedule(() => {
-          if (dailyFailure === "offline") return options.onerror();
+          const failure = typeof dailyFailure === "function" ? dailyFailure(value) : dailyFailure;
+          if (failure === "offline") return options.onerror();
           const response = {
             protocol: 1,
             mode:
@@ -365,9 +366,9 @@ function createPage({
               dailyCloseListing &&
               ["finished", "verified"].includes(value.state),
             cancel:
-              ["cancel", "cleanup"].includes(dailyFailure) &&
+              ["cancel", "cleanup"].includes(failure) &&
               value.state === "running",
-            closeRunTabs: dailyFailure === "cleanup",
+            closeRunTabs: failure === "cleanup",
           };
           options.onload({
             status: 200,
@@ -783,7 +784,111 @@ test("checking auto-open starts immediately and saves the choice for future visi
     true,
   );
   await nextPage.advanceAsync(1250);
-  assert.equal(nextPage.openedTabs.length, 1);
+  assert.equal(nextPage.openedTabs.length, 2);
+  assert.deepEqual(nextPage.openedTabs.map(tab => new URL(tab.href).pathname), [
+    "/giveaway/enter_choose_address/2", "/giveaway/enter_choose_address/1",
+  ]);
+});
+
+test("a fresh scheduled cycle resumes unfinished work across days without replaying completed entries", async () => {
+  const first = dailyPage({listing:{pages:[[1,2,3]]}});
+  await first.advanceAsync(1500);
+  assert.equal(first.openedTabs.length,1);
+  first.openedTabs[0].close();
+  await first.flush();
+  const saved=JSON.parse(first.stored.get("gr_giveaway_work"));
+  assert.deepEqual(saved.processed,["1"]);
+  assert.deepEqual(saved.pending.map(item=>item.id),["2","3"]);
+  // No session continuation survives a reboot, and book 2 is no longer in the
+  // first rendered list. Durable profile work supplies it independently.
+  const next=dailyPage({stored:first.stored,startTime:first.now+3*86400000,
+    listing:{pages:[[3,4]]},dailyResponse:()=>({entryLimit:3})});
+  await next.advanceAsync(1500);
+  const ids=[];
+  for(let i=0;i<3;i++){
+    assert.ok(next.openedTabs[i]);ids.push(new URL(next.openedTabs[i].href).pathname.split("/").at(-1));
+    next.openedTabs[i].close();await next.flush();
+  }
+  assert.deepEqual(new Set(ids),new Set(["2","3","4"]));
+  assert.equal(next.dailyRequests.at(-1).metrics.processed,3);
+  assert.equal(JSON.parse(next.stored.get("gr_giveaway_work")).pending.length,0);
+});
+
+test("legacy processed IDs migrate even when they were saved on an earlier date", async () => {
+  const page=dailyPage({stored:new Map([
+    ["gr_keyfire_enabled","1"],["gr_keyfire_settings",JSON.stringify(exampleKeyfireSettings)],
+    ["gr_daily_processed",JSON.stringify({day:"2000-01-01",ids:["1"]})],
+  ]),listing:{pages:[[1,2]]}});
+  await page.advanceAsync(1500);
+  assert.equal(page.openedTabs.length,1);
+  assert.equal(new URL(page.openedTabs[0].href).pathname,"/giveaway/enter_choose_address/2");
+  page.openedTabs[0].close();await page.flush();
+  assert.deepEqual(JSON.parse(page.stored.get("gr_giveaway_work")).processed,["1","2"]);
+});
+
+test("saved work is isolated by browser storage and never requires a profile name", async () => {
+  const a=dailyPage({listing:{pages:[[1]]}});await a.advanceAsync(1500);
+  a.openedTabs[0].close();await a.flush();
+  const b=dailyPage({listing:{pages:[[1]]}});await b.advanceAsync(1500);
+  assert.equal(b.openedTabs.length,1);
+  assert.equal(JSON.parse(a.stored.get("gr_giveaway_work")).processed[0],"1");
+  assert.deepEqual(JSON.parse(b.stored.get("gr_giveaway_work")).processed,[]);
+});
+
+test("unreadable saved work is preserved and cannot silently start a fresh queue", async () => {
+  const stored=new Map([["gr_keyfire_enabled","1"],["gr_keyfire_settings",JSON.stringify(exampleKeyfireSettings)],
+    ["gr_giveaway_work","{broken"]]);
+  const page=dailyPage({stored,listing:{pages:[[1,2]]}});await page.advanceAsync(2000);
+  assert.equal(page.openedTabs.length,0);
+  assert.equal(stored.get("gr_giveaway_work"),"{broken");
+  assert.match(page.dailyRequests.at(-1).reason,/unreadable/);
+});
+
+test("completed rows at the front of a later cycle do not hide unfinished pages", async () => {
+  const done=Array.from({length:100},(_,i)=>String(i+1));
+  const page=dailyPage({stored:new Map([["gr_keyfire_enabled","1"],["gr_keyfire_settings",JSON.stringify(exampleKeyfireSettings)],
+    ["gr_giveaway_work",JSON.stringify({schema:1,processed:done,pending:[],today:{day:"2000-01-01",ids:[]}})]]),
+    listing:{pages:[done.map(Number),[101,102,103]]}});
+  await page.advanceAsync(2500);
+  assert.equal(page.paginationClicks,1);
+  assert.equal(new URL(page.openedTabs[0].href).pathname,"/giveaway/enter_choose_address/101");
+});
+
+test("ninety independent cycles retain work without daily resets or session continuation", async () => {
+  let stored=new Map([["gr_keyfire_enabled","1"],["gr_keyfire_settings",JSON.stringify(exampleKeyfireSettings)]]);
+  for(let cycle=0;cycle<90;cycle++){
+    if(stored.has("gr_giveaway_work")){
+      const work=JSON.parse(stored.get("gr_giveaway_work"));work.today={day:"2000-01-01",ids:[]};
+      stored.set("gr_giveaway_work",JSON.stringify(work));
+    }
+    const id=cycle+1000;
+    const page=dailyPage({stored,listing:{pages:[[1000,id]]},dailyResponse:()=>({entryLimit:1})});
+    await page.advanceAsync(1500);
+    assert.equal(page.openedTabs.length,1);
+    assert.equal(new URL(page.openedTabs[0].href).pathname,`/giveaway/enter_choose_address/${id}`);
+    page.openedTabs[0].close();await page.flush();
+    assert.equal(page.dailyRequests.at(-1).metrics.processed,1);
+    stored=page.stored;
+  }
+  assert.equal(JSON.parse(stored.get("gr_giveaway_work")).processed.length,90);
+});
+
+test("a lost coordinator can return for cleanup without reauthorizing keyboard work", async () => {
+  let phase="online";
+  const page=dailyPage({href:`https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    listing:{pages:[[1,2]]},dailyFailure:()=>phase==="offline"?"offline":null,
+    dailyResponse:value=>phase==="recover"&&value.state==="failed"?{cancel:true,closeRunTabs:true}:
+      phase==="recover"&&value.state==="cleanup-ready"?{cancel:false,closeListing:true}:{}});
+  await page.advanceAsync(1500);page.openedTabs[0].close();await page.flush();
+  phase="offline";await page.advanceAsync(5500);
+  const opened=page.openedTabs.length;
+  assert.equal(page.dailyRequests.at(-1).state,"failed");
+  phase="recover";await page.advanceAsync(31000);
+  assert.equal(page.openedTabs.length,opened);
+  assert.ok(page.openedTabs.every(tab=>tab.closed));
+  assert.equal(page.closeCount,1);
+  assert.deepEqual(JSON.parse(page.stored.get("gr_giveaway_work")).processed,["1"]);
+  assert.equal(page.dailyRequests.at(-1).state,"cleanup-ready");
 });
 
 test("automatic startup accepts reordered query parameters and a fragment", async () => {
@@ -1774,7 +1879,7 @@ test("background batches wait for all tabs to close before refreshing", async ()
   assert.equal(page.navigations.length, 1);
 });
 
-test("a refreshed batch skips previously opened books and stops if no progress is possible", async () => {
+test("a refreshed batch loads past processed rows and continues with unfinished books", async () => {
   const first = keyfirePage({ pages: giveawayPages(1, 200) });
   await first.advanceAsync(4500);
   await closeBatch(first, 100);
@@ -1784,12 +1889,13 @@ test("a refreshed batch skips previously opened books and stops if no progress i
     sessionStored: first.sessionStored,
     listing: { pages: giveawayPages(1, 200) },
   });
-  await next.advanceAsync(4500);
-  assert.equal(next.cards.length, 100);
-  assert.equal(next.openedTabs.length, 0);
+  await next.advanceAsync(6500);
+  assert.equal(next.cards.length, 200);
+  assert.equal(next.openedTabs.length, 1);
+  assert.equal(new URL(next.openedTabs[0].href).pathname,"/giveaway/enter_choose_address/101");
   assert.equal(next.navigations.length, 0);
   assert.equal(next.sessionStored.has("gr_giveaway_continuation"), false);
-  assert.match(next.alerts.join(" "), /no new|same giveaways/i);
+  assert.deepEqual(next.alerts,[]);
 });
 
 test("a manual full run resumes after refresh even with Auto on load off", async () => {

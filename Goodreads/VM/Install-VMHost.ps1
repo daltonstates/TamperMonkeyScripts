@@ -48,7 +48,7 @@ $trigger = New-ScheduledTaskTrigger -Daily -At $startAt
 # https://learn.microsoft.com/windows/win32/api/taskschd/nf-taskschd-itrigger-put_startboundary
 $trigger.StartBoundary = $startAt.ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$taskSettings = New-ScheduledTaskSettingsSet -WakeToRun -MultipleInstances Parallel -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description 'Request the Goodreads queue at 04:00 Eastern, including an already-running VM. Export reports live and shut down only after report delivery and designated-job checks.' -Force | Out-Null
 if (-not $Enable -and (-not $existing -or [string]$existing.State -eq 'Disabled')) { Disable-ScheduledTask -TaskName $taskName | Out-Null }
 if ($Enable) {

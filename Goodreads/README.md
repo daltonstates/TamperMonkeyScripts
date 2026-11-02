@@ -418,17 +418,23 @@ work in separate windows. Profile sign-ins and other browser windows are preserv
 Setup verification also checks this closure without submitting entries. Older
 settings without this option retain their existing behavior until reinstalled.
 
-If a managed listing fails, stalls, or cannot close, `daily-incomplete.json` blocks
-later automatic runs, including after a restart. Inspect and close the unfinished
-giveaway tabs, fix the recorded problem, then explicitly clear the marker:
+The userscript saves unfinished giveaway work before opening tabs and retains
+processed IDs across dates. A later request resumes what remains, even when the
+book is no longer on the first listing page. Each browser storage keeps its own
+work; the userscript does not need a profile name or VM configuration.
 
-```powershell
-python Goodreads/DailyGiveaways.py --config "$env:LOCALAPPDATA\GoodreadsKeyfireCompanion\daily-settings.json" --clear-pending
-```
+The runner keeps independent profile checkpoints under `jobs` and request reports
+under `runs/<request-id>`. `--profile-directory "Profile 1"` selects one configured
+profile without rewriting the others. Independent schedules wait for the shared
+foreground keyboard lock. One profile's macro is validated when that profile
+connects; an unused catalog default does not control other accounts.
 
-Clearing the marker does not open or close a browser. Verify the profiles again
-before resuming unattended runs. Reports from completed attempts are also kept in
-the `history` folder beside the current report.
+After a worker interruption, the next cycle retires a verified dead browser owner
+or reconnects to the old listing for authenticated cleanup before starting new
+work. It preserves recovery evidence. Unknown ownership or unconfirmed cleanup
+remains a reported exception and is retried next cycle. New profile checkpoints
+do not require manual marker clearing. Legacy markers without ownership data
+still require one explicit review before migration.
 
 The runner records failure if a userscript does not connect within two minutes,
 useful progress or contact stalls for `inactivityMinutes` (default 15), the user
@@ -441,8 +447,9 @@ cannot be reached. A background tab can delay this check until its next timer.
 The local status endpoint is `127.0.0.1:17385`; each account uses a fresh temporary
 token in its URL fragment. It accepts only the active token and expected origins.
 
-Read `%LOCALAPPDATA%\GoodreadsKeyfireCompanion\daily-last-run.json` for the last
-run, `daily-verification.json` for setup checks, and `daily.log` for diagnostics.
+Read `%LOCALAPPDATA%\GoodreadsKeyfireCompanion\daily-last-run.json` for the current
+pointer, and `runs/<request-id>` for that request's report and diagnostic log.
+Earlier request and profile results are retained independently.
 Goodreads' explicit no-results page finishes with zero entries, allowing the next account to run.
 The report's `plannedStarts` records that run's selected times and random delays.
 `--now` runs and setup-only verification bypass the random delays.
