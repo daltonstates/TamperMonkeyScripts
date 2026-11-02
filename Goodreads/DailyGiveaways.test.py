@@ -963,6 +963,44 @@ class FailureRecoveryTests(unittest.TestCase):
 
 
 class DurableProfileJobsTests(unittest.TestCase):
+    def startup_retry(self, second_connects):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);server=MagicMock();window=MagicMock();window.closed.return_value=True
+            elapsed=[0.0];sessions=[];commands=[];real_session=daily.Session
+            settings={"startAt":"04:00","edgePath":"edge.exe","userDataDirectory":folder,
+                      "closeCompletedListings":True,"profiles":[{"name":"One","directory":"Default","offsetMinutes":0}]}
+            def make_session(*args,**kwargs):
+                session=real_session(*args,**kwargs,clock=lambda:elapsed[0]);sessions.append(session);return session
+            def launch(command):
+                commands.append(command)
+                if len(commands)==2 and second_connects:
+                    old,current=sessions
+                    self.assertTrue(old.event({"token":old.token,"state":"ready"})["cancel"])
+                    with self.assertRaises(ValueError):current.event({"token":old.token,"state":"ready"})
+                    current.event({"token":current.token,"state":"ready","windowTag":current.window_tag,
+                                   "closeListingSupported":True})
+                    current.event({"token":current.token,"state":"finished","metrics":{"processed":1,"loaded":1,"open":0}})
+            with patch.object(daily,"Server",return_value=server),patch.object(daily,"ListingWindow",return_value=window),\
+                 patch.object(daily,"Session",side_effect=make_session),patch.object(daily,"desktop_available",return_value=True),\
+                 patch.object(daily.subprocess,"Popen",side_effect=launch),\
+                 patch.object(daily.time,"sleep",side_effect=lambda seconds:elapsed.__setitem__(0,elapsed[0]+seconds)):
+                result=daily.run_queue(settings,root,immediate=True)
+            self.assertEqual(len(commands),2)
+            self.assertNotEqual(sessions[0].token,sessions[1].token)
+            self.assertNotEqual(sessions[0].window_tag,sessions[1].window_tag)
+            self.assertEqual(len(list((root/"jobs").glob("*/history/*-unadmitted.json"))),1)
+            report=json.loads((root/"daily-last-run.json").read_text())
+            self.assertFalse(report["profiles"][0]["startupAttempts"][0]["entryAuthorizationGranted"])
+            self.assertEqual(result,0 if second_connects else 1)
+            self.assertLessEqual(elapsed[0],250)
+            self.assertEqual((root/"daily-incomplete.json").exists(),not second_connects)
+
+    def test_unconnected_startup_retries_once_without_authorizing_a_late_first_window(self):
+        self.startup_retry(True)
+
+    def test_two_unconnected_launches_stop_with_their_evidence_preserved(self):
+        self.startup_retry(False)
+
     def test_cached_startup_failure_with_no_profiles_still_returns_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);run_id="a"*32

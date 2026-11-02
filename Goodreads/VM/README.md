@@ -27,6 +27,12 @@ queued while monitoring that queue. The startup acknowledgement deadline does
 not impose a total runtime limit on the existing work.
 
 The default request runs Profile 1, then Profile 2 after safe cleanup, then Profile 3.
+An owned queue retries a completely unconnected profile launch once. It archives
+the unadmitted attempt and replaces its token before the retry, so a late first
+window cannot receive permission to open entry tabs. Unidentified windows are
+preserved. Focus or identity failures after a connection still use the existing
+authenticated cleanup checks.
+
 The VM installation uses `profileStartPolicy: "completion"`; the former 04:30
 and 05:00 minimum times are removed. Existing start jitter is applied once to
 the beginning of the queue. Browser pacing, filters, cookies, macro selections,

@@ -26,7 +26,7 @@ import uuid
 from KeyfireGiveaways import Settings, read_config, read_workflow
 
 PORT = 17385
-VERSION = "2026.11.02.3"
+VERSION = "2026.11.02.4"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
@@ -910,55 +910,71 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
                 item.update(state="failed", reason="Windows is locked or has no interactive desktop.")
                 persist_report()
                 break
-            tag = secrets.token_hex(16) if settings.get("closeCompletedListings") else None
-            item["windowTag"] = tag
-            listing = ListingWindow(tag, settings["edgePath"]) if tag else None
-            session = Session(profile, verify, listing=listing, window_tag=tag,
-                              recover_failures=recover_failures,
-                              inactivity_minutes=settings.get("inactivityMinutes", 15), entry_limit=entry_limit, batch_entry_limit=batch_entry_limit,
-                              keyfire_config=settings.get("keyfireConfig"))
-            job_directory = profile_job_directory(settings, profile, state_root)
-            checkpoint_path = job_directory / "active.json"
-            record = {"schema": 1, "runId": run_id, "profile": dict(profile), "token": session.token,
-                      "windowTag": tag, "worker": process_identity(os.getpid()), "startedAt": report["startedAt"]}
-            checkpoint_lock = threading.Lock()
-            def checkpoint(current, target_listing=listing, target_path=checkpoint_path,
-                           target_record=record, target_lock=checkpoint_lock):
-                if not target_listing:
-                    return
-                with target_lock:
-                    target_record.update(state=current.state, counters=dict(current.counters), updatedAt=datetime.now().astimezone().isoformat())
-                    owner = target_listing.checkpoint() if current.state in {"waiting","ready","running"} and hasattr(target_listing, "checkpoint") else None
-                    if isinstance(owner, dict):
-                        target_record["windowOwner"] = owner
-                    save_report(target_path, target_record)
-            session.checkpoint = checkpoint
-            server.session = session
-            if listing:
-                checkpoint(session)
-                save_report(pending_path, {"startedAt": report["startedAt"], "profile": profile["name"],
-                                           "runId": run_id, "windowTag": tag,
-                                           "reason": "The scheduled window has not been confirmed closed."})
-            logging.info("Starting %s (%s)", profile["name"], profile["directory"])
-            item["startedAt"] = datetime.now().astimezone().isoformat()
-            persist_report()
-            subprocess.Popen([settings["edgePath"], f'--user-data-dir={settings["userDataDirectory"]}',
-                              f'--profile-directory={profile["directory"]}', "--new-window",
-                              LIST_URL + "#grDailyToken=" + session.token
-                              + ("&grDailyWindow=" + tag if tag else "")])
-            while session.state not in TERMINAL:
-                session.check_deadlines()
-                if session.state not in TERMINAL and not desktop_available():
-                    with session.lock:
-                        session.state, session.reason = "failed", "Windows was locked during the run."
-                with session.lock:
-                    item.update(state=session.state, progress=session.progress, counters=dict(session.counters),
-                                lastUsefulAt=session.last_useful_at,
-                                inactivitySeconds=round(max(0, session.clock() - session.last_progress), 1))
+            for startup_attempt in range(2):
+                tag = secrets.token_hex(16) if settings.get("closeCompletedListings") else None
+                item["windowTag"] = tag
+                listing = ListingWindow(tag, settings["edgePath"]) if tag else None
+                session = Session(profile, verify, listing=listing, window_tag=tag,
+                                  recover_failures=recover_failures,
+                                  inactivity_minutes=settings.get("inactivityMinutes", 15), entry_limit=entry_limit, batch_entry_limit=batch_entry_limit,
+                                  keyfire_config=settings.get("keyfireConfig"))
+                job_directory = profile_job_directory(settings, profile, state_root)
+                checkpoint_path = job_directory / "active.json"
+                record = {"schema": 1, "runId": run_id, "profile": dict(profile), "token": session.token,
+                          "windowTag": tag, "worker": process_identity(os.getpid()), "startedAt": report["startedAt"]}
+                checkpoint_lock = threading.Lock()
+                def checkpoint(current, target_listing=listing, target_path=checkpoint_path,
+                               target_record=record, target_lock=checkpoint_lock):
+                    if not target_listing:
+                        return
+                    with target_lock:
+                        target_record.update(state=current.state, counters=dict(current.counters), updatedAt=datetime.now().astimezone().isoformat())
+                        owner = target_listing.checkpoint() if current.state in {"waiting","ready","running"} and hasattr(target_listing, "checkpoint") else None
+                        if isinstance(owner, dict):
+                            target_record["windowOwner"] = owner
+                        save_report(target_path, target_record)
+                session.checkpoint = checkpoint
+                server.session = session
+                if listing:
                     checkpoint(session)
-                report["updatedAt"] = datetime.now().astimezone().isoformat()
+                    save_report(pending_path, {"startedAt": report["startedAt"], "profile": profile["name"],
+                                               "runId": run_id, "windowTag": tag,
+                                               "reason": "The scheduled window has not been confirmed closed."})
+                logging.info("Starting %s (%s)", profile["name"], profile["directory"])
+                item.setdefault("startedAt", datetime.now().astimezone().isoformat())
                 persist_report()
-                time.sleep(1)
+                subprocess.Popen([settings["edgePath"], f'--user-data-dir={settings["userDataDirectory"]}',
+                                  f'--profile-directory={profile["directory"]}', "--new-window",
+                                  LIST_URL + "#grDailyToken=" + session.token
+                                  + ("&grDailyWindow=" + tag if tag else "")])
+                while session.state not in TERMINAL:
+                    session.check_deadlines()
+                    if session.state not in TERMINAL and not desktop_available():
+                        with session.lock:
+                            session.state, session.reason = "failed", "Windows was locked during the run."
+                    with session.lock:
+                        item.update(state=session.state, progress=session.progress, counters=dict(session.counters),
+                                    lastUsefulAt=session.last_useful_at,
+                                    inactivitySeconds=round(max(0, session.clock() - session.last_progress), 1))
+                        checkpoint(session)
+                    report["updatedAt"] = datetime.now().astimezone().isoformat()
+                    persist_report()
+                    time.sleep(1)
+                if (startup_attempt == 0 and listing and session.state == "failed"
+                        and session.window_binding is None and session.last_seen == session.started
+                        and session.reason.startswith("Userscript did not connect;")):
+                    # No ready response ever authorized this attempt. Replace
+                    # its token before retrying so a late first window cannot
+                    # join the new attempt or start a second keyboard workflow.
+                    attempt = {"state": "unadmitted", "windowTag": tag, "reason": session.reason,
+                               "entryAuthorizationGranted": False,
+                               "windowHandling": "Unidentified listing preserved; no entry tabs were authorized."}
+                    save_report(job_directory / "history" / (run_key + "-" + tag + "-unadmitted.json"),
+                                {**record, "recovery": attempt})
+                    item.setdefault("startupAttempts", []).append(attempt)
+                    logging.warning("%s: retrying its unadmitted startup once with a new token", profile["name"])
+                    continue
+                break
             item.update(state=session.state, reason=session.reason, progress=session.progress,
                         endedAt=datetime.now().astimezone().isoformat(), counters=dict(session.counters),
                         lastUsefulAt=session.last_useful_at)
