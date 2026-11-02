@@ -54,7 +54,7 @@ foreach($name in @('Goodreads acceptance restore','Goodreads maintenance catch-u
                 Start-Sleep -Milliseconds 250
             }while($true)
         }
-        if($old){Disable-ScheduledTask -TaskName $name|Out-Null}
+        if($old -and [string]$old.State -ne 'Disabled'){Disable-ScheduledTask -TaskName $name|Out-Null}
     }
 }
 $daily=if(Test-Path -LiteralPath $dailyPath){Get-Content -LiteralPath $dailyPath -Raw|ConvertFrom-Json}else{Get-Content -LiteralPath (Join-Path $root 'daily-settings.template.json') -Raw|ConvertFrom-Json}
