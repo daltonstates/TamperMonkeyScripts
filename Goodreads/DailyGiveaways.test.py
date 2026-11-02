@@ -963,6 +963,17 @@ class FailureRecoveryTests(unittest.TestCase):
 
 
 class DurableProfileJobsTests(unittest.TestCase):
+    def test_cached_startup_failure_with_no_profiles_still_returns_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);run_id="a"*32
+            daily.save_report(root/"runs"/run_id/"daily-last-run.json", {
+                "runId":run_id,"state":"blocked","endedAt":"2026-11-02T12:00:00-05:00","profiles":[]})
+            with patch.object(daily.sys,"argv",["DailyGiveaways.py","--config",str(root/"settings.json"),"--run-id",run_id]),\
+                 patch.object(daily,"read_settings",return_value={"profiles":[{"directory":"Default"}]}),\
+                 patch.object(daily.logging,"basicConfig"),patch.object(daily.subprocess,"Popen") as launch:
+                self.assertEqual(daily.main(),1)
+                launch.assert_not_called()
+
     def fixture(self, root):
         settings = {"startAt":"04:00", "edgePath":"edge.exe", "userDataDirectory":str(root),
                     "closeCompletedListings":True, "profiles":[{"name":"Account", "directory":"Default", "offsetMinutes":0}]}

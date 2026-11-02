@@ -849,7 +849,7 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
     if durable_report.exists():
         previous = json.loads(durable_report.read_text(encoding="utf-8-sig"))
         if previous.get("endedAt"):
-            return 0 if len(previous.get("profiles", [])) == len(settings["profiles"]) and all(
+            return 0 if previous.get("state") not in {"failed", "blocked"} and len(previous.get("profiles", [])) == len(settings["profiles"]) and all(
                 item.get("state") in {"finished", "verified"} for item in previous["profiles"]) else 1
         save_report(durable_report.parent / "attempts" / (run_started.strftime("%Y%m%d-%H%M%S-%f") + ".json"), previous)
     def persist_report():
@@ -1062,7 +1062,8 @@ def main():
         # competing keyboard helpers.
         if report_path.exists() and json.loads(report_path.read_text(encoding="utf-8-sig")).get("endedAt"):
             previous = json.loads(report_path.read_text(encoding="utf-8-sig"))
-            return 0 if all(item.get("state") in {"finished", "verified"} for item in previous.get("profiles", [])) else 1
+            return 0 if previous.get("state") not in {"failed", "blocked"} and len(previous.get("profiles", [])) == len(settings["profiles"]) and all(
+                item.get("state") in {"finished", "verified"} for item in previous.get("profiles", [])) else 1
         with foreground_queue_lock(shared_lock, report_path, args.run_id, args.verify_only), desktop_power_request():
             pythonw = Path(sys.executable).with_name("pythonw.exe")
             subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
