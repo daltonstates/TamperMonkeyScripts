@@ -854,6 +854,18 @@ test("completed rows at the front of a later cycle do not hide unfinished pages"
   assert.equal(new URL(page.openedTabs[0].href).pathname,"/giveaway/enter_choose_address/101");
 });
 
+test("saved work preserves titled entry routes and resumes them without a session", async () => {
+  const page=dailyPage({listing:{pages:[[{id:"123-a-book-title"},{id:"456-another-title/"}]]}});
+  await page.advanceAsync(1500);
+  assert.equal(new URL(page.openedTabs[0].href).pathname,"/giveaway/enter_choose_address/123-a-book-title");
+  page.openedTabs[0].close();await page.flush();
+  page.window.emit("pagehide");
+  const resumed=dailyPage({stored:page.stored,listing:{pages:[[123,456]]}});
+  await resumed.advanceAsync(1500);
+  assert.equal(new URL(resumed.openedTabs[0].href).pathname,"/giveaway/enter_choose_address/456-another-title/");
+  assert.equal(JSON.parse(resumed.stored.get("gr_giveaway_work")).processed.includes("123"),true);
+});
+
 test("ninety independent cycles retain work without daily resets or session continuation", async () => {
   let stored=new Map([["gr_keyfire_enabled","1"],["gr_keyfire_settings",JSON.stringify(exampleKeyfireSettings)]]);
   for(let cycle=0;cycle<90;cycle++){

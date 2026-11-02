@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.43
+// @version      4.44
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -379,6 +379,12 @@
     return savedGiveawayWork().processed;
   }
 
+  function giveawayWorkPath(path) {
+    return typeof path === "string" ? path.match(
+      /^\/giveaway\/(enter_choose_address|enter_print_giveaway)\/(\d+)(?:-[^/?#]+)?\/?$/,
+    ) : null;
+  }
+
   function savedGiveawayWork() {
     const day = new Date().toLocaleDateString("en-CA");
     const validId = (id) => typeof id === "string" && /^\d+$/.test(id);
@@ -391,13 +397,14 @@
       if (saved && (saved.schema !== 1 || !Array.isArray(saved.processed) || !Array.isArray(saved.pending)))
         throw new Error("Unsupported saved giveaway work");
       if (saved && (!saved.processed.every(validId) || !saved.pending.every(item => validId(item?.id) &&
-          /^(enter_choose_address|enter_print_giveaway)$/.test(item.page))))
+          /^(enter_choose_address|enter_print_giveaway)$/.test(item.page) &&
+          (item.path === undefined || (giveawayWorkPath(item.path)?.[1] === item.page && giveawayWorkPath(item.path)?.[2] === item.id)))))
         throw new Error("Incomplete saved giveaway work");
       const processed = [...new Set([...(saved?.processed ?? []).filter(validId), ...legacyIds])];
       const done = new Set(processed);
       const pending = (saved?.pending ?? []).filter((item) => validId(item?.id) &&
         /^(enter_choose_address|enter_print_giveaway)$/.test(item.page) && !done.has(item.id))
-        .map((item) => ({id:item.id, page:item.page, attempts:Number.isSafeInteger(item.attempts) && item.attempts >= 0 ? item.attempts : 0}));
+        .map((item) => ({id:item.id, page:item.page, ...(item.path === undefined ? {} : {path:item.path}), attempts:Number.isSafeInteger(item.attempts) && item.attempts >= 0 ? item.attempts : 0}));
       const todayIds = saved?.today?.day === day && Array.isArray(saved.today.ids) ? saved.today.ids.filter(validId) : [];
       if (legacy?.day === day) todayIds.push(...legacyIds);
       return {schema:1, processed, pending, today:{day, ids:[...new Set(todayIds)]}};
@@ -418,15 +425,15 @@
     const known = new Set([...work.processed, ...work.pending.map((item) => item.id)]);
     for (const link of links) {
       const url = new URL(link);
-      const match = url.pathname.match(/^\/giveaway\/(enter_choose_address|enter_print_giveaway)\/(\d+)$/);
+      const match = giveawayWorkPath(url.pathname);
       if (url.origin !== "https://www.goodreads.com" || !match || known.has(match[2])) continue;
       known.add(match[2]);
-      work.pending.push({id:match[2],page:match[1],attempts:0});
+      work.pending.push({id:match[2],page:match[1],path:url.pathname,attempts:0});
     }
     saveGiveawayWork(work); // Persist discovery before any browser tab opens.
     initialGiveawayAttempts ??= new Map(work.pending.map((item) => [item.id,item.attempts]));
     return [...work.pending].sort((a,b) => (initialGiveawayAttempts.get(a.id) ?? 0)-(initialGiveawayAttempts.get(b.id) ?? 0))
-      .map((item) => `https://www.goodreads.com/giveaway/${item.page}/${item.id}`)
+      .map((item) => `https://www.goodreads.com${item.path ?? `/giveaway/${item.page}/${item.id}`}`)
       .filter((link) => !openedGiveawayLinks.has(link));
   }
 
