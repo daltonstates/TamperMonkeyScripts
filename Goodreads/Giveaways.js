@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.37
+// @version      4.38
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -1094,6 +1094,10 @@
       if (!isAutoOpenPage()) return;
       result.openedIds.forEach((id) => previouslyOpenedIds.add(id));
       try {
+        // React can clean launch metadata long after DOMContentLoaded. Restore
+        // it before saving the page key and reloading, so the next batch keeps
+        // the same authenticated queue, window identity and URL-only autoload.
+        restoreLaunchRequest();
         sessionStorage.setItem(
           SS_GIVEAWAY_CONTINUATION,
           JSON.stringify({

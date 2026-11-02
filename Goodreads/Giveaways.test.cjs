@@ -2687,6 +2687,49 @@ test("capped daily batches refresh with their token without reporting completion
   assert.equal(resumed.closeCount, 1);
 });
 
+test("late Goodreads URL cleanup cannot strip a scheduled batch continuation", async () => {
+  const token = "d".repeat(64);
+  const tag = "a".repeat(32);
+  const page = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}&autoload=1#grDailyToken=${token}&grDailyWindow=${tag}`,
+    dailyCloseListing: true,
+    listing: { pages: Array.from({ length: 4 }, (_, page) =>
+      Array.from({ length: 30 }, (_, index) => page * 30 + index + 1)) },
+  });
+  await page.advanceAsync(1500);
+  for (let index = 0; index < 90; index++) {
+    assert.ok(page.openedTabs[index]);
+    if (index === 89) {
+      // React can clean the listing URL long after the startup restoration.
+      page.window.history.replaceState(null, "", `https://www.goodreads.com${automaticListPath}`);
+    }
+    page.openedTabs[index].close();
+    await page.flush();
+  }
+  assert.equal(page.navigations.length, 1);
+  const next = new URL(page.navigations[0]);
+  assert.equal(next.searchParams.get("autoload"), "1");
+  const hash = new URLSearchParams(next.hash.slice(1));
+  assert.equal(hash.get("grDailyToken"), token);
+  assert.equal(hash.get("grDailyWindow"), tag);
+  assert.equal(page.dailyRequests.some(request => request.state === "finished"), false);
+  const continuation = JSON.parse(page.sessionStored.get("gr_giveaway_continuation"));
+  next.hash = "";
+  next.searchParams.sort();
+  assert.equal(continuation.page, next.href);
+  const resumed = dailyPage({
+    href: page.navigations[0], dailyCloseListing: true, stored: page.stored,
+    sessionStored: page.sessionStored, listing: { pages: [[91]] }, startTime: page.now,
+  });
+  await resumed.advanceAsync(1500);
+  assert.equal(resumed.openedTabs.length, 1);
+  resumed.openedTabs[0].close();
+  await resumed.advanceAsync(0);
+  assert.equal(resumed.dailyRequests.at(-1).state, "finished");
+  assert.equal(resumed.dailyRequests.at(-1).metrics.processed, 91);
+  assert.equal(resumed.closeCount, 1);
+});
+
 test("a saved macro connects automatically without a browser pairing key", async () => {
   const page = createPage({
     pathname: automaticListPath,
