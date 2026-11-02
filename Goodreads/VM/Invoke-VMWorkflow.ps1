@@ -5,7 +5,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 $reportDirectory=Join-Path $env:ProgramData 'GoodreadsGiveawaysVM\reports'
-$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.02.1';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
+$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.02.2';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
 $powerSet=$false
 $mutex=$null
 $ownsLock=$false
@@ -42,6 +42,7 @@ try {
     $report.vmStart=Start-GiveawaysMorningVM $settings
     $request=@{schema=1;runId=$report.runId;requestedAt=$report.startedAt;mode=$(if($VerifyOnly){'verify'}elseif($Repeat){'repeat'}else{'scheduled'})}
     if($settings.requestEntryLimit){$request.entryLimit=$settings.requestEntryLimit;$report.entryLimit=$settings.requestEntryLimit}
+    if($settings.requestBatchEntryLimit){$request.batchEntryLimit=$settings.requestBatchEntryLimit;$report.batchEntryLimit=$settings.requestBatchEntryLimit}
     $readyDeadline=[DateTimeOffset]::Now.AddMinutes(3)
     do {
         try {Set-GiveawaysRequest $settings $request;break}
@@ -54,6 +55,7 @@ try {
     $acknowledged=$false
     $waitingForQueue=$false
     do {
+        if([string](Get-OwnedGiveawaysVM $settings).State -ne 'Running'){throw 'The VM stopped before delivering its current final report.'}
         $bundle=Read-GiveawaysLiveReport $settings
         if(Test-GiveawaysOtherActiveQueue $bundle $report.runId){
             # An earlier/manual healthy queue owns the interactive task. Keep
@@ -131,6 +133,7 @@ try {
 } catch {
     $report.state='failed'
     $report.reason=$_.Exception.Message
+    $report.failureLocation=@{script=(Split-Path -Leaf $_.InvocationInfo.ScriptName);line=$_.InvocationInfo.ScriptLineNumber;stack=$_.ScriptStackTrace}
     $report.shutdownDecision=@{state='deferred';reason='The request failed; guest state was preserved for diagnosis.'}
 } finally {
     if($powerSet){[void][GoodreadsRequestPower]::SetThreadExecutionState([uint32]2147483648)}

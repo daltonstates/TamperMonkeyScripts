@@ -2773,6 +2773,45 @@ test("scheduled continuation retains progress through 1002 entries and late URL 
   assert.equal(processed, 1002);
 });
 
+test("a five-entry controlled request crosses 2+2+1 batches without counting earlier work", async () => {
+  let href = `https://www.goodreads.com${automaticListPath}&autoload=1#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`;
+  let stored = new Map([
+    ["gr_keyfire_enabled", "1"], ["gr_keyfire_settings", JSON.stringify(exampleKeyfireSettings)],
+    ["gr_daily_processed", JSON.stringify({ day: new Date().toLocaleDateString("en-CA"), ids: ["1","2","3","4","5","6","7"] })],
+  ]);
+  let sessionStored = new Map();
+  let now = 0;
+  const ids = [];
+  for (const expected of [2, 2, 1]) {
+    const page = dailyPage({ href, stored, sessionStored, startTime: now, dailyCloseListing: true,
+      dailyResponse: () => ({ entryLimit: 5, batchEntryLimit: 2 }), listing: { pages: [[8,9,10,11,12,13]] } });
+    await page.advanceAsync(1500);
+    for (let index = 0; index < expected; index++) {
+      assert.ok(page.openedTabs[index]);
+      ids.push(new URL(page.openedTabs[index].href).pathname);
+      if (expected === 2 && index === 1)
+        page.window.history.replaceState(null, "", `https://www.goodreads.com${automaticListPath}`);
+      page.openedTabs[index].close();
+      await page.flush();
+    }
+    await page.advanceAsync(0);
+    assert.equal(page.openedTabs.length, expected);
+    if (expected === 2) {
+      assert.equal(page.navigations.length, 1);
+      assert.equal(page.closeCount, 0);
+      href = page.navigations[0];
+    } else {
+      assert.equal(page.navigations.length, 0);
+      assert.equal(page.closeCount, 1);
+      assert.equal(page.dailyRequests.at(-1).metrics.processed, 5);
+      assert.equal(page.dailyRequests.at(-1).metrics.processedToday, 12);
+      assert.equal(page.dailyRequests.at(-1).metrics.opened, 5);
+    }
+    stored = page.stored; sessionStored = page.sessionStored; now = page.now;
+  }
+  assert.equal(new Set(ids).size, 5);
+});
+
 test("a saved macro connects automatically without a browser pairing key", async () => {
   const page = createPage({
     pathname: automaticListPath,

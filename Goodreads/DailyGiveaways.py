@@ -23,7 +23,7 @@ import time
 from KeyfireGiveaways import Settings, read_workflow
 
 PORT = 17385
-VERSION = "2026.11.02.1"
+VERSION = "2026.11.02.2"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
@@ -288,7 +288,7 @@ class ListingWindow:
 
 class Session:
     def __init__(self, profile, verify=False, clock=time.monotonic, *, listing=None, window_tag=None,
-                 recover_failures=False, inactivity_minutes=15, entry_limit=None, keyfire_config=None):
+                 recover_failures=False, inactivity_minutes=15, entry_limit=None, batch_entry_limit=None, keyfire_config=None):
         self.profile = profile
         self.verify = verify
         self.clock = clock
@@ -317,6 +317,7 @@ class Session:
         self.wait_allowance = 0
         self.wait_accounted = False
         self.entry_limit = entry_limit
+        self.batch_entry_limit = batch_entry_limit
         self.keyfire_config = keyfire_config
         self.macro_wait_seconds = 0
 
@@ -441,6 +442,8 @@ class Session:
                                           if value.get("windowWaitSupported") is not True else ""))
                 if not failure and self.entry_limit and value.get("controlledEntryLimitSupported") is not True:
                     failure = "Update Giveaways.js before a controlled entry-limited check; no entries were started."
+                if not failure and self.batch_entry_limit and value.get("controlledBatchLimitSupported") is not True:
+                    failure = "Update Giveaways.js to 4.39 or later before a controlled batch check; no entries were started."
                 if failure:
                     self.state, self.reason = "failed", failure
                     return {"protocol": 1, "cancel": True, "error": self.reason}
@@ -473,7 +476,7 @@ class Session:
             if state == "failed" and self.recover_failures and self.cleanup_supported:
                 return self.cleanup_response()
             return {"protocol": 1, "mode": "verify" if self.verify else "run", "cancel": False,
-                    "entryLimit": self.entry_limit}
+                    "entryLimit": self.entry_limit, "batchEntryLimit": self.batch_entry_limit}
 
     def check_deadlines(self):
         with self.lock:
@@ -637,7 +640,7 @@ def recover_failed_listing(session):
     return diagnostics
 
 
-def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False, entry_limit=None, requested=False, run_id=None):
+def run_queue(settings, output, *, verify=False, immediate=False, recover_failures=False, entry_limit=None, batch_entry_limit=None, requested=False, run_id=None):
     run_started = datetime.now()
     base_starts = planned_starts(settings, run_started, immediate, randbelow=lambda _: 0)
     starts = planned_starts(settings, run_started, immediate)
@@ -649,7 +652,7 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
              "delaySeconds": int((start - base).total_seconds())}
             for profile, start, base in zip(settings["profiles"], starts, base_starts)]
     report = {"startedAt": run_started.astimezone().isoformat(), "verificationOnly": verify,
-              "plannedStarts": plan, "profiles": [], "entryLimit": entry_limit, "runId": run_id, "runnerVersion": VERSION,
+              "plannedStarts": plan, "profiles": [], "entryLimit": entry_limit, "batchEntryLimit": batch_entry_limit, "runId": run_id, "runnerVersion": VERSION,
               "note": "Finished means the tab queue closed; it does not prove Goodreads accepted every entry."}
     output.mkdir(parents=True, exist_ok=True)
     pending_path = output / "daily-incomplete.json"
@@ -689,7 +692,7 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
             listing = ListingWindow(tag, settings["edgePath"]) if tag else None
             session = Session(profile, verify, listing=listing, window_tag=tag,
                               recover_failures=recover_failures,
-                              inactivity_minutes=settings.get("inactivityMinutes", 15), entry_limit=entry_limit,
+                              inactivity_minutes=settings.get("inactivityMinutes", 15), entry_limit=entry_limit, batch_entry_limit=batch_entry_limit,
                               keyfire_config=settings.get("keyfireConfig"))
             server.session = session
             if listing:
@@ -770,12 +773,15 @@ def main():
     parser.add_argument("--requested", action="store_true", help="Start the completion-ordered queue on request, retaining its start jitter")
     parser.add_argument("--clear-pending", action="store_true", help="After inspecting and closing unfinished giveaway tabs, allow future scheduled runs")
     parser.add_argument("--entry-limit", type=int, help="Controlled live check: process at most this many entries per profile")
+    parser.add_argument("--batch-entry-limit", type=int, help="Controlled live check: refresh after this many entries, within --entry-limit")
     parser.add_argument("--run-id", help="Request identity for correlated reports")
     parser.add_argument("--recover-failures", "--vm-recover-failures", dest="recover_failures", action="store_true",
                         help="Close only authenticated failed-run windows before continuing later profiles")
     args = parser.parse_args()
     if args.entry_limit is not None and not 1 <= args.entry_limit <= 10:
         parser.error("Controlled checks allow 1 to 10 entries per profile")
+    if args.batch_entry_limit is not None and (args.entry_limit is None or not 1 <= args.batch_entry_limit <= args.entry_limit):
+        parser.error("A controlled batch must fit within --entry-limit")
     settings = read_settings(args.config)
     if args.check:
         jitter = settings.get("startJitterMinutes", 0)
@@ -816,7 +822,7 @@ def main():
             subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
                               "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
             return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
-                             recover_failures=args.recover_failures, entry_limit=args.entry_limit, requested=args.requested, run_id=args.run_id)
+                             recover_failures=args.recover_failures, entry_limit=args.entry_limit, batch_entry_limit=args.batch_entry_limit, requested=args.requested, run_id=args.run_id)
     except Exception:
         logging.exception("Daily giveaway runner failed")
         raise

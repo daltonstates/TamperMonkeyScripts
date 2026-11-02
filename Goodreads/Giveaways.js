@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.38
+// @version      4.39
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -470,6 +470,7 @@
             addressSubmitRetrySupported: true,
             failureCleanupSupported: true,
             controlledEntryLimitSupported: true,
+            controlledBatchLimitSupported: true,
             workflow: keyfireSettings,
             windowTag: dailyRun?.windowTag,
             reason: reason.slice(0, 300),
@@ -547,11 +548,13 @@
       waitingForWindow: true,
       timer: null,
       titleTimer: null,
-      baseOpened: continuation?.openedIds.length ?? 0,
+      baseOpened: continuation ? Math.max(0,
+        (continuation.processedIds ?? continuation.openedIds).length - (continuation.baselineProcessed ?? 0)) : 0,
       processedIds: new Set(continuation?.processedIds ?? continuation?.openedIds ?? savedDailyProcessed()),
       baselineProcessed: continuation?.baselineProcessed ?? (continuation ? 0 : savedDailyProcessed().length),
       loadedIds: new Set(continuation?.loadedIds ?? []),
       entryLimit: null,
+      batchEntryLimit: null,
     };
     keepDailyTitle();
     try {
@@ -575,6 +578,9 @@
       dailyRun.waitingForWindow = false;
       if (Number.isInteger(response.entryLimit) && response.entryLimit > 0)
         dailyRun.entryLimit = response.entryLimit;
+      if (dailyRun.entryLimit && Number.isInteger(response.batchEntryLimit) &&
+          response.batchEntryLimit > 0 && response.batchEntryLimit <= dailyRun.entryLimit)
+        dailyRun.batchEntryLimit = response.batchEntryLimit;
       if (!keyfireEnabled || !isKeyfireConfigured(keyfireSettings))
         throw new Error(
           "Save Keyfire setup and enable Use Keyfire workflow in this Edge profile.",
@@ -1080,11 +1086,15 @@
       const result = await openVisibleGiveaways(controller, {
         rowLimit: MAX_GIVEAWAY_ROWS,
         skippedIds: previouslyOpenedIds,
-        waitForAll: capped,
+        waitForAll: capped || Boolean(dailyRun?.batchEntryLimit),
         workflow: preparedWorkflow,
       });
-      if (controller.signal.aborted || !capped || !result || result.failed || dailyRun?.entryLimit)
-        return;
+      if (controller.signal.aborted || !result || result.failed) return;
+      if (dailyRun?.entryLimit &&
+          dailyRun.processedIds.size - dailyRun.baselineProcessed >= dailyRun.entryLimit) return;
+      if (dailyRun?.entryLimit && !dailyRun.batchEntryLimit) return;
+      const smallBatchFilled = dailyRun?.batchEntryLimit && result.openedIds.length >= dailyRun.batchEntryLimit;
+      if (!capped && !smallBatchFilled) return;
       if (result.openedIds.length === 0) {
         giveawayError(
           "No new eligible giveaways in this batch. Check the remaining entries and genre filters before starting again.",
@@ -1325,6 +1335,7 @@
     refreshOpenButton();
 
     let opened = 0;
+    const processedBeforeBatch = dailyRun ? dailyRun.processedIds.size - dailyRun.baselineProcessed : 0;
     let failed = 0;
     let workflow = null;
 
@@ -1333,7 +1344,8 @@
         workflow = options.workflow ?? (await startKeyfireRun(signal));
       }
       for (const [linkIndex, link] of links.entries()) {
-        if (dailyRun?.entryLimit && opened >= dailyRun.entryLimit) break;
+        if (dailyRun?.entryLimit && processedBeforeBatch + opened >= dailyRun.entryLimit) break;
+        if (dailyRun?.batchEntryLimit && opened >= dailyRun.batchEntryLimit) break;
         await waitForOpenTabSlot(signal);
         await waitForGiveawayPacing(workflow, signal);
         // Settings may lower the background tab limit during a pacing wait.

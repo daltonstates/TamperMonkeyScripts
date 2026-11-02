@@ -48,6 +48,16 @@ try{
     $bad=@{count=1;sha256=('0'*64);runId=$bundle.runId}|ConvertTo-Json -Compress
     $script:exchange.GuestExchangeItems=@((KvpXml 'Goodreads.Report' $bad),(KvpXml 'Goodreads.Report.0' $encoded))
     Check ($null -eq (Read-GiveawaysLiveReport $settings)) 'A partial or corrupt report must not be accepted.'
+    $savedVM=$script:kvpVM
+    $savedExchange=$script:exchange
+    $script:kvpVM=$null
+    Check ($null -eq (Read-GiveawaysLiveReport $settings)) 'A VM disappearing during normal/manual shutdown must be an unavailable snapshot, not a null-method crash.'
+    $script:kvpVM=$savedVM
+    $script:exchange=$null
+    Check ($null -eq (Read-GiveawaysLiveReport $settings)) 'A missing exchange component must be an unavailable snapshot.'
+    $script:exchange=[pscustomobject]@{GuestExchangeItems=@($null,'',' ',(KvpXml 'Goodreads.Report' $manifest),(KvpXml 'Goodreads.Report.0' $encoded))}
+    Check ((Read-GiveawaysLiveReport $settings).runId -eq $bundle.runId) 'Empty WMI values must not cause a null-method crash or prevent a complete digest-checked report.'
+    $script:exchange=$savedExchange
 
     $reports=Join-Path $scratch 'reports'
     New-Item -ItemType Directory -Path $reports|Out-Null

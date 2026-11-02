@@ -229,6 +229,22 @@ class HttpTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_controlled_batch_requires_capability_and_returns_both_limits(self):
+        for supported in (False, True):
+            with self.subTest(supported=supported):
+                listing=MagicMock();listing.bind.return_value=True;listing.diagnostics={'matchingEdgeWindows':1}
+                session=daily.Session({'name':'Profile 1'},listing=listing,window_tag='a'*32,
+                                      entry_limit=5,batch_entry_limit=2)
+                response=session.event({'token':session.token,'state':'ready','windowTag':'a'*32,
+                    'closeListingSupported':True,'controlledEntryLimitSupported':True,
+                    'controlledBatchLimitSupported':supported,'userscriptVersion':'4.39' if supported else '4.38'})
+                if supported:
+                    self.assertEqual(response['mode'],'run')
+                    self.assertEqual((response['entryLimit'],response['batchEntryLimit']),(5,2))
+                else:
+                    self.assertTrue(response['cancel'])
+                    self.assertIn('4.39',response['error'])
+
     @unittest.skipUnless(os.name == "nt", "Windows file-sharing regression")
     def test_report_survives_a_real_windows_reader_that_temporarily_denies_replacement(self):
         with tempfile.TemporaryDirectory() as folder:

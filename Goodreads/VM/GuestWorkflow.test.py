@@ -27,6 +27,16 @@ class GuestTests(unittest.TestCase):
         return {'enabled':True,'dailySettings':str(daily),'dailyRunner':'DailyGiveaways.py',
                 'recoverFailedProfiles':True,'jobInventoryVerified':True,'otherJobTasks':[]}
 
+    def test_controlled_batch_request_requires_a_valid_total_entry_limit(self):
+        registry=MagicMock()
+        base={'schema':1,'runId':'a'*32,'mode':'scheduled','entryLimit':5,'batchEntryLimit':2}
+        with patch.dict(sys.modules,{'winreg':registry}):
+            registry.QueryValueEx.return_value=(json.dumps(base),1)
+            self.assertEqual(guest.read_request()['batchEntryLimit'],2)
+            for entry,batch in ((None,2),(5,0),(5,6),(5,True),(True,1)):
+                registry.QueryValueEx.return_value=(json.dumps({**base,'entryLimit':entry,'batchEntryLimit':batch}),1)
+                with self.subTest(entry=entry,batch=batch),self.assertRaises(ValueError):guest.read_request()
+
     def test_disabled_request_has_a_fresh_result_and_skip_reason(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(guest,'is_hyperv_guest',return_value=True):
             root=Path(folder); settings=self.settings(root); settings['enabled']=False
@@ -61,12 +71,13 @@ class GuestTests(unittest.TestCase):
             def launch(command, **kwargs):
                 self.assertIn('--recover-failures',command)
                 self.assertIn('--requested',command)
+                self.assertEqual(command[command.index('--batch-entry-limit')+1],'1')
                 guest.write_report(root/'daily-last-run.json',{'runId':'d'*32,'startedAt':guest.utc_now(),'endedAt':guest.utc_now(),
                     'profiles':[{'state':'finished','listingClosed':True} for _ in range(3)]})
                 return child
             publish=MagicMock()
             with patch.object(guest.subprocess,'Popen',side_effect=launch):
-                self.assertEqual(guest.run(settings,request={'runId':'d'*32,'entryLimit':1},publisher=publish),0)
+                self.assertEqual(guest.run(settings,request={'runId':'d'*32,'entryLimit':1,'batchEntryLimit':1},publisher=publish),0)
             child.wait.assert_called_once_with()
             report=guest.read_json(root/'vm-last-run.json')
             self.assertEqual(report['state'],'finished')
@@ -76,6 +87,7 @@ class GuestTests(unittest.TestCase):
             calls=guest.ctypes.windll.kernel32.SetThreadExecutionState.call_args_list
             self.assertEqual([call.args[0] for call in calls],[0x80000003,0x80000000])
             self.assertTrue(report['powerRequest']['displayRequired'])
+            self.assertEqual(report['batchEntryLimit'],1)
 
     def test_late_transient_read_failures_do_not_reapply_startup_deadline(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(guest,'is_hyperv_guest',return_value=True):

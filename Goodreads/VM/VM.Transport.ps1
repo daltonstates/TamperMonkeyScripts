@@ -36,9 +36,13 @@ function Set-GiveawaysRequest($Settings, $Request) {
 
 function Read-GiveawaysLiveReport($Settings) {
     $vm = Get-GiveawaysKvpVM $Settings
+    if(-not $vm){return $null}
     $items = @{}
-    @($vm.GetRelated('Msvm_KvpExchangeComponent'))[0].GuestExchangeItems | ForEach-Object {
-        [xml]$xml = $_
+    $component=@($vm.GetRelated('Msvm_KvpExchangeComponent'))[0]
+    if(-not $component){return $null}
+    foreach($rawItem in $component.GuestExchangeItems){
+        if([string]::IsNullOrWhiteSpace($rawItem)){continue}
+        [xml]$xml = $rawItem
         $name = $xml.SelectSingleNode("/INSTANCE/PROPERTY[@NAME='Name']/VALUE").InnerText
         if ($name -like 'Goodreads.Report*') { $items[$name] = $xml.SelectSingleNode("/INSTANCE/PROPERTY[@NAME='Data']/VALUE").InnerText }
     }

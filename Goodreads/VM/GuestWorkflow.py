@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-VERSION = "2026.11.02.1"
+VERSION = "2026.11.02.2"
 KVP_ROOT = r"SOFTWARE\Microsoft\Virtual Machine"
 REPORT_NAMES = ("vm-last-run.json", "vm-last-skip.json", "daily-last-run.json",
                 "daily-verification.json", "daily-incomplete.json", "helper-status.json", "installation.json")
@@ -68,7 +68,10 @@ def read_request():
     if (value.get("schema") != 1 or not re.fullmatch(r"[a-f0-9]{32}", value.get("runId", ""))
             or value.get("mode") not in {"scheduled", "repeat", "verify"}
             or value.get("entryLimit") is not None and
-            (type(value["entryLimit"]) is not int or not 1 <= value["entryLimit"] <= 10)):
+            (type(value["entryLimit"]) is not int or not 1 <= value["entryLimit"] <= 10)
+            or value.get("batchEntryLimit") is not None and
+            (type(value["batchEntryLimit"]) is not int or type(value.get("entryLimit")) is not int
+             or not 1 <= value["batchEntryLimit"] <= value["entryLimit"])):
         raise ValueError("Invalid host Goodreads request")
     return value
 
@@ -156,6 +159,7 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
     request = request or {"runId": uuid.uuid4().hex, "mode": "verify" if verify_only else "repeat" if run_now else "scheduled"}
     report = {"runId": request["runId"], "startedAt": utc_now(), "state": "starting", "adapterVersion": VERSION,
               "verificationOnly": verify_only, "manualRun": run_now, "entryLimit": request.get("entryLimit"),
+              "batchEntryLimit": request.get("batchEntryLimit"),
               "note": "Processed entries are not independently confirmed as accepted by Goodreads."}
     report_path = output / "vm-last-run.json"
     success_path = output / "vm-last-success.json"
@@ -190,6 +194,8 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
                 command.append("--recover-failures")
             if request.get("entryLimit"):
                 command += ["--entry-limit", str(request["entryLimit"])]
+            if request.get("batchEntryLimit"):
+                command += ["--batch-entry-limit", str(request["batchEntryLimit"])]
             # A sleeping guest display hides browser pages and removes their
             # authenticated keyboard target. Keep both display and system awake
             # through queue pacing; restore the power request in finally.

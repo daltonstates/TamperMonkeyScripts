@@ -83,6 +83,14 @@ the configured inactivity interval for reporting to recover. The generic queue
 owns its own system/display keep-awake request until it exits, so losing the VM
 adapter cannot put a still-running keyboard workflow to sleep.
 
+For a small live batch-transition check, temporarily request `entryLimit=5`
+and `batchEntryLimit=2` through the installed entry point (host settings
+`requestEntryLimit` and `requestBatchEntryLimit`). The same userscript then
+processes 2 + 2 + 1 entries per profile, keeping the total limit across refreshes
+and retaining same-day deduplication. It requires userscript 4.39 or later.
+Limited checks never mark the full day's queue complete. Restore both temporary
+host settings after the request is accepted; normal runs retain their full batches.
+
 ## Installation and updates
 
 Keep private settings, VM disks, sign-ins, exported macros, logs, reports, and
