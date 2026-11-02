@@ -5,7 +5,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 $reportDirectory=Join-Path $env:ProgramData 'GoodreadsGiveawaysVM\reports'
-$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.01.2';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
+$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.02.1';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
 $powerSet=$false
 $mutex=$null
 $ownsLock=$false
@@ -92,7 +92,7 @@ try {
     $hostEligibility=Get-GiveawaysHostShutdownEligibility $settings
     $eligible=($guest.queueClosed -eq $true -and $bundle.shutdown.eligible -eq $true -and $hostEligibility.eligible -eq $true)
     if($eligible){$report.shutdownDecision=@{state='eligible';reason='The queue is closed and all designated host and guest jobs are idle.'}}
-    else{$report.shutdownDecision=@{state='deferred';reason=(@($guest.shutdown.reason,$bundle.shutdown.reason,$hostEligibility.reason)|Where-Object{$_}) -join ' '}}
+    else{$report.shutdownDecision=@{state='deferred';reason=(@($guest.shutdown.reason,$bundle.shutdown.reason,$hostEligibility.reason)|Where-Object{$_}|Select-Object -Unique) -join ' '}}
     $report.endedAt=[DateTimeOffset]::Now.ToString('o')
     Save-HostResult # Deliver before requesting any shutdown, including a VM that stays on.
     if($eligible){

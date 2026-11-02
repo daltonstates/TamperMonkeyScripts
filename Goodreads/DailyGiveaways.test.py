@@ -11,6 +11,29 @@ from unittest.mock import patch, MagicMock
 import DailyGiveaways as daily
 
 
+class DesktopPowerTests(unittest.TestCase):
+    def test_queue_main_owns_display_request_until_completion_or_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as folder:
+                power=MagicMock()
+                settings={'keyfireConfig':str(Path(folder)/'keyfire.json')}
+                def run(*args, **kwargs):
+                    self.assertEqual([call.args[0] for call in power.SetThreadExecutionState.call_args_list],[0x80000003])
+                    if fail: raise RuntimeError('queue fixture failed')
+                    return 0
+                with patch.object(daily.ctypes,'windll',MagicMock(kernel32=power),create=True), \
+                     patch.dict(daily.sys.modules,{'msvcrt':MagicMock()}), \
+                     patch.object(daily.sys,'argv',['DailyGiveaways.py','--config',str(Path(folder)/'daily-settings.json')]), \
+                     patch.object(daily,'read_settings',return_value=settings), \
+                     patch.object(daily,'run_queue',side_effect=run), \
+                     patch.object(daily.subprocess,'Popen'), \
+                     patch.object(daily.logging,'basicConfig'), patch.object(daily.logging,'exception'):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError,'queue fixture failed'): daily.main()
+                    else: self.assertEqual(daily.main(),0)
+                self.assertEqual([call.args[0] for call in power.SetThreadExecutionState.call_args_list],[0x80000003,0x80000000])
+
+
 class ScheduleTests(unittest.TestCase):
     def test_targets_are_4_430_5_on_the_current_local_day(self):
         settings = {"startAt": "04:00", "profiles": [{"offsetMinutes": n} for n in (0, 30, 60)]}

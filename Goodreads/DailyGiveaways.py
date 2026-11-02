@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from ctypes import wintypes
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -22,7 +23,7 @@ import time
 from KeyfireGiveaways import Settings, read_workflow
 
 PORT = 17385
-VERSION = "2026.11.01.2"
+VERSION = "2026.11.02.1"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
@@ -30,6 +31,18 @@ WINDOW_BIND_TIMEOUT = "The scheduled Edge window was not identified and brought 
 # Background listing timers may run only once a minute. Leave time for the
 # next authenticated heartbeat to receive cancellation and then close its tabs.
 FAILED_CLEANUP_SECONDS = 90
+
+
+@contextmanager
+def desktop_power_request():
+    """Keep the queue's interactive desktop awake independently of its caller."""
+    kernel = ctypes.windll.kernel32
+    if not kernel.SetThreadExecutionState(0x80000003):
+        raise RuntimeError("Could not keep the interactive desktop awake for giveaway automation")
+    try:
+        yield
+    finally:
+        kernel.SetThreadExecutionState(0x80000000)
 
 
 def read_settings(path):
@@ -795,12 +808,15 @@ def main():
             (output / "daily-incomplete.json").unlink(missing_ok=True)
             print("Unfinished-work marker cleared. No browser was opened or closed.")
             return 0
-        # The companion's own lock prevents competing copies.
-        pythonw = Path(sys.executable).with_name("pythonw.exe")
-        subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
-                          "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
-        return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
-                         recover_failures=args.recover_failures, entry_limit=args.entry_limit, requested=args.requested, run_id=args.run_id)
+        # Own this request here: a caller's monitoring failure must not put a
+        # still-running browser queue to sleep. The companion's lock prevents
+        # competing keyboard helpers.
+        with desktop_power_request():
+            pythonw = Path(sys.executable).with_name("pythonw.exe")
+            subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
+                              "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
+            return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
+                             recover_failures=args.recover_failures, entry_limit=args.entry_limit, requested=args.requested, run_id=args.run_id)
     except Exception:
         logging.exception("Daily giveaway runner failed")
         raise

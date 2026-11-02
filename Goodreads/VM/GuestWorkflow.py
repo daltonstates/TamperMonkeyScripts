@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-VERSION = "2026.11.01.2"
+VERSION = "2026.11.02.1"
 KVP_ROOT = r"SOFTWARE\Microsoft\Virtual Machine"
 REPORT_NAMES = ("vm-last-run.json", "vm-last-skip.json", "daily-last-run.json",
                 "daily-verification.json", "daily-incomplete.json", "helper-status.json", "installation.json")
@@ -202,24 +202,49 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
                 child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
                                          creationflags=subprocess.CREATE_NO_WINDOW)
                 launch_clock = time.monotonic()
+                established = False
+                last_readable = launch_clock
+                monitoring_seconds = daily_settings.get("inactivityMinutes", 15) * 60
                 while child.poll() is None:
                     # The generic queue owns inactivity and safe cleanup.
                     daily_path = output / ("daily-verification.json" if verify_only else "daily-last-run.json")
+                    read_error = None
                     try:
                         current = read_json(daily_path)
+                        if not isinstance(current, dict):
+                            raise ValueError("The queue report is not a JSON object")
                         current_queue = current.get("runId") == report["runId"]
-                    except (OSError, ValueError):
+                        modified = daily_path.stat().st_mtime if current_queue else None
+                        if not current_queue:
+                            read_error = "The available queue report belongs to another request"
+                    except (OSError, ValueError) as error:
                         current_queue = False
-                    if not current_queue and time.monotonic() - launch_clock > 120:
-                        raise RuntimeError("The child queue did not establish current reporting; it was left running for diagnosis.")
-                    if current_queue and time.time() - daily_path.stat().st_mtime > daily_settings.get("inactivityMinutes", 15) * 60:
+                        read_error = f"{type(error).__name__}: {error}"
+                    now = time.monotonic()
+                    if current_queue:
+                        established = True
+                        last_readable = now
+                        report.pop("monitoringWarning", None)
+                    else:
+                        report["monitoringReadFailures"] = report.get("monitoringReadFailures", 0) + 1
+                        report["monitoringLastReadError"] = read_error[:1000]
+                        report["monitoringWarning"] = "Temporarily unable to read this queue's current report; the child is still supervised."
+                    # Startup is a one-way transition. A sharing conflict or a
+                    # partial read ten minutes into a healthy run is not proof
+                    # that it never started. Keep publishing and supervising it.
+                    if not established and now - launch_clock > 120:
+                        raise RuntimeError("The child queue did not establish current reporting; it was left running for diagnosis. " + (read_error or ""))
+                    if established and not current_queue and now - last_readable > monitoring_seconds:
+                        raise RuntimeError("Queue reporting remained unreadable for the inactivity interval. The child and VM were preserved. " + (read_error or ""))
+                    if current_queue and time.time() - modified > monitoring_seconds:
                         raise RuntimeError("Queue monitoring stopped updating. This does not prove a website stall; the child and VM were preserved.")
                     emit()
                     time.sleep(5)
                 result = child.wait()
             daily = read_json(output / ("daily-verification.json" if verify_only else "daily-last-run.json"))
             profiles = daily.get("profiles", [])
-            if (not daily.get("endedAt") or datetime.fromisoformat(daily["startedAt"]) < datetime.fromisoformat(report["startedAt"])
+            if (daily.get("runId") != report["runId"] or not daily.get("endedAt")
+                    or datetime.fromisoformat(daily["startedAt"]) < datetime.fromisoformat(report["startedAt"])
                     or len(profiles) != len(daily_settings["profiles"])):
                 raise RuntimeError(daily.get("reason") or "The queue did not produce a current complete profile report")
             expected = "verified" if verify_only else "finished"
@@ -241,7 +266,8 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
         report["endedAt"] = utc_now()
         report["shutdown"] = shutdown_eligibility(settings)
         if keep_running or not report.get("queueClosed"):
-            report["shutdown"] = {"eligible": False, "reason": "Requested to stay running or the queue has not proved safe cleanup."}
+            report["shutdown"] = {"eligible": False, "reason": "Requested to stay running." if keep_running
+                                  else "The queue has not proved safe cleanup; the VM was preserved."}
         emit()
         write_report(output / "requests" / (report["runId"] + ".json"), report)
     return 0 if report["state"] in {"finished", "verified", "skipped"} else 1

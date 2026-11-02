@@ -76,6 +76,12 @@ its report and owned windows before explicitly using the generic runner's
 
 Lost transport or frozen queue reporting produces a monitoring failure and
 leaves the VM running. It is not treated as elapsed-time proof of a website stall.
+After the child first publishes its request ID, a temporary sharing conflict,
+unreadable JSON, or older snapshot never restarts the two-minute startup check.
+The adapter retains that established state, records read failures, and allows
+the configured inactivity interval for reporting to recover. The generic queue
+owns its own system/display keep-awake request until it exits, so losing the VM
+adapter cannot put a still-running keyboard workflow to sleep.
 
 ## Installation and updates
 

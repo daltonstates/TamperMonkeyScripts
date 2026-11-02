@@ -61,7 +61,7 @@ class GuestTests(unittest.TestCase):
             def launch(command, **kwargs):
                 self.assertIn('--recover-failures',command)
                 self.assertIn('--requested',command)
-                guest.write_report(root/'daily-last-run.json',{'startedAt':guest.utc_now(),'endedAt':guest.utc_now(),
+                guest.write_report(root/'daily-last-run.json',{'runId':'d'*32,'startedAt':guest.utc_now(),'endedAt':guest.utc_now(),
                     'profiles':[{'state':'finished','listingClosed':True} for _ in range(3)]})
                 return child
             publish=MagicMock()
@@ -76,6 +76,89 @@ class GuestTests(unittest.TestCase):
             calls=guest.ctypes.windll.kernel32.SetThreadExecutionState.call_args_list
             self.assertEqual([call.args[0] for call in calls],[0x80000003,0x80000000])
             self.assertTrue(report['powerRequest']['displayRequired'])
+
+    def test_late_transient_read_failures_do_not_reapply_startup_deadline(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(guest,'is_hyperv_guest',return_value=True):
+            root=Path(folder); settings=self.settings(root); clock=[0]; polls=[0]; reads=[0]
+            run_id='e'*32
+            child=MagicMock()
+            original_read=guest.read_json
+            def poll():
+                polls[0]+=1
+                if polls[0] <= 240:
+                    return None
+                current=original_read(root/'daily-last-run.json')
+                current.update(endedAt=guest.utc_now(),profiles=[{'state':'finished','listingClosed':True} for _ in range(3)])
+                guest.write_report(root/'daily-last-run.json',current)
+                return 0
+            child.poll.side_effect=poll; child.wait.return_value=0
+            def launch(command, **kwargs):
+                guest.write_report(root/'daily-last-run.json',{'runId':run_id,'startedAt':guest.utc_now(),'profiles':[]})
+                return child
+            def read(path):
+                if path.name=='daily-last-run.json':
+                    reads[0]+=1
+                    if reads[0]==10: raise PermissionError('sharing conflict while replacing current report')
+                    if reads[0]==45: raise ValueError('partial JSON snapshot')
+                    if reads[0]==90: return {'runId':'an older request'}
+                return original_read(path)
+            def sleep(seconds): clock[0]+=60
+            with patch.object(guest.subprocess,'Popen',side_effect=launch), \
+                 patch.object(guest,'read_json',side_effect=read), \
+                 patch.object(guest.time,'monotonic',side_effect=lambda:clock[0]), \
+                 patch.object(guest.time,'sleep',side_effect=sleep):
+                self.assertEqual(guest.run(settings,request={'runId':run_id,'entryLimit':1}),0)
+            report=original_read(root/'vm-last-run.json')
+            self.assertEqual(report['state'],'finished')
+            self.assertEqual(report['monitoringReadFailures'],3)
+            self.assertNotIn('monitoringWarning',report)
+            self.assertEqual(clock[0],4*3600)
+            child.wait.assert_called_once_with()
+            child.terminate.assert_not_called()
+
+    def test_never_established_reporting_still_has_bounded_startup_check(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(guest,'is_hyperv_guest',return_value=True):
+            root=Path(folder); settings=self.settings(root); clock=[0]
+            child=MagicMock(); child.poll.return_value=None
+            def sleep(seconds): clock[0]+=60
+            with patch.object(guest.subprocess,'Popen',return_value=child), \
+                 patch.object(guest.time,'monotonic',side_effect=lambda:clock[0]), \
+                 patch.object(guest.time,'sleep',side_effect=sleep):
+                self.assertEqual(guest.run(settings,request={'runId':'f'*32}),1)
+            report=guest.read_json(root/'vm-last-run.json')
+            self.assertIn('did not establish',report['reason'])
+            self.assertIn('FileNotFoundError',report['reason'])
+            self.assertTrue(report['queueStillActive'])
+            self.assertFalse(report['shutdown']['eligible'])
+            self.assertLessEqual(clock[0],180)
+            child.terminate.assert_not_called()
+
+    def test_established_but_continuously_unreadable_reporting_uses_monitoring_interval(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(guest,'is_hyperv_guest',return_value=True):
+            root=Path(folder); settings=self.settings(root); clock=[0]; reads=[0]
+            child=MagicMock(); child.poll.return_value=None
+            original_read=guest.read_json
+            def launch(command, **kwargs):
+                guest.write_report(root/'daily-last-run.json',{'runId':'a'*32,'startedAt':guest.utc_now(),'profiles':[]})
+                return child
+            def read(path):
+                if path.name=='daily-last-run.json':
+                    reads[0]+=1
+                    if reads[0]>1: raise PermissionError('persistent sharing failure')
+                return original_read(path)
+            def sleep(seconds): clock[0]+=60
+            with patch.object(guest.subprocess,'Popen',side_effect=launch), \
+                 patch.object(guest,'read_json',side_effect=read), \
+                 patch.object(guest.time,'monotonic',side_effect=lambda:clock[0]), \
+                 patch.object(guest.time,'sleep',side_effect=sleep):
+                self.assertEqual(guest.run(settings,request={'runId':'a'*32}),1)
+            report=original_read(root/'vm-last-run.json')
+            self.assertIn('remained unreadable',report['reason'])
+            self.assertNotIn('did not establish',report['reason'])
+            self.assertIn('persistent sharing failure',report['monitoringLastReadError'])
+            self.assertTrue(report['queueStillActive'])
+            self.assertEqual(clock[0],16*60)
+            child.terminate.assert_not_called()
 
     def test_another_designated_job_defers_shutdown_and_unknown_inventory_is_safe(self):
         with tempfile.TemporaryDirectory() as folder:
