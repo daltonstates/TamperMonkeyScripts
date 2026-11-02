@@ -93,6 +93,25 @@ host settings after the request is accepted; normal runs retain their full batch
 
 ## Installation and updates
 
+For a dedicated automation desktop, `Set-AutomationDesktop.ps1` can configure
+the mounted disk of an **off** Windows Pro/Enterprise/Education VM. It verifies
+the account SID/profile mapping, refuses the host's Windows directory, records
+previous values, and reads each applied value back. Run it from an elevated
+Windows maintenance process; a temporary SYSTEM task also avoids registry-hive
+loading failures inherited from a packaged desktop application's process.
+
+The optional setup suppresses guest toast banners, OneDrive backup/sign-in
+prompts, and Start account reminders. Host report notifications stay available.
+`-UpdateMode DownloadOnly -Apply` keeps automatic update downloads enabled but
+requires deliberate installation/restart during idle maintenance. Schedule that
+maintenance regularly. It rejects conflicting update deadlines and records any
+existing pending reboot; it does not disable update services or Defender.
+The default `-UpdateMode Keep` preserves existing update settings. Active hours
+are at most 18 hours and cannot protect a queue of arbitrary duration. See
+[Microsoft's restart guidance](https://learn.microsoft.com/windows/deployment/update/waas-restart)
+and [OneDrive policy reference](https://learn.microsoft.com/sharepoint/use-group-policy#prevent-users-from-moving-their-windows-known-folders-to-onedrive).
+Use `-Apply` only after inspecting the report, and retain it for the prior values.
+
 Keep private settings, VM disks, sign-ins, exported macros, logs, reports, and
 credentials outside Git. Defaults are:
 
