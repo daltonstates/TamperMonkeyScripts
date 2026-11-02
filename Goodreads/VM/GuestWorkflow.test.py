@@ -240,5 +240,25 @@ class GuestTests(unittest.TestCase):
                 opened.assert_not_called()
             self.assertEqual(guest.read_json(root/'requests'/('d'*32+'.json')),previous)
 
+    def test_cached_failure_keeps_cleanup_guard_even_when_designated_jobs_are_idle(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings=self.settings(root)
+            guest.write_report(root/'requests'/('e'*32+'.json'),{'runId':'e'*32,'state':'failed','queueStillActive':True,
+                'shutdown':{'eligible':False,'reason':'The queue has not proved safe cleanup; the VM was preserved.'}})
+            publisher=MagicMock()
+            self.assertEqual(guest.run(settings,request={'runId':'e'*32},publisher=publisher),1)
+            eligibility=publisher.call_args.kwargs['eligibility']
+            self.assertFalse(eligibility['eligible'])
+            self.assertIn('safe cleanup',eligibility['reason'])
+
+    def test_cached_closed_run_keeps_an_explicit_stay_running_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);settings=self.settings(root)
+            for report in ({'queueClosed':True,'keepRunning':True},
+                           {'queueClosed':True,'shutdown':{'eligible':False,'reason':'Requested to stay running.'}}):
+                result=guest.report_shutdown_eligibility(settings,report)
+                self.assertFalse(result['eligible'])
+                self.assertEqual(result['reason'],'Requested to stay running.')
+
 
 if __name__=='__main__': unittest.main()

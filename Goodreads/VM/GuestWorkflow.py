@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-VERSION = "2026.11.02.3"
+VERSION = "2026.11.02.4"
 KVP_ROOT = r"SOFTWARE\Microsoft\Virtual Machine"
 REPORT_NAMES = ("vm-last-run.json", "vm-last-skip.json", "daily-last-run.json",
                 "daily-verification.json", "daily-incomplete.json", "helper-status.json", "installation.json")
@@ -161,6 +161,14 @@ def shutdown_eligibility(settings, task_states=None):
         return {"eligible": False, "reason": "Cannot establish guest shutdown eligibility: " + str(error)}
 
 
+def report_shutdown_eligibility(settings, report):
+    if report.get("keepRunning") or report.get("shutdown", {}).get("reason") == "Requested to stay running.":
+        return {"eligible": False, "reason": "Requested to stay running."}
+    if not report.get("queueClosed"):
+        return {"eligible": False, "reason": "The queue has not proved safe cleanup; the VM was preserved."}
+    return shutdown_eligibility(settings)
+
+
 def run(settings, *, verify_only=False, keep_running=False, run_now=False, request=None, publisher=None):
     output = Path(settings["dailySettings"]).parent
     output.mkdir(parents=True, exist_ok=True)
@@ -170,13 +178,15 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
     previous = output / "requests" / (request["runId"] + ".json")
     if previous.exists():
         result = read_json(previous)
+        result["shutdown"] = report_shutdown_eligibility(settings, result)
         if publisher:
-            publisher(output, result, eligibility=shutdown_eligibility(settings))
+            publisher(output, result, eligibility=result["shutdown"])
         return 0 if result["state"] in {"finished", "verified", "skipped"} else 1
     run_output = output / "runs" / request["runId"]
     run_output.mkdir(parents=True, exist_ok=True)
     report = {"runId": request["runId"], "startedAt": utc_now(), "state": "starting", "adapterVersion": VERSION,
-              "verificationOnly": verify_only, "manualRun": run_now, "entryLimit": request.get("entryLimit"), "queueDirectory": str(run_output),
+              "verificationOnly": verify_only, "manualRun": run_now, "keepRunning": keep_running,
+              "entryLimit": request.get("entryLimit"), "queueDirectory": str(run_output),
               "batchEntryLimit": request.get("batchEntryLimit"),
               "note": "Processed entries are not independently confirmed as accepted by Goodreads."}
     report_path = output / "vm-last-run.json"
@@ -295,10 +305,7 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
         if os.name == "nt":
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
         report["endedAt"] = utc_now()
-        report["shutdown"] = shutdown_eligibility(settings)
-        if keep_running or not report.get("queueClosed"):
-            report["shutdown"] = {"eligible": False, "reason": "Requested to stay running." if keep_running
-                                  else "The queue has not proved safe cleanup; the VM was preserved."}
+        report["shutdown"] = report_shutdown_eligibility(settings, report)
         emit()
         write_report(output / "requests" / (report["runId"] + ".json"), report)
     return 0 if report["state"] in {"finished", "verified", "skipped"} else 1
@@ -353,7 +360,7 @@ def main():
             previous = output / "requests" / (request["runId"] + ".json") if request else None
             if previous and previous.exists():
                 report = read_json(previous)
-                report["shutdown"] = shutdown_eligibility(settings)
+                report["shutdown"] = report_shutdown_eligibility(settings, report)
                 publish(output, report, eligibility=report["shutdown"])
                 return 0 if report["state"] in {"finished", "verified", "skipped"} else 1
             return run(settings, verify_only=args.verify_only or bool(request and request["mode"] == "verify"),
