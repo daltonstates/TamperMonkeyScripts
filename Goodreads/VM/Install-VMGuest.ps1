@@ -80,7 +80,7 @@ $companion=Join-Path $env:LOCALAPPDATA 'GoodreadsKeyfireCompanion'
 $pairing=Join-Path $companion 'pairing-key.txt'
 if(-not (Test-Path -LiteralPath $pairing)){throw 'Set up the existing local Keyfire helper in this account before enabling the VM adapter.'}
 $settings=if(Test-Path -LiteralPath $settingsPath){Get-Content -LiteralPath $settingsPath -Raw|ConvertFrom-Json}else{[pscustomobject]@{enabled=$false}}
-foreach($entry in @{dailyRunner=$dailyRunner;dailySettings=$dailyPath;recoverFailedProfiles=$true;adapterVersion='2026.11.02.4';interactiveUserSid=$identity.User.Value}.GetEnumerator()){$settings|Add-Member -Force NoteProperty $entry.Key $entry.Value}
+foreach($entry in @{dailyRunner=$dailyRunner;dailySettings=$dailyPath;recoverFailedProfiles=$true;adapterVersion='2026.11.02.5';interactiveUserSid=$identity.User.Value}.GetEnumerator()){$settings|Add-Member -Force NoteProperty $entry.Key $entry.Value}
 # The host owns shutdown and report delivery; the guest never powers off itself.
 $settings|Add-Member -Force NoteProperty shutdownAfterSuccess $false
 $settings|Add-Member -Force NoteProperty preflightUserScriptUpdates $false
@@ -101,7 +101,7 @@ if($admin){
     }finally{$registryKey.Dispose()}
 }
 $kvpKey=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Virtual Machine\Guest',[Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,[Security.AccessControl.RegistryRights]::SetValue)
-try{$kvpKey.SetValue('Goodreads.InstallVersion','2026.11.02.4',[Microsoft.Win32.RegistryValueKind]::String)}finally{$kvpKey.Dispose()}
+try{$kvpKey.SetValue('Goodreads.InstallVersion','2026.11.02.5',[Microsoft.Win32.RegistryValueKind]::String)}finally{$kvpKey.Dispose()}
 $wrapper=Join-Path $root 'Goodreads\VM\GuestWorkflow.py'
 # Keep Goodreads' background listing/coordinator out of Edge sleeping tabs.
 # Preserve every other existing site exclusion and profile preference.
@@ -140,7 +140,6 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon,$po
 # The listener must remain available to publish a fresh disabled/skip result.
 Enable-ScheduledTask -TaskName $taskName|Out-Null
 $taskInfo=Get-ScheduledTaskInfo -TaskName $taskName
-@{state='installed';version='2026.11.02.4';at=[DateTimeOffset]::Now.ToString('o');timeZone=(Get-TimeZone).Id;identity=$identity.Name;taskState=[string](Get-ScheduledTask -TaskName $taskName).State;taskXml=(Export-ScheduledTask -TaskName $taskName);lastRunTime=$taskInfo.LastRunTime.ToString('o');lastTaskResult=$taskInfo.LastTaskResult;profiles=$daily.profiles}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $output 'installation.json') -Encoding UTF8
+@{state='installed';version='2026.11.02.5';at=[DateTimeOffset]::Now.ToString('o');timeZone=(Get-TimeZone).Id;identity=$identity.Name;taskState=[string](Get-ScheduledTask -TaskName $taskName).State;taskXml=(Export-ScheduledTask -TaskName $taskName);lastRunTime=$taskInfo.LastRunTime.ToString('o');lastTaskResult=$taskInfo.LastTaskResult;profiles=$daily.profiles}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $output 'installation.json') -Encoding UTF8
 if($VerifyOnly){& $python $wrapper --settings $settingsPath --verify-only --keep-running;if($LASTEXITCODE -ne 0){throw 'Guest setup verification failed.'}}
-Write-Output "Installed guest adapter 2026.11.02.4; task enabled: $($settings.enabled). Existing browser and macro settings preserved."
-
+Write-Output "Installed guest adapter 2026.11.02.5; task enabled: $($settings.enabled). Existing browser and macro settings preserved."

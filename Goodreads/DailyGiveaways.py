@@ -26,7 +26,7 @@ import uuid
 from KeyfireGiveaways import Settings, read_config, read_workflow
 
 PORT = 17385
-VERSION = "2026.11.02.4"
+VERSION = "2026.11.02.5"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
@@ -94,10 +94,9 @@ def foreground_queue_lock(path, waiting_report, run_id, verify=False):
     import msvcrt
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as lock:
-        lock.seek(0)
-        if not lock.read(1):
-            lock.write(b"0")
-            lock.flush()
+        # Windows can lock beyond EOF. Reading a byte first would itself fail
+        # when another process owns that byte, before we can wait for the lock.
+        # https://docs.python.org/3/library/msvcrt.html#msvcrt.locking
         queued = {"runId": run_id, "state": "queued", "profiles": [], "verificationOnly": verify,
                   "startedAt": datetime.now().astimezone().isoformat(), "runnerVersion": VERSION,
                   "reason": "Another browser job owns the interactive keyboard."}
@@ -110,7 +109,8 @@ def foreground_queue_lock(path, waiting_report, run_id, verify=False):
                 if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} and getattr(error, "winerror", None) not in {33, 36}:
                     raise
                 queued["updatedAt"] = datetime.now().astimezone().isoformat()
-                save_report(waiting_report, queued)
+                if waiting_report is not None:
+                    save_report(waiting_report, queued)
                 time.sleep(1)
         try:
             yield
@@ -1076,16 +1076,19 @@ def main():
         # Own this request here: a caller's monitoring failure must not put a
         # still-running browser queue to sleep. The companion's lock prevents
         # competing keyboard helpers.
-        if report_path.exists() and json.loads(report_path.read_text(encoding="utf-8-sig")).get("endedAt"):
-            previous = json.loads(report_path.read_text(encoding="utf-8-sig"))
-            return 0 if previous.get("state") not in {"failed", "blocked"} and len(previous.get("profiles", [])) == len(settings["profiles"]) and all(
-                item.get("state") in {"finished", "verified"} for item in previous.get("profiles", [])) else 1
-        with foreground_queue_lock(shared_lock, report_path, args.run_id, args.verify_only), desktop_power_request():
-            pythonw = Path(sys.executable).with_name("pythonw.exe")
-            subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
-                              "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
-            return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
-                             recover_failures=args.recover_failures, entry_limit=args.entry_limit, batch_entry_limit=args.batch_entry_limit, requested=args.requested, run_id=args.run_id, state_root=state_root)
+        # A duplicate request waits silently for its original worker. It must
+        # not overwrite that worker\'s live report with a queued heartbeat.
+        with foreground_queue_lock(state_root / "runs" / args.run_id / "request.lock", None, args.run_id, args.verify_only):
+            if report_path.exists() and json.loads(report_path.read_text(encoding="utf-8-sig")).get("endedAt"):
+                previous = json.loads(report_path.read_text(encoding="utf-8-sig"))
+                return 0 if previous.get("state") not in {"failed", "blocked"} and len(previous.get("profiles", [])) == len(settings["profiles"]) and all(
+                    item.get("state") in {"finished", "verified"} for item in previous.get("profiles", [])) else 1
+            with foreground_queue_lock(shared_lock, report_path, args.run_id, args.verify_only), desktop_power_request():
+                pythonw = Path(sys.executable).with_name("pythonw.exe")
+                subprocess.Popen([str(pythonw), str(Path(__file__).with_name("KeyfireGiveaways.py")),
+                                  "--config", settings["keyfireConfig"]], creationflags=subprocess.CREATE_NO_WINDOW)
+                return run_queue(settings, output, verify=args.verify_only, immediate=args.now or args.verify_only,
+                                 recover_failures=args.recover_failures, entry_limit=args.entry_limit, batch_entry_limit=args.batch_entry_limit, requested=args.requested, run_id=args.run_id, state_root=state_root)
     except Exception:
         logging.exception("Daily giveaway runner failed")
         raise

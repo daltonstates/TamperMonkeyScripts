@@ -251,6 +251,21 @@ class GuestTests(unittest.TestCase):
             self.assertFalse(eligibility['eligible'])
             self.assertIn('safe cleanup',eligibility['reason'])
 
+    def test_same_request_can_finish_work_started_before_its_replacement_supervisor(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(guest,'is_hyperv_guest',return_value=True):
+            root=Path(folder);settings=self.settings(root);original_start='2026-11-01T04:00:00-05:00'
+            child=MagicMock();child.poll.return_value=0;child.wait.return_value=0
+            def launch(command,**kwargs):
+                target=Path(command[command.index('--output-directory')+1])
+                guest.write_report(target/'daily-last-run.json',{'runId':'f'*32,'startedAt':original_start,'endedAt':guest.utc_now(),
+                    'profiles':[{'state':'finished','listingClosed':True} for _ in range(3)]})
+                return child
+            with patch.object(guest.subprocess,'Popen',side_effect=launch):
+                self.assertEqual(guest.run(settings,request={'runId':'f'*32}),0)
+            report=guest.read_json(root/'vm-last-run.json')
+            self.assertEqual(report['state'],'finished')
+            self.assertEqual(report['queueStartedAt'],original_start)
+
     def test_cached_closed_run_keeps_an_explicit_stay_running_request(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);settings=self.settings(root)

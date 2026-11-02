@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-VERSION = "2026.11.02.4"
+VERSION = "2026.11.02.5"
 KVP_ROOT = r"SOFTWARE\Microsoft\Virtual Machine"
 REPORT_NAMES = ("vm-last-run.json", "vm-last-skip.json", "daily-last-run.json",
                 "daily-verification.json", "daily-incomplete.json", "helper-status.json", "installation.json")
@@ -285,9 +285,12 @@ def run(settings, *, verify_only=False, keep_running=False, run_now=False, reque
             daily = read_json(run_output / ("daily-verification.json" if verify_only else "daily-last-run.json"))
             profiles = daily.get("profiles", [])
             if (daily.get("runId") != report["runId"] or not daily.get("endedAt")
-                    or datetime.fromisoformat(daily["startedAt"]) < datetime.fromisoformat(report["startedAt"])
                     or len(profiles) != len(expected_profiles)):
                 raise RuntimeError(daily.get("reason") or "The queue did not produce a current complete profile report")
+            # The same request may have outlived its previous supervisor. Its
+            # UUID and own report directory identify the work; an earlier queue
+            # start is valid and must not turn a recovered completion into failure.
+            report["queueStartedAt"] = datetime.fromisoformat(daily["startedAt"]).isoformat()
             expected = "verified" if verify_only else "finished"
             closed = all(p.get("listingClosed") is True for p in profiles) and not (output / "daily-incomplete.json").exists()
             if result == 0 and closed and all(p.get("state") == expected for p in profiles):
@@ -348,10 +351,8 @@ def main():
         import msvcrt
         output.mkdir(parents=True, exist_ok=True)
         with (output / "vm-workflow.lock").open("a+b") as lock:
-            lock.seek(0)
-            if not lock.read(1):
-                lock.write(b"0")
-                lock.flush()
+            # Locking beyond EOF is supported; never read another owner's
+            # locked byte before checking whether this listener can enter.
             lock.seek(0)
             try:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)

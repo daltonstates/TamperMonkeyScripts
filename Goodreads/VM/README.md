@@ -33,6 +33,11 @@ window cannot receive permission to open entry tabs. Unidentified windows are
 preserved. Focus or identity failures after a connection still use the existing
 authenticated cleanup checks.
 
+Duplicate instances of one request wait on that request's lock without writing
+over its active report. A replacement supervisor accepts earlier work only from
+the same request ID and its own report directory, preserving the original queue
+start time and the cleanup decision when a saved report is republished.
+
 The VM installation uses `profileStartPolicy: "completion"`; the former 04:30
 and 05:00 minimum times are removed. Existing start jitter is applied once to
 the beginning of the queue. Browser pacing, filters, cookies, macro selections,

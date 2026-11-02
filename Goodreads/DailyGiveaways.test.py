@@ -5,6 +5,9 @@ from http.client import HTTPConnection
 from pathlib import Path
 import tempfile
 import threading
+import subprocess
+import sys
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -963,6 +966,33 @@ class FailureRecoveryTests(unittest.TestCase):
 
 
 class DurableProfileJobsTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Native Windows byte-lock behavior")
+    def test_duplicate_request_waits_without_overwriting_the_active_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);lock_path=root/"request.lock";active=root/"daily-last-run.json"
+            daily.save_report(active,{"runId":"a"*32,"state":"running","profiles":[{"state":"running","counters":{"processed":600}}]})
+            original=active.read_bytes();started=root/"started";acquired=root/"acquired"
+            code=("import sys;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import DailyGiveaways as d;"
+                  "pause=d.time.sleep\ndef waiting(seconds):Path(sys.argv[3]).touch();pause(.02)\n"
+                  "d.time.sleep=waiting\nwith d.foreground_queue_lock(Path(sys.argv[2]),None,'a'*32):Path(sys.argv[4]).touch()")
+            contender=None
+            try:
+                with daily.foreground_queue_lock(lock_path,None,"a"*32):
+                    contender=subprocess.Popen([sys.executable,"-c",code,str(Path(daily.__file__).parent),str(lock_path),str(started),str(acquired)],
+                                               stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                    deadline=time.monotonic()+5
+                    while not started.exists() and time.monotonic()<deadline:time.sleep(.02)
+                    self.assertTrue(started.exists())
+                    self.assertIsNone(contender.poll(),contender.stderr.read().decode() if contender.poll() is not None else "")
+                    self.assertFalse(acquired.exists())
+                    self.assertEqual(active.read_bytes(),original)
+                stdout,stderr=contender.communicate(timeout=5)
+                self.assertEqual(contender.returncode,0,stderr.decode())
+                self.assertTrue(acquired.exists())
+                self.assertEqual(active.read_bytes(),original)
+            finally:
+                if contender and contender.poll() is None:contender.terminate();contender.communicate(timeout=5)
+
     def startup_retry(self, second_connects):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);server=MagicMock();window=MagicMock();window.closed.return_value=True
@@ -1008,7 +1038,8 @@ class DurableProfileJobsTests(unittest.TestCase):
                 "runId":run_id,"state":"blocked","endedAt":"2026-11-02T12:00:00-05:00","profiles":[]})
             with patch.object(daily.sys,"argv",["DailyGiveaways.py","--config",str(root/"settings.json"),"--run-id",run_id]),\
                  patch.object(daily,"read_settings",return_value={"profiles":[{"directory":"Default"}]}),\
-                 patch.object(daily.logging,"basicConfig"),patch.object(daily.subprocess,"Popen") as launch:
+                 patch.object(daily.logging,"basicConfig"),patch.object(daily,"foreground_queue_lock"),\
+                 patch.object(daily.subprocess,"Popen") as launch:
                 self.assertEqual(daily.main(),1)
                 launch.assert_not_called()
 
