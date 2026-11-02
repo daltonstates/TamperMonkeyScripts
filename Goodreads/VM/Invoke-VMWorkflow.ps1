@@ -5,7 +5,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 $reportDirectory=Join-Path $env:ProgramData 'GoodreadsGiveawaysVM\reports'
-$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.02.2';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
+$report=[ordered]@{runId=[guid]::NewGuid().ToString('N');startedAt=[DateTimeOffset]::Now.ToString('o');state='starting';adapterVersion='2026.11.02.3';shutdownDecision=@{state='deferred';reason='Startup has not established shutdown eligibility.'}}
 $powerSet=$false
 $mutex=$null
 $ownsLock=$false

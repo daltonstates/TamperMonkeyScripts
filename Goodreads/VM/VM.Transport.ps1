@@ -55,14 +55,26 @@ function Read-GiveawaysLiveReport($Settings) {
         if (-not $chunk -or $chunk.Length -gt 800) { return $null }
         $encoded += $chunk
     }
-    $inputStream = [IO.MemoryStream]::new([Convert]::FromBase64String($encoded))
-    $stream = [IO.Compression.GZipStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
-    $outputStream = [IO.MemoryStream]::new()
+    $inputStream=$stream=$outputStream=$null
     try {
-        $buffer = New-Object byte[] 8192
-        while (($count = $stream.Read($buffer,0,$buffer.Length)) -gt 0) {
-            $outputStream.Write($buffer,0,$count)
-            if ($outputStream.Length -gt 1MB) { throw 'Oversized guest report.' }
+        try {
+            $inputStream = [IO.MemoryStream]::new([Convert]::FromBase64String($encoded))
+            $stream = [IO.Compression.GZipStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
+            $outputStream = [IO.MemoryStream]::new()
+            $buffer = New-Object byte[] 8192
+            while (($count = $stream.Read($buffer,0,$buffer.Length)) -gt 0) {
+                $outputStream.Write($buffer,0,$count)
+                if ($outputStream.Length -gt 1MB) { throw 'Oversized guest report.' }
+            }
+        } catch {
+            # KVP propagates individual chunks before the final manifest. A
+            # mixed snapshot may fail decoding before its digest can be checked.
+            $cause=$_.Exception
+            while($cause){
+                if($cause -is [FormatException] -or $cause -is [IO.InvalidDataException]){return $null}
+                $cause=$cause.InnerException
+            }
+            throw
         }
         $raw = $outputStream.ToArray()
         $hash = [Security.Cryptography.SHA256]::Create()
@@ -71,7 +83,11 @@ function Read-GiveawaysLiveReport($Settings) {
         $bundle = [Text.Encoding]::UTF8.GetString($raw) | ConvertFrom-Json
         if ($bundle.schema -ne 1 -or $bundle.runId -ne $manifest.runId) { throw 'Invalid guest report identity.' }
         return $bundle
-    } finally { $stream.Dispose(); $inputStream.Dispose(); $outputStream.Dispose() }
+    } finally {
+        if($stream){$stream.Dispose()}
+        if($inputStream){$inputStream.Dispose()}
+        if($outputStream){$outputStream.Dispose()}
+    }
 }
 
 function Export-GiveawaysLiveReport($Settings, $Bundle) {

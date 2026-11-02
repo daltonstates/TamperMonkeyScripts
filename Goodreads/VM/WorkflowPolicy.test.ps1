@@ -48,6 +48,10 @@ try{
     $bad=@{count=1;sha256=('0'*64);runId=$bundle.runId}|ConvertTo-Json -Compress
     $script:exchange.GuestExchangeItems=@((KvpXml 'Goodreads.Report' $bad),(KvpXml 'Goodreads.Report.0' $encoded))
     Check ($null -eq (Read-GiveawaysLiveReport $settings)) 'A partial or corrupt report must not be accepted.'
+    $script:exchange.GuestExchangeItems=@((KvpXml 'Goodreads.Report' $manifest),(KvpXml 'Goodreads.Report.0' 'not-base64!'))
+    Check ($null -eq (Read-GiveawaysLiveReport $settings)) 'Mixed KVP chunks with incomplete base64 must be retried without abandoning an active queue.'
+    $script:exchange.GuestExchangeItems=@((KvpXml 'Goodreads.Report' $manifest),(KvpXml 'Goodreads.Report.0' ([Convert]::ToBase64String([byte[]](1,2,3,4)))))
+    Check ($null -eq (Read-GiveawaysLiveReport $settings)) 'Mixed KVP chunks with incomplete gzip must be retried without abandoning an active queue.'
     $savedVM=$script:kvpVM
     $savedExchange=$script:exchange
     $script:kvpVM=$null
