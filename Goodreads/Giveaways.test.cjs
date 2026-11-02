@@ -2730,6 +2730,49 @@ test("late Goodreads URL cleanup cannot strip a scheduled batch continuation", a
   assert.equal(resumed.closeCount, 1);
 });
 
+test("scheduled continuation retains progress through 1002 entries and late URL cleanup in ten batches", async () => {
+  const token = "d".repeat(64);
+  const tag = "a".repeat(32);
+  let href = `https://www.goodreads.com${automaticListPath}&autoload=1#grDailyToken=${token}&grDailyWindow=${tag}`;
+  let stored;
+  let sessionStored;
+  let processed = 0;
+  let now = 0;
+  for (const count of [...Array(10).fill(100), 2]) {
+    const page = dailyPage({ href, dailyCloseListing: true, ...(stored ? { stored, sessionStored } : {}),
+      listing: { pages: [Array.from({ length: count }, (_, index) => processed + index + 1)] }, startTime: now });
+    await page.advanceAsync(1500);
+    for (let index = 0; index < count; index++) {
+      assert.ok(page.openedTabs[index]);
+      if (count === 100 && index === 99)
+        page.window.history.replaceState(null, "", `https://www.goodreads.com${automaticListPath}`);
+      page.openedTabs[index].close();
+      await page.flush();
+    }
+    await page.advanceAsync(0);
+    processed += count;
+    if (count === 100) {
+      assert.equal(page.navigations.length, 1);
+      assert.equal(page.closeCount, 0);
+      assert.equal(page.dailyRequests.some(request => request.state === "finished"), false);
+      const next = new URL(page.navigations[0]);
+      assert.equal(next.searchParams.get("autoload"), "1");
+      assert.equal(new URLSearchParams(next.hash.slice(1)).get("grDailyToken"), token);
+      const continuation = JSON.parse(page.sessionStored.get("gr_giveaway_continuation"));
+      assert.equal(continuation.processedIds.length, processed);
+      assert.equal(new Set(continuation.processedIds).size, processed);
+      href = page.navigations[0];
+    } else {
+      assert.equal(page.navigations.length, 0);
+      assert.equal(page.dailyRequests.at(-1).state, "finished");
+      assert.equal(page.dailyRequests.at(-1).metrics.processed, 1002);
+      assert.equal(page.closeCount, 1);
+    }
+    stored = page.stored; sessionStored = page.sessionStored; now = page.now;
+  }
+  assert.equal(processed, 1002);
+});
+
 test("a saved macro connects automatically without a browser pairing key", async () => {
   const page = createPage({
     pathname: automaticListPath,
