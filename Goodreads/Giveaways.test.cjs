@@ -270,7 +270,6 @@ function createPage({
     let pageIndex = 0;
     const updatePagination = () => {
       status.textContent = `Showing 1 - ${cards.length} of ${total}`;
-      status.dataset.originalText = status.textContent;
       if (pageIndex === listing.pages.length - 1) {
         pagination = null;
         return;
@@ -1136,6 +1135,26 @@ test("loading all waits through missing pagination until the known total is reac
   assert.equal(page.paginationClicks, 2);
   assert.equal(page.openedTabs.length, 6);
   assert.deepEqual(page.alerts, []);
+});
+
+test("filter counts preserve Goodreads pagination text across React updates", () => {
+  const page = createPage({
+    pathname: automaticListPath,
+    stored: new Map([["gr_blocked_genres", '["horror"]']]),
+    listing: { pages: [[1, { id: 2, genres: ["Horror"] }], [3]] },
+  });
+  const status = page.document.querySelector('[data-testid="paginationStatus"]');
+  assert.equal(status.textContent, "Showing 1 - 2 of 3");
+  const counts = page.document.querySelector("#gr-filter-counts");
+  assert.equal(counts.textContent, "1 visible, 1 hidden, filter ON");
+
+  // React owns this text and may revise its total while the list loads.
+  status.textContent = "Showing 1 - 2 of 4";
+  page.advance(1100);
+  assert.equal(status.textContent, "Showing 1 - 2 of 4");
+  page.document.querySelector("#gr-filter-toggle").onclick();
+  assert.equal(counts.textContent, "2 visible, 0 hidden, filter OFF");
+  assert.equal(status.textContent, "Showing 1 - 2 of 4");
 });
 
 test("turning filtering off includes all visible genres in the opening queue", async () => {

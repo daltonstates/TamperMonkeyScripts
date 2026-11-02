@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.41
+// @version      4.42
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -280,14 +280,11 @@
       else visible++;
     });
 
-    const status = document.querySelector('[data-testid="paginationStatus"]');
+    const status = document.querySelector("#gr-filter-counts");
     if (!status) return;
-
-    const original =
-      status.dataset.originalText ||
-      (status.dataset.originalText = status.textContent.trim());
-
-    status.textContent = `${original}  (${visible} visible, ${hidden} hidden, filter ${filteringEnabled ? "ON" : "OFF"})`;
+    // React owns the native pagination text. Replacing its text nodes can
+    // interfere with later renders and used to restore an obsolete total.
+    status.textContent = `${visible} visible, ${hidden} hidden, filter ${filteringEnabled ? "ON" : "OFF"}`;
   }
 
   /* ------------------------------------------------------------
@@ -2502,6 +2499,11 @@
       setSettingsPanelOpen(Boolean(document.querySelector("#gr-settings")?.hidden));
     openAllRow.appendChild(settingsToggle);
     controls.appendChild(openAllRow);
+
+    const filterCounts = document.createElement("p");
+    filterCounts.id = "gr-filter-counts";
+    filterCounts.className = "gr-setting-help";
+    controls.appendChild(filterCounts);
 
     const btn = document.createElement("button");
     btn.id = "gr-open-btn";
