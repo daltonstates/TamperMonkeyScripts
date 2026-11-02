@@ -2814,7 +2814,9 @@ test("a five-entry controlled request crosses 2+2+1 batches without counting ear
 
 async function smallBatchBeforeLoadFailure() {
   const response = () => ({ entryLimit: 5, batchEntryLimit: 2 });
-  const first = dailyPage({ dailyCloseListing: true, dailyResponse: response, listing: { pages: [[1,2,3,4,5,6]] } });
+  const first = dailyPage({
+    href: `https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
+    dailyCloseListing: true, dailyResponse: response, listing: { pages: [[1,2,3,4,5,6]] } });
   await first.advanceAsync(1500);
   for (let index = 0; index < 2; index++) { first.openedTabs[index].close(); await first.flush(); }
   await first.advanceAsync(0);
