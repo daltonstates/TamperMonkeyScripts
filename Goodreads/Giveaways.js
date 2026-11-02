@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.40
+// @version      4.41
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -998,7 +998,17 @@
       );
     }
 
-    throw new Error("Timed out waiting for Goodreads to load more giveaways.");
+    const button = findShowMoreGiveawaysButton();
+    const detail = {
+      at: new Date().toISOString(),
+      rows: document.querySelectorAll("article.BookListItem").length,
+      previousRows: previousCount, total: pagination.total,
+      more: !button ? "missing" : button.disabled || button.getAttribute("aria-disabled") === "true" ? "disabled" : "enabled",
+      status: document.querySelector('[data-testid="paginationStatus"]')?.textContent?.trim().slice(0, 150) ?? "missing",
+      ready: document.readyState ?? "unknown", title: document.title.slice(0, 150),
+    };
+    try { localStorage.setItem("gr_last_listing_load_error", JSON.stringify(detail)); } catch {}
+    throw new Error(`Timed out waiting for Goodreads to load more giveaways. rows=${detail.rows}, previous=${detail.previousRows}, total=${detail.total}, more=${detail.more}, status=${detail.status}`);
   }
 
   async function openAllGiveaways(continuation = null) {
@@ -1072,7 +1082,7 @@
         if (controller.signal.aborted) return;
         console.error("Could not load all Goodreads giveaways", error);
         if (dailyRun && continuation && preparedWorkflow && !dailyRun.stopped && !leavingPage &&
-            error?.message === "Timed out waiting for Goodreads to load more giveaways." &&
+            error?.message?.startsWith("Timed out waiting for Goodreads to load more giveaways.") &&
             (continuation?.listingLoadRetries ?? 0) < 1 && trackedGiveawayTabs.size === 0 && isAutoOpenPage()) {
           // Retry only this blocked listing operation, with no entry tabs open.
           // Keep the same queue/token/dedup state; a retry is not useful progress.

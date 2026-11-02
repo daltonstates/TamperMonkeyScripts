@@ -2856,6 +2856,10 @@ test("a second timeout of the same refreshed listing fails with its actual load 
   assert.equal(repeated.openedTabs.length,0);
   assert.equal(repeated.dailyRequests.at(-1).state,"failed");
   assert.match(repeated.dailyRequests.at(-1).reason,/Timed out waiting for Goodreads to load more giveaways/);
+  assert.match(repeated.dailyRequests.at(-1).reason,/rows=1, previous=1, total=4, more=disabled/);
+  const diagnostic=JSON.parse(repeated.stored.get("gr_last_listing_load_error"));
+  assert.equal(diagnostic.rows,1);
+  assert.equal(diagnostic.more,"disabled");
   assert.equal(repeated.dailyRequests.at(-1).metrics.processed,2);
 });
 
