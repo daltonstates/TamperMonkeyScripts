@@ -237,6 +237,53 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(session.state, "failed")
             self.assertEqual(session.counters, {"processed": 0, "loaded": 90})
 
+    def test_transport_recovery_is_reported_without_renewing_useful_progress(self):
+        now = [0]
+        session = daily.Session({"name": "One"}, clock=lambda:now[0], inactivity_minutes=2)
+        self.server.session = session
+        status, body = self.request(metrics={"processed":72,"loaded":90})
+        self.assertEqual((status, body["inactivitySeconds"]), (200, 120))
+        now[0] = 115
+        status, body = self.request(state="running", metrics={"processed":72,"loaded":90},
+                                   connection={"failures":1,"recoveries":1,
+                                               "lastError":"The daily runner did not respond within five seconds.",
+                                               "lastFailedAt":"2026-11-03T04:10:43-05:00"})
+        self.assertEqual(status, 200)
+        self.assertEqual(session.last_progress, 0)
+        self.assertEqual(session.connection["recoveries"], 1)
+        now[0] = 121
+        session.check_deadlines()
+        self.assertEqual(session.state, "failed")
+        self.assertIn("No useful giveaway progress", session.reason)
+
+    def test_slow_checkpoint_and_lost_response_can_retry_the_same_authenticated_event(self):
+        listing = MagicMock(); listing.bind.return_value = True
+        listing.diagnostics = {"matchingEdgeWindows":1}
+        entered, release = threading.Event(), threading.Event()
+        def checkpoint(session):
+            if session.state == "running" and not release.is_set():
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("Test did not release its slow checkpoint")
+        session = daily.Session({"name":"One"}, listing=listing, window_tag="a"*32,
+                                checkpoint=checkpoint)
+        self.server.session = session
+        self.request(closeListingSupported=True, windowTag=session.window_tag)
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=.15)
+        try:
+            connection.request("POST", "/v1/daily", json.dumps({"token":session.token,"state":"running",
+                "metrics":{"processed":72,"loaded":90}}),
+                {"Content-Type":"application/json","X-Goodreads-Companion":"daily"})
+            self.assertTrue(entered.wait(2))
+            with self.assertRaises(TimeoutError):
+                connection.getresponse()
+        finally:
+            connection.close(); release.set()
+        status, body = self.request(state="running", metrics={"processed":72,"loaded":90})
+        self.assertEqual((status, body["mode"]), (200,"run"))
+        self.assertEqual(session.state, "running")
+        self.assertEqual(session.counters["processed"], 72)
+
 
 class QueueTests(unittest.TestCase):
     def test_controlled_batch_requires_capability_and_returns_both_limits(self):

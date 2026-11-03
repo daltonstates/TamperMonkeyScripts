@@ -1,7 +1,13 @@
 # Goodreads Giveaway Enhancer
 
-Version **4.37** adds meaningful progress counters, same-day processing
-deduplication, and controlled live-check limits. Both desktop and VM installations
+Version **4.45** retries transient reporting failures and pauses new giveaway tabs
+until the runner responds. One missed five-second response no longer fails a
+healthy account. Explicit cancellation and invalid authorization still stop
+immediately. Reconnection uses the runner's configured inactivity interval
+(15 minutes by default); retries never count as useful progress. Reports record
+connection failures, recovery, and slow runner responses. Durable per-profile
+work survives later requests and days without repeating processed giveaways.
+Both desktop and VM installations
 use the published userscript on `main`. The generic profile runner now uses
 15 minutes of inactivity, without an account or total morning runtime cutoff.
 The [VM adapter](VM/README.md) requests one completion-ordered queue at 04:00 Eastern.

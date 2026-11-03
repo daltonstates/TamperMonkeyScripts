@@ -26,7 +26,7 @@ import uuid
 from KeyfireGiveaways import Settings, read_config, read_workflow
 
 PORT = 17385
-VERSION = "2026.11.02.5"
+VERSION = "2026.11.03.1"
 LIST_URL = "https://www.goodreads.com/giveaway?sort=ending_soon&format=print&autoload=1"
 TERMINAL = {"finished", "verified", "failed", "cancelled"}
 WINDOW_BIND_SECONDS = 30
@@ -444,6 +444,8 @@ class Session:
         self.keyfire_config = keyfire_config
         self.macro_wait_seconds = 0
         self.checkpoint = checkpoint
+        self.connection = {"failures": 0, "recoveries": 0}
+        self.request_timing = {"slowResponses": 0, "maxSeconds": 0}
 
     def observe_progress(self, value, now):
         """Only new processed entries or newly loaded rows renew the deadline."""
@@ -496,6 +498,23 @@ class Session:
             if (not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{64}", token)
                     or not secrets.compare_digest(token, self.token)):
                 raise ValueError("Unknown scheduled run")
+            connection = value.get("connection")
+            if isinstance(connection, dict):
+                previous = self.connection["failures"]
+                for name in ("failures", "recoveries"):
+                    number = connection.get(name)
+                    if type(number) is int and self.connection[name] <= number <= 10000000:
+                        self.connection[name] = number
+                for name in ("lastError", "lastFailedAt"):
+                    detail = connection.get(name)
+                    if isinstance(detail, str):
+                        self.connection[name] = detail[:200]
+                seconds = connection.get("lastFailedSeconds")
+                if type(seconds) in {int, float} and 0 <= seconds <= 86400:
+                    self.connection["lastFailedSeconds"] = seconds
+                if self.connection["failures"] > previous:
+                    logging.warning("%s: userscript recovered contact after %d transport failures; last error: %s",
+                                    self.profile["name"], self.connection["failures"], self.connection.get("lastError", ""))
             if self.state in TERMINAL:
                 if (self.state == "failed" and self.recover_failures and self.cleanup_supported
                         and self.cleanup_requested_at is not None
@@ -604,7 +623,8 @@ class Session:
             if state == "failed" and self.recover_failures and self.cleanup_supported:
                 return self.cleanup_response()
             return {"protocol": 1, "mode": "verify" if self.verify else "run", "cancel": False,
-                    "entryLimit": self.entry_limit, "batchEntryLimit": self.batch_entry_limit}
+                    "entryLimit": self.entry_limit, "batchEntryLimit": self.batch_entry_limit,
+                    "inactivitySeconds": self.inactivity_seconds}
 
     def check_deadlines(self):
         with self.lock:
@@ -673,8 +693,19 @@ class Handler(BaseHTTPRequestHandler):
             value = json.loads(self.rfile.read(length))
             if not isinstance(value, dict) or self.server.session is None:
                 raise ValueError("No account is running")
-            result = self.server.session.event(value)
+            session = self.server.session
+            started = time.monotonic()
+            result = session.event(value)
+            elapsed = round(time.monotonic() - started, 3)
+            session.request_timing["maxSeconds"] = max(session.request_timing["maxSeconds"], elapsed)
+            if elapsed >= 1:
+                session.request_timing["slowResponses"] += 1
+                logging.warning("%s: daily %s response took %.3fs", session.profile["name"], value.get("state"), elapsed)
             self.reply(200, result)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # A timed-out caller may retry an event already accepted above.
+            # Losing that response does not fail the authenticated profile.
+            logging.warning("Daily userscript disconnected before receiving its response")
         except (ValueError, OSError) as error:
             logging.warning("Daily userscript request rejected: %s", error)
             self.reply(400, {"error": str(error)})
@@ -977,7 +1008,8 @@ def run_queue(settings, output, *, verify=False, immediate=False, recover_failur
                 break
             item.update(state=session.state, reason=session.reason, progress=session.progress,
                         endedAt=datetime.now().astimezone().isoformat(), counters=dict(session.counters),
-                        lastUsefulAt=session.last_useful_at)
+                        lastUsefulAt=session.last_useful_at, connection=dict(session.connection),
+                        requestTiming=dict(session.request_timing))
             if session.window_binding is not None:
                 item["windowBinding"] = {k: v for k, v in session.window_binding.items() if k != "started"}
             item["capabilities"] = session.capabilities

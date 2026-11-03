@@ -94,6 +94,7 @@ function createPage({
   dailyCloseListing = false,
   dailyWindowWait = 0,
   dailyResponse = null,
+  dailyDelay = 0,
   automationSettings = legacyAutomationSettings,
 } = {}) {
   if (automationSettings !== null && !stored.has(automationSettingsKey)) {
@@ -353,9 +354,11 @@ function createPage({
       if (options.url.endsWith("/v1/daily")) {
         const value = JSON.parse(options.data);
         dailyRequests.push(value);
+        const requestNumber = dailyRequests.length;
         schedule(() => {
           const failure = typeof dailyFailure === "function" ? dailyFailure(value) : dailyFailure;
           if (failure === "offline") return options.onerror();
+          if (failure === "hang") return;
           const response = {
             protocol: 1,
             mode:
@@ -376,7 +379,7 @@ function createPage({
               dailyResponse ? { ...response, ...dailyResponse(value) } : response,
             ),
           });
-        }, 0);
+        }, typeof dailyDelay === "function" ? dailyDelay(value, requestNumber) : dailyDelay);
         return {
           abort() {
             options.onabort();
@@ -890,9 +893,9 @@ test("a lost coordinator can return for cleanup without reauthorizing keyboard w
   const page=dailyPage({href:`https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"a".repeat(32)}`,
     listing:{pages:[[1,2]]},dailyFailure:()=>phase==="offline"?"offline":null,
     dailyResponse:value=>phase==="recover"&&value.state==="failed"?{cancel:true,closeRunTabs:true}:
-      phase==="recover"&&value.state==="cleanup-ready"?{cancel:false,closeListing:true}:{}});
+      phase==="recover"&&value.state==="cleanup-ready"?{cancel:false,closeListing:true}:{inactivitySeconds:60}});
   await page.advanceAsync(1500);page.openedTabs[0].close();await page.flush();
-  phase="offline";await page.advanceAsync(5500);
+  phase="offline";await page.advanceAsync(65500);
   const opened=page.openedTabs.length;
   assert.equal(page.dailyRequests.at(-1).state,"failed");
   phase="recover";await page.advanceAsync(31000);
@@ -2738,6 +2741,121 @@ test("an unreachable daily runner never falls back to saved automatic claiming",
   assert.equal(page.openedTabs.length, 0);
   assert.equal(page.helperRequests.length, 0);
   assert.equal(page.alerts.length, 0);
+});
+
+test("one missed running response pauses new tabs and reconnects without failing the profile", async () => {
+  let missed = false;
+  const page = dailyPage({dailyFailure: request => {
+    if (request.state === "running" && !missed) { missed = true; return "hang"; }
+  }});
+  await page.advanceAsync(10000); // The five-second heartbeat's five-second operation deadline.
+  assert.equal(page.openedTabs.length, 1);
+  page.openedTabs[0].close();
+  await page.advanceAsync(500);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.dailyRequests.some(request => request.state === "failed"), false);
+  await page.advanceAsync(500);
+  assert.equal(page.openedTabs.length, 2);
+  page.openedTabs[1].close();
+  await page.advanceAsync(0);
+  const result = page.dailyRequests.at(-1);
+  assert.equal(result.state, "finished");
+  assert.equal(result.metrics.processed, 2);
+  assert.equal(result.connection.failures, 1);
+  assert.equal(result.connection.recoveries, 1);
+});
+
+test("an expired late cancellation response cannot close a recovered run", async () => {
+  let first = null;
+  const page = dailyPage({href:`https://www.goodreads.com${automaticListPath}#grDailyToken=${"d".repeat(64)}&grDailyWindow=${"e".repeat(32)}`,
+    dailyDelay: request => {
+    if (request.state === "running" && !first) { first = request; return 7000; }
+    return 0;
+  }, dailyResponse: request => request === first ? {cancel:true,closeRunTabs:true} : {}});
+  await page.advanceAsync(10000);
+  page.openedTabs[0].close();
+  await page.advanceAsync(2000);
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.openedTabs[1].closed, false);
+  assert.equal(page.closeCount, 0);
+  assert.equal(page.dailyRequests.some(request => request.state === "failed"), false);
+});
+
+test("persistent transport errors use the configured inactivity interval and retain unfinished work", async () => {
+  const page = dailyPage({dailyFailure: request => request.state === "running" ? "offline" : null,
+    dailyResponse: () => ({inactivitySeconds:60})});
+  await page.advanceAsync(10000);
+  page.openedTabs[0].close();
+  await page.advanceAsync(54000);
+  assert.equal(page.openedTabs.length, 1);
+  assert.equal(page.dailyRequests.some(request => request.state === "failed"), false);
+  await page.advanceAsync(1000);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+  assert.match(page.dailyRequests.at(-1).reason, /connection could not be restored for 1 minute/);
+  assert.equal(page.openedTabs.length, 1);
+  const work = JSON.parse(page.stored.get("gr_giveaway_work"));
+  assert.deepEqual(work.processed, ["123"]);
+  assert.deepEqual(work.pending.map(item => item.id), ["456"]);
+});
+
+test("a missed completion response retries the same processing result without reopening giveaways", async () => {
+  let missed = false;
+  const page = dailyPage({dailyFailure: request => {
+    if (request.state === "finished" && !missed) { missed = true; return "hang"; }
+  }});
+  await page.advanceAsync(1500);
+  page.openedTabs[0].close(); await page.advanceAsync(0);
+  page.openedTabs[1].close(); await page.advanceAsync(6000);
+  const completions = page.dailyRequests.filter(request => request.state === "finished");
+  assert.equal(completions.length, 2);
+  assert.ok(completions.every(request => request.metrics.processed === 2));
+  assert.equal(page.openedTabs.length, 2);
+  assert.equal(page.dailyRequests.some(request => request.state === "failed"), false);
+});
+
+test("connection recovery counters survive a scheduled batch continuation", async () => {
+  let missed = false;
+  const page = dailyPage({dailyResponse:()=>({entryLimit:2,batchEntryLimit:1}), dailyFailure:request=>{
+    if (request.state === "running" && !missed) { missed = true; return "hang"; }
+  }});
+  await page.advanceAsync(11000);
+  page.openedTabs[0].close(); await page.advanceAsync(0);
+  assert.equal(page.navigations.length, 1);
+  page.window.emit("pagehide");
+  const resumed = dailyPage({stored:page.stored,sessionStored:page.sessionStored,
+    dailyResponse:()=>({entryLimit:2,batchEntryLimit:1})});
+  await resumed.advanceAsync(1500);
+  resumed.openedTabs[0].close(); await resumed.advanceAsync(0);
+  const result = resumed.dailyRequests.at(-1);
+  assert.equal(result.state, "finished");
+  assert.equal(result.connection.failures, 1);
+  assert.equal(result.connection.recoveries, 1);
+  assert.equal(result.connection.lastFailedSeconds, 5);
+  assert.equal(result.metrics.processed, 2);
+});
+
+test("explicit runner cancellation after a transport retry stops immediately", async () => {
+  let running = 0;
+  const page = dailyPage({dailyFailure: request => {
+    if (request.state === "running") return ++running === 1 ? "offline" : "cancel";
+  }});
+  await page.advanceAsync(6000);
+  assert.equal(page.dailyRequests.at(-1).state, "failed");
+  assert.match(page.dailyRequests.at(-1).reason, /runner stopped this account/);
+  page.openedTabs[0].close(); await page.advanceAsync(5000);
+  assert.equal(page.openedTabs.length, 1);
+});
+
+test("leaving during reconnection stops retries without clearing the next page's continuation", async () => {
+  const page = dailyPage({dailyFailure: request => request.state === "running" ? "offline" : null});
+  await page.advanceAsync(5500);
+  page.sessionStored.set("gr_giveaway_continuation", "next-page-saved-work");
+  page.window.emit("pagehide");
+  const requests = page.dailyRequests.length;
+  await page.advanceAsync(30000);
+  assert.equal(page.dailyRequests.length, requests);
+  assert.equal(page.sessionStored.get("gr_giveaway_continuation"), "next-page-saved-work");
+  assert.equal(page.dailyRequests.some(request => request.state === "failed"), false);
 });
 
 test("missing per-profile setup fails the daily run without ordinary tabs", async () => {

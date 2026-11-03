@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Goodreads Giveaway Enhancer
 // @namespace    https://github.com/daltonstates
-// @version      4.44
+// @version      4.45
 // @updateURL    https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @downloadURL  https://raw.githubusercontent.com/daltonstates/TamperMonkeyScripts/main/Goodreads/Giveaways.js
 // @homepageURL  https://github.com/daltonstates/TamperMonkeyScripts/tree/main/Goodreads
@@ -506,21 +506,66 @@
     return run.cleanupPromise;
   }
 
-  function dailyRequest(token, state, reason = "") {
+  async function dailyRequest(token, state, reason = "") {
+    const run = dailyRun;
+    const recoverable = run?.authorized && !run.stopped &&
+      ["running", "finished", "verified"].includes(state);
+    let disconnectedAt = null;
+    while (true) {
+      try {
+        const response = await dailyRequestOnce(token, state, reason,
+          recoverable ? run.connectionController.signal : null);
+        if (disconnectedAt !== null) {
+          run.connection.recoveries++;
+          run.message = "";
+          refreshWorkflowStatus();
+        }
+        return response;
+      } catch (error) {
+        if (!recoverable || !error.dailyTransport || run !== dailyRun ||
+            run.stopped || leavingPage || run.connectionController.signal.aborted) throw error;
+        disconnectedAt ??= Date.now();
+        run.connection.failures++;
+        run.connection.lastError = error.message;
+        run.connection.lastFailedAt = new Date(Date.now()).toISOString();
+        run.connection.lastFailedSeconds = error.elapsedSeconds;
+        // This is a connection problem, not evidence that useful work stalled.
+        // Pause new tabs while retrying the same authenticated report. Polls and
+        // retries never renew the runner's useful-progress deadline.
+        if (Date.now() - disconnectedAt >= run.inactivitySeconds * 1000)
+          throw new Error(`The daily runner connection could not be restored for ${run.inactivitySeconds / 60} minute${run.inactivitySeconds === 60 ? "" : "s"}. New giveaways were paused; saved work was preserved.`);
+        run.message = "Waiting to reconnect to the daily runner; new giveaways are paused.";
+        refreshWorkflowStatus();
+        await waitForGiveawayDelay(1000, run.connectionController.signal);
+      }
+    }
+  }
+
+  function dailyRequestOnce(token, state, reason, signal = null) {
     return new Promise((resolve, reject) => {
       let settled = false;
       let request;
+      const startedAt = Date.now();
+      const transportError = (message) => Object.assign(new Error(message), {dailyTransport:true});
       const finish = (error, value) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener("abort", cancelled);
+        if (error?.dailyTransport) error.elapsedSeconds = (Date.now() - startedAt) / 1000;
         if (error) reject(error);
         else resolve(value);
       };
+      const cancelled = () => {
+        finish(new Error("The daily request was cancelled."));
+        request?.abort();
+      };
       const timer = setTimeout(() => {
-        finish(new Error("The daily runner did not respond."));
+        finish(transportError("The daily runner did not respond within five seconds."));
         request?.abort();
       }, 5000);
+      if (signal?.aborted) { cancelled(); return; }
+      signal?.addEventListener("abort", cancelled, {once:true});
       try {
         request = GM_xmlhttpRequest({
           method: "POST",
@@ -546,14 +591,16 @@
             reason: reason.slice(0, 300),
             progress: dailyProgress(),
             metrics: dailyMetrics(),
+            connection: dailyRun?.connection,
           }),
           onerror: () =>
-            finish(new Error("The daily runner connection failed.")),
+            finish(transportError("The daily runner connection failed.")),
           onabort: () =>
-            finish(new Error("The daily runner connection stopped.")),
+            finish(transportError("The daily runner connection stopped.")),
           ontimeout: () =>
-            finish(new Error("The daily runner connection timed out.")),
+            finish(transportError("The daily runner connection timed out.")),
           onload: (response) => {
+            if (settled) return; // An expired response cannot cancel newer work.
             try {
               const value = JSON.parse(response.responseText);
               if (
@@ -597,6 +644,7 @@
     dailyRun.waitingForWindow = false;
     dailyRun.message = `Daily run stopped: ${message}`;
     clearInterval(dailyRun.timer);
+    dailyRun.connectionController.abort();
     if (dailyRun.windowTag) {
       // A crashed coordinator may return on the next schedule. Keep only a
       // cleanup channel alive; this never restarts claiming or keyboard input.
@@ -637,6 +685,11 @@
       loadedIds: new Set(continuation?.loadedIds ?? []),
       entryLimit: null,
       batchEntryLimit: null,
+      authorized: false,
+      inactivitySeconds: 15 * 60,
+      connection: {failures:0, recoveries:0, ...(continuation?.connection ?? {})},
+      connectionController: new AbortController(),
+      reportingPromise: null,
     };
     keepDailyTitle();
     try {
@@ -658,6 +711,8 @@
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
       dailyRun.waitingForWindow = false;
+      if (Number.isFinite(response.inactivitySeconds) && response.inactivitySeconds > 0)
+        dailyRun.inactivitySeconds = response.inactivitySeconds;
       if (Number.isInteger(response.entryLimit) && response.entryLimit > 0)
         dailyRun.entryLimit = response.entryLimit;
       if (dailyRun.entryLimit && Number.isInteger(response.batchEntryLimit) &&
@@ -679,6 +734,7 @@
       }
       if (response.mode !== "run")
         throw new Error("Update the daily runner and try again.");
+      dailyRun.authorized = true;
       if (!isAutoOpenPage())
         throw new Error(
           "Daily runs are limited to ending-soon print giveaways.",
@@ -688,14 +744,19 @@
         if (pending || dailyRun.stopped) return;
         pending = true;
         try {
-          await dailyRequest(token, "running");
+          dailyRun.reportingPromise = dailyRequest(token, "running");
+          await dailyRun.reportingPromise;
         } catch (error) {
-          giveawayError(error.message);
+          if (!leavingPage && !dailyRun.stopped) giveawayError(error.message);
         } finally {
+          dailyRun.reportingPromise = null;
           pending = false;
         }
       }, 5000);
-      window.addEventListener("pagehide", () => clearInterval(dailyRun.timer), {
+      window.addEventListener("pagehide", () => {
+        clearInterval(dailyRun.timer);
+        dailyRun.connectionController.abort();
+      }, {
         once: true,
       });
       await openAllGiveaways(continuation);
@@ -706,11 +767,13 @@
         "Daily run finished. All opened giveaway tabs have closed.",
       );
     } catch (error) {
-      giveawayError(error.message);
+      if (!leavingPage) giveawayError(error.message);
     }
   }
 
   async function completeDailyRun(state, message) {
+    if (dailyRun.reportingPromise) await dailyRun.reportingPromise;
+    if (dailyRun.stopped || leavingPage) return;
     const response = await dailyRequest(dailyRun.token, state);
     dailyRun.message = message;
     refreshWorkflowStatus();
@@ -1235,6 +1298,7 @@
       processedIds: [...(dailyRun?.processedIds ?? [])],
       baselineProcessed: dailyRun?.baselineProcessed ?? 0,
       loadedIds: [...(dailyRun?.loadedIds ?? [])], pacing: giveawayPacing,
+      connection: dailyRun?.connection,
       listingLoadRetries,
     }));
   }
@@ -1454,6 +1518,9 @@
         await waitForGiveawayPacing(workflow, signal);
         // Settings may lower the background tab limit during a pacing wait.
         await waitForOpenTabSlot(signal);
+        signal.throwIfAborted();
+        if (dailyRun?.reportingPromise)
+          await waitForGiveawayTask(dailyRun.reportingPromise, signal);
         signal.throwIfAborted();
 
         const tabId = crypto.randomUUID().replace(/-/g, "");
